@@ -98,6 +98,12 @@ def _make_parser() -> argparse.ArgumentParser:
                         help="附带 token 用量汇总")
     usage_p = sub.add_parser("usage", help="token 用量统计（按天/会话汇总）")
     usage_p.add_argument("--days", type=int, default=7, help="统计最近 N 天（默认 7）")
+    rt = sub.add_parser("roundtable", help="多角色圆桌讨论（同一模型扮演多个视角）")
+    rt.add_argument("topic", help="讨论议题")
+    rt.add_argument("--rounds", type=int, default=2, help="发言轮数（默认 2）")
+    rt.add_argument("--role", action="append", default=None, metavar="名称:提示词",
+                    help="自定义角色（可多次）；省略则用默认三视角")
+    rt.add_argument("--no-moderator", action="store_true", help="不要主持人总结")
 
     plugin = sub.add_parser("plugin", help="插件管理")
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
@@ -379,6 +385,52 @@ def _usage_summary(profile: Profile, args) -> int:
     return 0
 
 
+def _roundtable(host, args) -> int:
+    """多角色圆桌讨论：同一模型扮演多个视角轮流发言，主持人总结（功能2）。
+
+    角色共用当前模型的 LLM 实例（多视角靠不同 instructions 实现），
+    发言走独立 session，不污染用户的常规会话。
+    """
+    from nanoagent import Agent
+    from nanoagent.memory import Memory
+    from nanoagent.multi import Roundtable
+
+    runtime = host.service("models_runtime") or {}
+    pool = runtime.get("pool") or {}
+    if not pool:
+        print("错误：没有可用模型，无法组织圆桌讨论", file=sys.stderr)
+        return 1
+    llm = pool[runtime["current"]]
+
+    roles = []
+    for spec in (args.role or []):
+        name, _, prompt = str(spec).partition(":")
+        name = name.strip() or "角色"
+        roles.append((name, prompt.strip()))
+    if not roles:
+        roles = [("支持者", "你是乐观的支持者：优先寻找方案的可行性与机会，并给出理由。"),
+                 ("质疑者", "你是谨慎的质疑者：重点找风险、漏洞与反例，敢于直接反驳。"),
+                 ("中立分析者", "你是中立的分析者：客观比较各方观点，指出被忽略的中间地带。")]
+
+    agents = [Agent(name=name, instructions=prompt, llm=llm,
+                    memory=Memory(), tracer=None)
+              for name, prompt in roles]
+    moderator = None
+    if not args.no_moderator:
+        moderator = Agent(name="主持人",
+                          instructions="你是讨论主持人：中立、简明、直奔结论。",
+                          llm=llm, memory=Memory(), tracer=None)
+
+    result = Roundtable(agents, rounds=max(args.rounds, 1),
+                        moderator=moderator).run(args.topic)
+    print(f"议题：{result.topic}\n")
+    for t in result.transcript:
+        print(f"【{t['agent']}·第{t['round']}轮】{t['statement']}\n")
+    if result.summary:
+        print(f"【主持人总结】\n{result.summary}")
+    return 0
+
+
 def main(argv: list | None = None) -> int:
     args = _make_parser().parse_args(argv)
 
@@ -517,6 +569,9 @@ def main(argv: list | None = None) -> int:
         from .desktop import run as run_desktop
 
         return run_desktop(host)
+
+    if command == "roundtable":
+        return _roundtable(host, args)
 
     # chat（默认）
     ui = host.service("ui")

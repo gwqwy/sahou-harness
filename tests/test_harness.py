@@ -1460,3 +1460,69 @@ class ExportUsageTests(unittest.TestCase):
             content = files[0].read_text(encoding="utf-8")
             self.assertIn("## 用户", content)
             self.assertIn("## 助手", content)
+
+
+class RoundtableCliTests(unittest.TestCase):
+    """功能2：sha roundtable 多角色圆桌讨论。"""
+
+    def test_roundtable_prints_transcript_and_summary(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            with patch_model_build():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main([*base, "model", "add", "m1",
+                                           "--model", "gpt-x", "--api-key", "sk-real",
+                                           "--default"]), 0)
+            buf = io.StringIO()
+            with patch_model_build():
+                with contextlib.redirect_stdout(buf):
+                    rc = main([*base, "roundtable", "要不要发布", "--rounds", "1"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            # 默认三视角 + 主持人
+            for name in ("支持者", "质疑者", "中立分析者", "主持人总结"):
+                self.assertIn(name, out)
+            self.assertIn("议题：要不要发布", out)
+
+    def test_roundtable_custom_roles_and_no_moderator(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            with patch_model_build():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main([*base, "model", "add", "m1",
+                                           "--model", "gpt-x", "--api-key", "sk-real",
+                                           "--default"]), 0)
+            buf = io.StringIO()
+            with patch_model_build():
+                with contextlib.redirect_stdout(buf):
+                    rc = main([*base, "roundtable", "议题X", "--rounds", "1",
+                               "--role", "法务:检查合规风险",
+                               "--no-moderator"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("法务", out)
+            self.assertNotIn("主持人总结", out)
+
+    def test_roundtable_without_models_fails(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = main([*base, "roundtable", "议题"])
+            self.assertEqual(rc, 1)
+            self.assertIn("没有可用模型", err.getvalue())
