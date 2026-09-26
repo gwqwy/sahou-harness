@@ -10,6 +10,7 @@
     sha plugin add <目录>          # 安装外部插件（装完立即校验能否激活）
     sha plugin list | remove <名>  # 查看 / 移除插件
     sha plugin new <名>            # 生成一个插件模板
+    sha plugin reload <名>         # 重载单个插件（改完插件代码不必重启）
     sha model list | use <名>      # 查看 / 切换模型
     sha model add | remove <名>    # 增删模型（此前只能手改 config.json）
     sha skill list                 # 列出技能
@@ -98,6 +99,8 @@ def _make_parser() -> argparse.ArgumentParser:
     p_new = plugin_sub.add_parser("new", help="生成一个插件模板（plugin.json + register.py）")
     p_new.add_argument("name")
     p_new.add_argument("--dir", default=".", help="生成到哪个目录（默认当前目录）")
+    p_reload = plugin_sub.add_parser("reload", help="重载单个插件（改完插件代码无需重启）")
+    p_reload.add_argument("name")
 
     model = sub.add_parser("model", help="模型管理")
     model_sub = model.add_subparsers(dest="model_command", required=True)
@@ -178,6 +181,25 @@ def _plugin_add(profile: Profile, source: str, workspace: str) -> int:
         print(f"已激活: {target.name}" + (f"  {provided}" if provided else ""))
         return 0
     print(f"已复制，但激活失败: {target.error or target.state}（修好后重启即生效）", file=sys.stderr)
+    return 1
+
+
+def _plugin_reload(profile: Profile, workspace: str, name: str) -> int:
+    """重载单个插件：卸载 → 重新装载 → 激活（改完插件代码不必重启整个 harness）。"""
+    try:
+        host = build_runtime(profile, workspace)
+    except ConfigError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    if name not in host.plugins:
+        print(f"错误：没有插件 '{name}'（可用: {', '.join(sorted(host.plugins))}）", file=sys.stderr)
+        return 1
+    record = host.reload(name)
+    if record.state == ACTIVE:
+        provided = ", ".join(f"{k}={','.join(v)}" for k, v in record.provided.items() if v)
+        print(f"已重载: {record.name}" + (f"  {provided}" if provided else ""))
+        return 0
+    print(f"重载后激活失败: {record.error or record.state}", file=sys.stderr)
     return 1
 
 
@@ -278,6 +300,8 @@ def main(argv: list | None = None) -> int:
                 return _plugin_add(profile, args.source, args.workspace)
             if args.plugin_command == "new":
                 return _plugin_new(args.name, args.dir)
+            if args.plugin_command == "reload":
+                return _plugin_reload(profile, args.workspace, args.name)
             if args.plugin_command == "list":
                 installed = sorted(p.name for p in profile.plugins_dir.iterdir() if p.is_dir())
                 print("\n".join(installed) or "（无）")
@@ -339,11 +363,15 @@ def main(argv: list | None = None) -> int:
         for plugin in host.list():
             provided = ", ".join(f"{k}={','.join(v)}" for k, v in plugin["provided"].items() if v)
             line = f"  {plugin['name']}  [{plugin['state']}]  {provided}".rstrip()
+            if plugin.get("deps"):
+                line += f"  inject={','.join(plugin['deps'])}"
             if plugin["skipped"]:
                 line += f"  (skipped: {'; '.join(plugin['skipped'])})"
             if plugin["error"]:
                 line += f"  错误: {plugin['error']}"
             print(line)
+        for service_name, providers in sorted(host.service_conflicts.items()):
+            print(f"  冲突: 服务 {service_name} 由 {', '.join(providers)} 同时提供（后者覆盖）")
         return 0
 
     if command == "desktop":

@@ -173,10 +173,14 @@ class PluginRecord:
     provided: Dict[str, List[str]] = field(default_factory=dict)
     skipped: List[str] = field(default_factory=list)
     error: str = ""
+    deps: List[str] = field(default_factory=list)
+    # 装载期就已知的问题（清单损坏、依赖缺失等）。与 skipped 分开存：
+    # activate() 会用 ctx.skipped 覆写 skipped，若把装载期的问题也塞在那里会被抹掉。
+    mount_notes: List[str] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {"name": self.name, "state": self.state, "provided": self.provided,
-                "skipped": self.skipped, "error": self.error}
+                "skipped": self.skipped, "error": self.error, "deps": self.deps}
 
 
 # ----------------------------------------------------------------------
@@ -187,13 +191,14 @@ class Harness:
         self.bus = EventBus()
         self.plugins: Dict[str, PluginRecord] = {}
         self.services: Dict[str, Any] = {}
+        self.service_conflicts: Dict[str, List[str]] = {}  # 服务名 → 提供者列表
         self.profile = None        # 由运行时（cli）注入
         self.confirm: Optional[Callable[[str], bool]] = None  # 权限确认回调（REPL 注入）
 
     # -- 发现 ------------------------------------------------------------
     def mount(self, path: str | Path, name: Optional[str] = None) -> PluginRecord:
         """装载一个插件目录（不激活）。重名自动加序号后缀。"""
-        from .loader import MANIFEST_ERROR_KEY, load_manifest
+        from .loader import MANIFEST_ERROR_KEY, load_manifest, manifest_deps
 
         path = Path(path)
         manifest = load_manifest(path)
@@ -203,10 +208,11 @@ class Harness:
         while final_name in self.plugins:
             final_name = f"{base}-{counter}"
             counter += 1
-        record = PluginRecord(name=final_name, path=str(path), manifest=manifest)
+        record = PluginRecord(name=final_name, path=str(path), manifest=manifest,
+                              deps=manifest_deps(manifest))
         manifest_error = record.manifest.pop(MANIFEST_ERROR_KEY, "")
         if manifest_error:
-            record.skipped.append(f"bad-manifest: {manifest_error}")
+            record.mount_notes.append(f"bad-manifest: {manifest_error}")
         self.plugins[final_name] = record
         return record
 
@@ -221,6 +227,50 @@ class Harness:
         return discovered
 
     # -- 激活 / 卸载 ------------------------------------------------------
+    def activation_order(self) -> List[str]:
+        """按依赖关系排出激活顺序（拓扑排序）。
+
+        未声明 ``inject`` 的插件保持挂载顺序（稳定）。此前顺序**只由目录名排序决定**，
+        任何在 register() 里直接用 ``ctx.host.service(...)`` 的插件，
+        只要名字排在被依赖者前面就会拿到 None —— 现在声明了依赖就不必赌字母序。
+
+        依赖成环时不阻塞：记录一条 warning，环内成员按挂载顺序激活。
+        """
+        order: List[str] = []
+        marks: Dict[str, int] = {}   # 0=访问中，1=已完成
+        cycles: List[str] = []
+
+        def visit(name: str, stack: List[str]) -> None:
+            state = marks.get(name)
+            if state == 1:
+                return
+            if state == 0:
+                cycles.append(" → ".join(stack + [name]))
+                return
+            marks[name] = 0
+            for dep in self.plugins[name].deps:
+                if dep in self.plugins:
+                    visit(dep, stack + [name])
+            marks[name] = 1
+            order.append(name)
+
+        for name in list(self.plugins):
+            visit(name, [])
+        for chain in cycles:
+            _logger.warning("插件依赖成环，环内成员按挂载顺序激活：%s", chain)
+        return order
+
+    def _dependency_notes(self, record: PluginRecord) -> List[str]:
+        """检查声明的依赖是否真的可用，返回给用户看的问题列表。"""
+        notes: List[str] = []
+        for dep in record.deps:
+            other = self.plugins.get(dep)
+            if other is None:
+                notes.append(f"missing-dep: 依赖的插件 {dep} 未装载")
+            elif other.state != ACTIVE:
+                notes.append(f"dep-not-active: 依赖的插件 {dep} 状态为 {other.state}")
+        return notes
+
     def activate(self, name: str) -> PluginRecord:
         """激活插件：建 ctx、执行 register(ctx)、聚合提供物。失败不外抛。"""
         from .loader import run_register
@@ -253,31 +303,48 @@ class Harness:
             "models": sorted(ctx.models_map),
             "commands": sorted(ctx.commands_map),
         }
-        record.skipped = list(ctx.skipped)
+        # 装载期的问题 + 依赖问题 + 插件自报的 skip，三处合并（去重保序）
+        notes = list(record.mount_notes) + self._dependency_notes(record) + list(ctx.skipped)
+        record.skipped = list(dict.fromkeys(notes))
         self._rebuild_services()
         self.bus.emit("activate", name=record.name)
         return record
 
     def _rebuild_services(self) -> None:
-        """从当前 ACTIVE 插件重建服务注册表（后激活者覆盖）。
+        """从当前 ACTIVE 插件重建服务注册表（后挂载者覆盖）。
 
         模型池（ctx.models_map）也在这里重建。旧实现只在 activate() 里写模型池，
         deactivate() 重建服务表时漏掉这一段 —— 于是卸载任意插件后
         service("models") 都会凭空消失。
+
+        同名服务被多个插件提供时会记 warning 并留档到 service_conflicts：
+        「后者静默覆盖前者」是插件系统里最难查的一类问题，至少要让它可见。
         """
         services: Dict[str, Any] = {}
+        owners: Dict[str, str] = {}
+        conflicts: Dict[str, List[str]] = {}
         models: Dict[str, Any] = {}
         for plugin in self.plugins.values():
-            if plugin.state == ACTIVE and plugin.ctx is not None:
-                services.update(plugin.ctx.services)
-                for model_name, llm in plugin.ctx.models_map.items():
-                    models[model_name] = llm
+            if plugin.state != ACTIVE or plugin.ctx is None:
+                continue
+            for key, value in plugin.ctx.services.items():
+                if key in services and owners.get(key) != plugin.name:
+                    providers = conflicts.setdefault(key, [owners[key]])
+                    if plugin.name not in providers:
+                        providers.append(plugin.name)
+                        _logger.warning("服务 %r 同时由 %s 与 %s 提供，后者覆盖前者",
+                                        key, " 与 ".join(providers[:-1]), plugin.name)
+                services[key] = value
+                owners[key] = plugin.name
+            for model_name, llm in plugin.ctx.models_map.items():
+                models[model_name] = llm
         if models or "models" in services:
             services["models"] = models
         self.services = services
+        self.service_conflicts = conflicts
 
     def activate_all(self) -> List[PluginRecord]:
-        return [self.activate(n) for n in list(self.plugins)]
+        return [self.activate(name) for name in self.activation_order()]
 
     def deactivate(self, name: str) -> PluginRecord:
         record = self.plugins.get(name)
@@ -291,6 +358,22 @@ class Harness:
         self._rebuild_services()
         self.bus.emit("deactivate", name=record.name)
         return record
+
+    def reload(self, name: str) -> PluginRecord:
+        """卸载并重新装载 + 激活单个插件（改完插件代码无需重启整个 harness）。
+
+        loader 本来就在卸载时把合成模块从 sys.modules 摘掉，所以重新 execute
+        拿到的一定是新代码 —— 缺的只是「让宿主把这件事串起来」。
+        """
+        record = self.plugins.get(name)
+        if record is None:
+            raise KeyError(f"插件 '{name}' 不存在")
+        path = record.path
+        self.deactivate(name)
+        del self.plugins[name]
+        fresh = self.mount(path, name=name)
+        self.bus.emit("reload", name=name)
+        return self.activate(fresh.name)
 
     # -- 能力聚合 --------------------------------------------------------
     def collect_tools(self) -> List[Any]:

@@ -93,11 +93,15 @@ def patch_model_build():
 
 
 class KernelTests(unittest.TestCase):
-    def _plugin(self, tmp, name: str, body: str) -> Path:
+    def _plugin(self, tmp, name: str, body: str, manifest_name: str | None = None,
+                **manifest_extra) -> Path:
+        """name 同时是目录名；manifest_name 可让清单里的插件名与目录名不同。"""
         tmp = Path(tmp)
         path = tmp / name
         path.mkdir(parents=True, exist_ok=True)
-        (path / "plugin.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+        manifest = {"name": manifest_name or name}
+        manifest.update(manifest_extra)
+        (path / "plugin.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
         (path / "register.py").write_text(body, encoding="utf-8")
         return path
 
@@ -213,6 +217,110 @@ def register(ctx):
             self.assertEqual(record.state, ACTIVE)
             self.assertEqual(record.error, "", "重新激活成功后必须清空陈旧错误")
             self.assertEqual(record.provided["services"], ["svc"])
+
+
+class PluginGraphTests(KernelTests):
+    """批次D：依赖声明 / 拓扑激活 / 冲突可见 / 单插件热重载。"""
+
+    def test_inject_orders_activation(self):
+        """声明 inject 后，激活顺序不再由目录名字母序决定。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            # 目录名故意让消费者排在前：a_consumer 先于 z_provider 被装载
+            self._plugin(tmp, "a_consumer", """
+def register(ctx):
+    svc = ctx.host.service("thing")
+    if svc is None:
+        raise RuntimeError("依赖未就绪：provider 还没激活")
+    ctx.provide("consumer.saw", svc)
+""", manifest_name="consumer", inject=["provider"])
+            plugin = self._plugin(tmp, "z_provider", """
+def register(ctx):
+    ctx.provide("thing", 42)
+""", manifest_name="provider")
+
+            host = Harness()
+            host.mount_all(tmp)
+            order = host.activation_order()
+            self.assertLess(order.index("provider"), order.index("consumer"),
+                            "被依赖者必须先激活")
+            host.activate_all()
+            states = {p["name"]: p["state"] for p in host.list()}
+            self.assertEqual(states["consumer"], ACTIVE)
+            self.assertEqual(host.service("consumer.saw"), 42)
+            self.assertEqual(host.plugins["consumer"].deps, ["provider"])
+            self.assertIsNotNone(plugin)
+
+    def test_missing_dependency_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._plugin(tmp, "solo", 'def register(ctx):\n    ctx.provide("x", 1)\n',
+                         inject=["nobody"])
+            host = Harness()
+            record = host.mount_all(tmp)[0]
+            host.activate_all()
+            self.assertEqual(record.state, ACTIVE, "依赖缺失不该让插件直接失败")
+            self.assertTrue(any("missing-dep" in note for note in record.skipped),
+                            f"应报告缺失依赖，实际: {record.skipped}")
+
+    def test_dependency_cycle_does_not_deadlock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._plugin(tmp, "cyc_a", 'def register(ctx):\n    ctx.provide("a", 1)\n',
+                         inject=["cyc_b"])
+            self._plugin(tmp, "cyc_b", 'def register(ctx):\n    ctx.provide("b", 2)\n',
+                         inject=["cyc_a"])
+            host = Harness()
+            host.mount_all(tmp)
+            host.activate_all()
+            states = {p["name"]: p["state"] for p in host.list()}
+            self.assertEqual(states["cyc_a"], ACTIVE)
+            self.assertEqual(states["cyc_b"], ACTIVE)
+
+    def test_bad_manifest_note_survives_activation(self):
+        """装载期记下的问题不能被 activate() 覆写掉（此前 skipped 会被整体替换）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "badman"
+            path.mkdir()
+            (path / "plugin.json").write_text("{ 这不是 json", encoding="utf-8")
+            (path / "register.py").write_text(
+                'def register(ctx):\n    ctx.provide("x", 1)\n', encoding="utf-8")
+            host = Harness()
+            record = host.mount(path)
+            host.activate(record.name)
+            self.assertEqual(record.state, ACTIVE)
+            self.assertTrue(any("bad-manifest" in note for note in record.skipped),
+                            f"清单损坏的提示不该消失，实际: {record.skipped}")
+
+    def test_service_conflict_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._plugin(tmp, "s1", 'def register(ctx):\n    ctx.provide("dup", "one")\n')
+            second = self._plugin(tmp, "s2", 'def register(ctx):\n    ctx.provide("dup", "two")\n')
+            host = Harness()
+            host.mount(first)
+            host.mount(second)
+            host.activate_all()
+            self.assertEqual(host.service("dup"), "two", "后挂载者覆盖")
+            self.assertEqual(host.service_conflicts.get("dup"), ["s1", "s2"],
+                             "同名服务的多个提供者必须可查，而不是静默覆盖")
+
+    def test_reload_picks_up_new_code(self):
+        """热重载必须拿到磁盘上的新代码（模块缓存需被清掉）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = self._plugin(tmp, "demo",
+                                  'def register(ctx):\n    ctx.provide("v", 1)\n')
+            host = Harness()
+            record = host.mount(plugin)
+            host.activate(record.name)
+            self.assertEqual(host.services["v"], 1)
+
+            (plugin / "register.py").write_text(
+                'def register(ctx):\n    ctx.provide("v", 2)\n', encoding="utf-8")
+            again = host.reload("demo")
+            self.assertEqual(again.state, ACTIVE)
+            self.assertEqual(host.services["v"], 2, "重载后应是磁盘上的新版本")
+
+    def test_reload_unknown_plugin_raises(self):
+        host = Harness()
+        with self.assertRaises(KeyError):
+            host.reload("nothing")
 
 
 class BuiltinPluginsTests(unittest.TestCase):

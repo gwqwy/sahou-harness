@@ -52,7 +52,7 @@ def _install_readline(host, profile_root) -> None:
     atexit.register(save_history)
 
     candidates = ["/exit", "/new", "/help", "/sessions", "/resume", "/usage",
-                  "/plugins", "/status"]
+                  "/reload", "/plugins", "/status"]
     candidates += [f"/{name}" for name in host.collect_commands()]
 
     def completer(text: str, state: int):
@@ -84,7 +84,8 @@ def register(ctx) -> None:
             session_id = switch_session(_latest_session(host))
 
         def print_help() -> str:
-            lines = ["内置: /exit /new /help /sessions /resume <id> /usage /plugins /status"]
+            lines = ["内置: /exit /new /help /sessions /resume <id> /usage /reload <插件> "
+                     "/plugins /status"]
             for name, cmd in sorted(host.collect_commands().items()):
                 lines.append(f"  /{name}  {cmd.get('help', '')}")
             return "\n".join(lines)
@@ -111,7 +112,7 @@ def register(ctx) -> None:
             print("累计用量: " + "  ".join(f"{k}={v}" for k, v in usage.items()))
 
         def run_command(line: str) -> None:
-            nonlocal session_id
+            nonlocal session_id, ask, new_session, switch_session
             name, _, args = line.partition(" ")
             if name == "/exit":
                 raise SystemExit(0)
@@ -140,6 +141,28 @@ def register(ctx) -> None:
                 return
             if name == "/usage":
                 show_usage()
+                return
+            if name == "/reload":
+                target = args.strip()
+                if not target:
+                    print("用法：/reload <插件名>（用 /plugins 查看）")
+                    return
+                if target not in host.plugins:
+                    print(f"没有插件 {target}（用 /plugins 查看）")
+                    return
+                loaded = host.reload(target)
+                if loaded.state != "ACTIVE":
+                    print(f"重载后激活失败: {loaded.error or loaded.state}")
+                    return
+                # 插件重载会换掉它提供的服务对象，本界面持有的旧引用必须换新，
+                # 否则重载 chat_loop / repl 之后，对话还走在旧闭包上。
+                ask = host.service("ask")
+                new_session = host.service("new_session")
+                switch_session = host.service("switch_session")
+                current = host.service("current_session")
+                if callable(current):
+                    session_id = current()
+                print(f"已重载 {loaded.name}")
                 return
             if name == "/plugins":
                 for plugin in host.list():

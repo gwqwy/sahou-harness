@@ -16,6 +16,24 @@ _logger = logging.getLogger(__name__)
 # 由 Harness.mount 取出后写进 record.skipped（P2 #3）。
 MANIFEST_ERROR_KEY = "_manifest_error"
 
+# 依赖声明的字段名（对齐 dsh 的 inject；兼容常见别名）
+DEP_KEYS = ("inject", "deps", "requires", "dependencies")
+
+
+def manifest_deps(manifest: Dict[str, Any]) -> list:
+    """从插件清单里取出依赖的插件名列表。
+
+    支持 ``"inject": ["models"]`` 与 ``"inject": "models, tools_fs"`` 两种写法；
+    未声明时返回空列表（保持挂载顺序，向后兼容）。
+    """
+    for key in DEP_KEYS:
+        value = manifest.get(key)
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
 
 def load_manifest(path: Path) -> Dict[str, Any]:
     """读取 plugin.json；不存在时返回最小清单（name=目录名）。
