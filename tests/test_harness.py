@@ -1473,15 +1473,13 @@ class RoundtableCliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             base = ["--home", tmp, "--workspace", tmp]
-            with patch_model_build():
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(main([*base, "model", "add", "m1",
-                                           "--model", "gpt-x", "--api-key", "sk-real",
-                                           "--default"]), 0)
+            with patch_model_build(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*base, "model", "add", "m1",
+                                       "--model", "gpt-x", "--api-key", "sk-real",
+                                       "--default"]), 0)
             buf = io.StringIO()
-            with patch_model_build():
-                with contextlib.redirect_stdout(buf):
-                    rc = main([*base, "roundtable", "要不要发布", "--rounds", "1"])
+            with patch_model_build(), contextlib.redirect_stdout(buf):
+                rc = main([*base, "roundtable", "要不要发布", "--rounds", "1"])
             self.assertEqual(rc, 0)
             out = buf.getvalue()
             # 默认三视角 + 主持人
@@ -1497,17 +1495,15 @@ class RoundtableCliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             base = ["--home", tmp, "--workspace", tmp]
-            with patch_model_build():
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(main([*base, "model", "add", "m1",
-                                           "--model", "gpt-x", "--api-key", "sk-real",
-                                           "--default"]), 0)
+            with patch_model_build(), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*base, "model", "add", "m1",
+                                       "--model", "gpt-x", "--api-key", "sk-real",
+                                       "--default"]), 0)
             buf = io.StringIO()
-            with patch_model_build():
-                with contextlib.redirect_stdout(buf):
-                    rc = main([*base, "roundtable", "议题X", "--rounds", "1",
-                               "--role", "法务:检查合规风险",
-                               "--no-moderator"])
+            with patch_model_build(), contextlib.redirect_stdout(buf):
+                rc = main([*base, "roundtable", "议题X", "--rounds", "1",
+                           "--role", "法务:检查合规风险",
+                           "--no-moderator"])
             self.assertEqual(rc, 0)
             out = buf.getvalue()
             self.assertIn("法务", out)
