@@ -23,14 +23,15 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 # 权限门合法取值；其余任何取值都归一到 DEFAULT_PERMISSION_MODE
 PERMISSION_MODES = ("ask", "allow", "deny")
 DEFAULT_PERMISSION_MODE = "ask"
 
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "default_model": "",
     "models": [],          # [{name, provider, base_url, api_key, model}]
     "permissions": {
@@ -66,7 +67,7 @@ def _warn(message: str) -> None:
     """配置层的告警出口：打印到 stderr，GUI 环境下 stderr 可能为空。"""
     try:
         print(f"[harness.config] 警告: {message}", file=sys.stderr)
-    except Exception:
+    except Exception:  # noqa: BLE001 —— GUI 打包后 stderr 可能已被关闭，告警本身不能反过来炸掉配置加载
         pass
 
 
@@ -83,7 +84,7 @@ def normalize_permission(raw: Any) -> str:
     return DEFAULT_PERMISSION_MODE
 
 
-def permission_mode(config: Dict[str, Any], key: str, default: str = DEFAULT_PERMISSION_MODE) -> str:
+def permission_mode(config: dict[str, Any], key: str, default: str = DEFAULT_PERMISSION_MODE) -> str:
     """读取 ``permissions.<key>`` 并归一化。
 
     这是权限门的**唯一入口**：调用方只需判断返回值是否为 "allow" 才放行，
@@ -109,7 +110,7 @@ def collapse_whitespace(text: Any) -> str:
     return " ".join(str(text or "").split())
 
 
-def normalize_allowlist(raw: Any) -> List[str]:
+def normalize_allowlist(raw: Any) -> list[str]:
     """把 ``permissions.shell_allow`` 归一为去空、去重、保序的字符串列表。
 
     fail-closed：整段不是列表、或元素不是字符串，一律**丢弃**而不是猜。
@@ -120,7 +121,7 @@ def normalize_allowlist(raw: Any) -> List[str]:
     if not isinstance(raw, (list, tuple)):
         _warn(f"permissions.shell_allow 不是列表（{type(raw).__name__}），已全部忽略")
         return []
-    result: List[str] = []
+    result: list[str] = []
     seen = set()
     for item in raw:
         if not isinstance(item, str):
@@ -135,13 +136,13 @@ def normalize_allowlist(raw: Any) -> List[str]:
     return result
 
 
-def shell_allowlist(config: Dict[str, Any]) -> List[str]:
+def shell_allowlist(config: dict[str, Any]) -> list[str]:
     """读取 ``permissions.shell_allow``；缺失或非法一律当空列表（即没有白名单）。"""
     perms = config.get("permissions")
     return normalize_allowlist(perms.get("shell_allow") if isinstance(perms, dict) else None)
 
 
-def matches_allowlist(command: str, patterns: List[str]) -> Optional[str]:
+def matches_allowlist(command: str, patterns: list[str]) -> str | None:
     """命令是否命中白名单，命中则返回命中的那条模式，否则 None。
 
     模式是 glob：``git status`` 精确匹配，``git log*`` 匹配一切以它开头的命令。
@@ -156,7 +157,7 @@ def matches_allowlist(command: str, patterns: List[str]) -> Optional[str]:
     return None
 
 
-def audit_enabled(config: Dict[str, Any]) -> bool:
+def audit_enabled(config: dict[str, Any]) -> bool:
     """是否把审批决定写审计日志。
 
     默认开启：审批是**有副作用的决定**，事后要能回答「这条命令是谁在什么时候放行的」。
@@ -173,7 +174,7 @@ def audit_enabled(config: Dict[str, Any]) -> bool:
 
 
 # 同一配置文件的进程内互斥锁（桌面端每个 js_api 调用都在独立线程）
-_LOCKS: Dict[str, threading.RLock] = {}
+_LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
 
@@ -229,7 +230,7 @@ class Profile:
             self.save_config(dict(CONFIG_EXAMPLE))
 
     # -- 配置 ------------------------------------------------------------
-    def load_config(self) -> Dict[str, Any]:
+    def load_config(self) -> dict[str, Any]:
         """读取配置。
 
         文件不存在 → 返回默认配置；文件存在但无法解析 → 备份后抛 ConfigError。
@@ -257,7 +258,7 @@ class Profile:
         _warn(f"配置无法解析（{exc}），已备份到 {backup}")
         return backup
 
-    def save_config(self, config: Dict[str, Any]) -> None:
+    def save_config(self, config: dict[str, Any]) -> None:
         """原子保存配置（临时文件 + os.replace），并保证权限字段被归一化。"""
         with self._lock:
             payload = dict(config)
@@ -267,7 +268,7 @@ class Profile:
                 json.dumps(payload, ensure_ascii=False, indent=2),
             )
 
-    def update_config(self, **changes: Any) -> Dict[str, Any]:
+    def update_config(self, **changes: Any) -> dict[str, Any]:
         """读-改-写，全程持锁，避免并发丢更新。"""
         with self._lock:
             config = self.load_config()
@@ -275,7 +276,7 @@ class Profile:
             self.save_config(config)
             return config
 
-    def mutate_config(self, mutator: Callable[[Dict[str, Any]], Any]) -> Dict[str, Any]:
+    def mutate_config(self, mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
         """在同一把锁内完成「读 → 由 mutator 就地修改 → 写」，适合读改写序列。"""
         with self._lock:
             config = self.load_config()
@@ -367,12 +368,12 @@ class Profile:
         return True
 
     # -- 会话 ------------------------------------------------------------
-    def save_session(self, session_id: str, history: List[dict]) -> Optional[Path]:
+    def save_session(self, session_id: str, history: list[dict]) -> Path | None:
         path = self.sessions_dir / f"{session_id}.json"
         atomic_write_text(path, json.dumps(history, ensure_ascii=False, indent=2))
         return path
 
-    def load_session(self, session_id: str) -> List[dict]:
+    def load_session(self, session_id: str) -> list[dict]:
         path = self.sessions_dir / f"{session_id}.json"
         if not path.is_file():
             return []
@@ -382,24 +383,24 @@ class Profile:
         except ValueError:
             return []
 
-    def session_ids(self) -> List[str]:
+    def session_ids(self) -> list[str]:
         return sorted(p.stem for p in self.sessions_dir.glob("*.json"))
 
 
-def _normalize_permissions(raw: Any) -> Dict[str, Any]:
+def _normalize_permissions(raw: Any) -> dict[str, Any]:
     """把 permissions 段归一为完整形状：缺键补默认、非法值收敛。
 
     注意新增键（``shell_allow`` / ``audit``）也必须在这里归一 —— 否则 ``update_config``
     的深合并会**静默丢掉**它们（H-07 是同一类问题的前科）。
     """
     perms = raw if isinstance(raw, dict) else {}
-    result: Dict[str, Any] = {key: normalize_permission(perms.get(key)) for key in ("shell", "fs")}
+    result: dict[str, Any] = {key: normalize_permission(perms.get(key)) for key in ("shell", "fs")}
     result["shell_allow"] = normalize_allowlist(perms.get("shell_allow"))
     result["audit"] = audit_enabled({"permissions": perms})
     return result
 
 
-def _merged(raw: Any) -> Dict[str, Any]:
+def _merged(raw: Any) -> dict[str, Any]:
     """深合并一层：``permissions`` 需与默认值合并，浅更新会丢键（H-07）。"""
     config = dict(DEFAULT_CONFIG)
     if isinstance(raw, dict):

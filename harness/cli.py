@@ -415,7 +415,7 @@ def main(argv: list | None = None) -> int:
     except ConfigError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
-    except Exception as exc:  # 不把裸异常栈丢给用户（如密钥无效的 401）
+    except Exception as exc:  # noqa: BLE001 —— CLI 顶层兜底，不把裸异常栈丢给用户（如密钥无效的 401）
         print(f"错误：{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

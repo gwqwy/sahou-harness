@@ -10,8 +10,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 # 遍历时一律跳过的目录名：版本/构建/虚拟环境产物，既无信息量又会淹没上下文
 IGNORED_PARTS = {

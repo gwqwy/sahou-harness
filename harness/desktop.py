@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 from urllib.parse import urlparse
 
 from .config import PERMISSION_MODES, ConfigError, permission_mode
@@ -58,7 +58,7 @@ def _validate_url(url: str) -> str:
 def _fetch_text(url: str, timeout: int = 20) -> str:
     _validate_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": "sha-harness-market/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - host 已校验
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", "replace")
 
 
@@ -76,10 +76,10 @@ def _mask_key(key: Any) -> str:
     return f"{text[:3]}***{text[-4:]}"
 
 
-def _parse_market(markdown: str) -> tuple[List[dict], List[str]]:
+def _parse_market(markdown: str) -> tuple[list[dict], list[str]]:
     """解析精选列表：`### 分类` 下的 `- [名称](链接) — 描述`。"""
-    items: List[dict] = []
-    categories: List[str] = []
+    items: list[dict] = []
+    categories: list[str] = []
     current = ""
     for raw in markdown.splitlines():
         line = raw.strip()
@@ -176,7 +176,7 @@ class DesktopApp:
         return False
 
     # -- 状态 ---------------------------------------------------------------
-    def status(self) -> Dict[str, Any]:
+    def status(self) -> dict[str, Any]:
         runtime = self.host.service("models_runtime") or {}
         config = self._config()
         ws_entries = {e.get("id"): e for e in (config.get("workspaces") or [])}
@@ -206,7 +206,7 @@ class DesktopApp:
             "usage": usage,
         }
 
-    def set_permission(self, kind: str, mode: str) -> Dict[str, Any]:
+    def set_permission(self, kind: str, mode: str) -> dict[str, Any]:
         if kind not in ("shell", "fs"):
             return {"ok": False, "error": f"未知权限类别: {kind}"}
         if mode not in PERMISSION_MODES:
@@ -218,7 +218,7 @@ class DesktopApp:
         return {"ok": True, "kind": kind, "mode": mode}
 
     # -- 工作区 ---------------------------------------------------------------
-    def set_workspace(self, path: str) -> Dict[str, Any]:
+    def set_workspace(self, path: str) -> dict[str, Any]:
         path = str(path or "").strip()
         if not path:
             return {"ok": False, "error": "路径为空"}
@@ -232,7 +232,7 @@ class DesktopApp:
         )
         return {"ok": True, "workspace": str(resolved), "workspace_name": entry["name"]}
 
-    def choose_workspace(self) -> Dict[str, Any]:
+    def choose_workspace(self) -> dict[str, Any]:
         """弹出原生文件夹选择对话框，选中后切换工作区。"""
         if self._window is None:
             return {"ok": False, "error": "窗口未就绪"}
@@ -246,7 +246,7 @@ class DesktopApp:
             return {"ok": False, "error": ""}
         return self.set_workspace(picked[0] if isinstance(picked, (list, tuple)) else picked)
 
-    def rename_workspace(self, name: str) -> Dict[str, Any]:
+    def rename_workspace(self, name: str) -> dict[str, Any]:
         name = str(name or "").strip()
         if not name:
             return {"ok": False, "error": "名称为空"}
@@ -260,7 +260,7 @@ class DesktopApp:
                 return {"ok": True, "id": current, "name": name}
         return {"ok": False, "error": "当前目录尚未注册为工作区"}
 
-    def workspaces(self) -> Dict[str, Any]:
+    def workspaces(self) -> dict[str, Any]:
         config = self._config()
         current = self._current_ws(config)
         return {"ok": True,
@@ -268,7 +268,7 @@ class DesktopApp:
                 "current": current}
 
     # -- 思考级别 -------------------------------------------------------------
-    def set_thinking(self, level: str) -> Dict[str, Any]:
+    def set_thinking(self, level: str) -> dict[str, Any]:
         if level not in THINKING_LEVELS:
             return {"ok": False, "error": f"未知思考级别: {level}"}
         self.host.profile.update_config(thinking_level=level)
@@ -279,13 +279,13 @@ class DesktopApp:
         return {"ok": True, "thinking_level": level}
 
     # -- 主题 -----------------------------------------------------------------
-    def set_theme(self, mode: str) -> Dict[str, Any]:
+    def set_theme(self, mode: str) -> dict[str, Any]:
         if mode not in THEME_MODES:
             return {"ok": False, "error": f"未知主题: {mode}"}
         self.host.profile.update_config(theme=mode)
         return {"ok": True, "theme": mode}
 
-    def open_url(self, url: str) -> Dict[str, Any]:
+    def open_url(self, url: str) -> dict[str, Any]:
         """在系统默认浏览器打开链接（市场条目 → 插件仓库）。"""
         import webbrowser
 
@@ -297,7 +297,7 @@ class DesktopApp:
             return {"ok": False, "error": str(exc)}
 
     # -- 插件市场 ---------------------------------------------------------------
-    def market_list(self, force: bool = False) -> Dict[str, Any]:
+    def market_list(self, force: bool = False) -> dict[str, Any]:
         """拉取 awesome-dsh-plugin 精选插件目录（README 解析，10 分钟缓存）。"""
         now = time.time()
         with self._market_lock:
@@ -315,7 +315,7 @@ class DesktopApp:
             self._market_cache = (now, items, categories)
         return {"ok": True, "count": len(items), "items": items, "categories": categories}
 
-    def market_install(self, url: str) -> Dict[str, Any]:
+    def market_install(self, url: str) -> dict[str, Any]:
         """从市场安装插件：浅克隆仓库到临时目录，再走本地安装流程。"""
         url = str(url or "").strip()
         try:
@@ -334,6 +334,7 @@ class DesktopApp:
             proc = subprocess.run(
                 ["git", "clone", "--depth", "1", url, str(tmp / repo)],
                 capture_output=True, text=True, timeout=180,
+                check=False,  # 失败原因在 stderr 里，下面自己判断并转成可读提示
             )
             if proc.returncode != 0:
                 return {"ok": False, "error": "git clone 失败: " + (proc.stderr or "").strip()[:300]}
@@ -347,7 +348,7 @@ class DesktopApp:
             shutil.rmtree(tmp, ignore_errors=True)
 
     # -- 会话 ---------------------------------------------------------------
-    def sessions(self) -> Dict[str, Any]:
+    def sessions(self) -> dict[str, Any]:
         config = self._config()
         meta = config.get("sessions_meta") or {}
         ids = set(self.host.profile.session_ids()) | set(meta)  # 含已命名但尚无消息的会话
@@ -363,12 +364,12 @@ class DesktopApp:
         items.sort(key=lambda item: item["updated"], reverse=True)
         return {"ok": True, "sessions": items, "current": self._current_session}
 
-    def session_history(self, session_id: str) -> Dict[str, Any]:
+    def session_history(self, session_id: str) -> dict[str, Any]:
         history = [m for m in self.host.profile.load_session(session_id)
                    if m.get("role") in ("user", "assistant")]
         return {"ok": True, "session": session_id, "history": history}
 
-    def new_session(self) -> Dict[str, Any]:
+    def new_session(self) -> dict[str, Any]:
         session_id = time.strftime("s-%Y%m%d-%H%M%S")
         reset = self.host.service("new_session")
         if callable(reset):
@@ -377,7 +378,7 @@ class DesktopApp:
         self._touch_session(session_id)
         return {"ok": True, "session": session_id}
 
-    def rename_session(self, session_id: str, name: str) -> Dict[str, Any]:
+    def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
         name = str(name or "").strip()
         if not name:
             return {"ok": False, "error": "名称为空"}
@@ -390,7 +391,7 @@ class DesktopApp:
         self.host.profile.update_config(sessions_meta=meta)
         return {"ok": True, "session": session_id, "name": name}
 
-    def chat(self, message: str, session_id: str = "") -> Dict[str, Any]:
+    def chat(self, message: str, session_id: str = "") -> dict[str, Any]:
         session_id = session_id or self._current_session
         with self._lock:
             if session_id != self._current_session:
@@ -413,7 +414,7 @@ class DesktopApp:
             self._touch_session(session_id)
             return result
 
-    def _push_event(self, payload: Dict[str, Any]) -> None:
+    def _push_event(self, payload: dict[str, Any]) -> None:
         if self._window is None:
             return
         try:
@@ -424,7 +425,7 @@ class DesktopApp:
             pass
 
     # -- 模型 ----------------------------------------------------------------
-    def get_models(self) -> Dict[str, Any]:
+    def get_models(self) -> dict[str, Any]:
         config = self.host.profile.load_config()
         # 明文 API Key 不回传前端（P2 #8）：只给掩码，保存时留空/回传掩码即保持原值
         models = []
@@ -435,14 +436,14 @@ class DesktopApp:
         return {"ok": True, "models": models,
                 "default_model": config.get("default_model", "")}
 
-    def save_models(self, models: List[dict], default_model: str = "") -> Dict[str, Any]:
+    def save_models(self, models: list[dict], default_model: str = "") -> dict[str, Any]:
         # 已存在的密钥：前端回传掩码或留空时保持原值，避免被掩码覆盖
         existing = {
             str(m.get("name")): str(m.get("api_key") or "")
             for m in (self.host.profile.load_config().get("models") or [])
         }
         seen: set = set()
-        cleaned: List[dict] = []
+        cleaned: list[dict] = []
         for entry in models or []:
             name = str(entry.get("name") or "").strip()
             model = str(entry.get("model") or "").strip()
@@ -471,7 +472,7 @@ class DesktopApp:
             for m in config["models"]
         ], "default_model": config["default_model"], "rebuild_error": error}
 
-    def switch_model(self, name: str) -> Dict[str, Any]:
+    def switch_model(self, name: str) -> dict[str, Any]:
         runtime = self.host.service("models_runtime") or {}
         setter = runtime.get("set")
         if not callable(setter):
@@ -529,7 +530,7 @@ class DesktopApp:
             return f"{type(exc).__name__}: {exc}"
 
     # -- 用量与上下文 ----------------------------------------------------------
-    def usage(self) -> Dict[str, Any]:
+    def usage(self) -> dict[str, Any]:
         try:
             llm = getattr(self.host.service("agent_factory")(), "llm", None)
         except Exception:  # noqa: BLE001
@@ -537,7 +538,7 @@ class DesktopApp:
         total = dict(getattr(llm, "total_usage", {}) or {})
         return {"ok": True, "usage": total}
 
-    def context_usage(self) -> Dict[str, Any]:
+    def context_usage(self) -> dict[str, Any]:
         """当前会话的上下文占用：消息/系统提示词/工具/技能分项估算。"""
         try:
             agent = self.host.service("agent_factory")()
@@ -580,7 +581,7 @@ class DesktopApp:
                 "breakdown": breakdown}
 
     # -- 右侧面板：工作区浏览 / 终端 / 审查 --------------------------------------
-    def ws_tree(self, subpath: str = "") -> Dict[str, Any]:
+    def ws_tree(self, subpath: str = "") -> dict[str, Any]:
         """列出工作区目录内容（锁定在工作区内部，隐藏点开头条目）。"""
         ws = str(getattr(self.host, "workspace", "") or "")
         if not ws.strip():
@@ -610,7 +611,7 @@ class DesktopApp:
         rel = target.relative_to(root).as_posix()
         return {"ok": True, "rel": "" if rel == "." else rel, "entries": entries}
 
-    def run_terminal(self, command: str) -> Dict[str, Any]:
+    def run_terminal(self, command: str) -> dict[str, Any]:
         """在右侧终端执行命令：复用 shell 工具（权限门 + 工作区 cwd）。"""
         tool = next((t for t in self.host.collect_tools() if t.name == "run_command"), None)
         if tool is None:
@@ -621,7 +622,7 @@ class DesktopApp:
             return {"ok": False, "error": f"命令执行失败: {exc}"}
         return {"ok": True, "output": output}
 
-    def review(self) -> Dict[str, Any]:
+    def review(self) -> dict[str, Any]:
         """审查工作区改动：git status + git diff。"""
         import locale
         import subprocess
@@ -645,7 +646,9 @@ class DesktopApp:
             # 取 bytes 自行解码（多编码兜底）；core.quotepath=false 避免非 ASCII 路径被八进制转义
             return subprocess.run(
                 ["git", "-c", "core.quotepath=false", *args],
-                cwd=ws, capture_output=True, timeout=30)
+                cwd=ws, capture_output=True, timeout=30,
+                check=False,  # 非零退出（如「不是 git 仓库」）由调用方按语义处理
+            )
 
         status = git("status", "--short")
         if status.returncode != 0:
@@ -659,7 +662,7 @@ class DesktopApp:
     def _profile_skills_dir(self) -> Path:
         return Path(self.host.profile.root) / "skills"
 
-    def skills(self) -> Dict[str, Any]:
+    def skills(self) -> dict[str, Any]:
         from nanoagent.skills import SkillRegistry
 
         registry = SkillRegistry()
@@ -679,7 +682,7 @@ class DesktopApp:
                           "source": "profile" if owned else "插件", "path": source})
         return {"ok": True, "skills": items}
 
-    def install_skill(self, source: str) -> Dict[str, Any]:
+    def install_skill(self, source: str) -> dict[str, Any]:
         import shutil
 
         src = Path(str(source or "").strip().strip('"'))
@@ -694,7 +697,7 @@ class DesktopApp:
         shutil.copytree(src, dest)
         return {"ok": True, "name": src.name}
 
-    def remove_skill(self, name: str) -> Dict[str, Any]:
+    def remove_skill(self, name: str) -> dict[str, Any]:
         import shutil
 
         dest = self._profile_skills_dir() / str(name or "")
@@ -705,7 +708,7 @@ class DesktopApp:
         return {"ok": True, "name": name}
 
     # -- 插件 ----------------------------------------------------------------
-    def plugins(self) -> Dict[str, Any]:
+    def plugins(self) -> dict[str, Any]:
         plugins_root = self.host.profile.plugins_dir.resolve()
         items = []
         for plugin in self.host.list():
@@ -727,7 +730,7 @@ class DesktopApp:
             })
         return {"ok": True, "plugins": items}
 
-    def install_plugin(self, source: str) -> Dict[str, Any]:
+    def install_plugin(self, source: str) -> dict[str, Any]:
         try:
             dest = self.host.profile.install_plugin(source)
         except Exception as exc:  # noqa: BLE001
@@ -752,7 +755,7 @@ class DesktopApp:
             }
         return {"ok": True, "name": record.name, "note": "已热激活"}
 
-    def remove_plugin(self, name: str) -> Dict[str, Any]:
+    def remove_plugin(self, name: str) -> dict[str, Any]:
         # 记录里的目录名可能与插件名（manifest name）不同，必须按 record.path 删除，
         # 否则会去删 <plugins>/<manifest-name> 这个不存在的目录，留下半卸载状态。
         record = self.host.plugins.get(name)
@@ -2180,11 +2183,13 @@ def run(host, title: str = "卅 harness", width: int = 1180, height: int = 780) 
     try:
         import webview  # pywebview
     except ImportError:
+        # from None：这里的 ImportError 只是「没装界面库」，链上去只会让人以为
+        # 是 pywebview 内部出了问题；真正要读的是下面这段安装指引。
         raise SystemExit(
             "桌面端需要 pywebview：\n"
             "    pip install pywebview\n"
             "或安装时带上桌面扩展：pip install sahou-harness[desktop]"
-        )
+        ) from None
     app = DesktopApp(host)
     # 沿用上次在界面里选择的工作区（优先于 CLI --workspace）
     try:

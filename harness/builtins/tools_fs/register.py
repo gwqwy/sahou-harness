@@ -20,13 +20,13 @@
 
 from __future__ import annotations
 
+from harness.config import permission_mode
 from harness.workspace import (
     IGNORED_PARTS,  # noqa: F401 —— 保留再导出，历史上从本模块引用过
     iter_files,
     relative,
     safe_path,
 )
-from harness.config import permission_mode
 
 MAX_READ_CHARS = 8000        # 单次 read_file 回给模型的字符上限
 DEFAULT_READ_LINES = 2000    # 单次 read_file 默认行数

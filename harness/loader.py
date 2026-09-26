@@ -8,7 +8,7 @@ import logging
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ MANIFEST_ERROR_KEY = "_manifest_error"
 DEP_KEYS = ("inject", "deps", "requires", "dependencies")
 
 
-def manifest_deps(manifest: Dict[str, Any]) -> list:
+def manifest_deps(manifest: dict[str, Any]) -> list:
     """从插件清单里取出依赖的插件名列表。
 
     支持 ``"inject": ["models"]`` 与 ``"inject": "models, tools_fs"`` 两种写法；
@@ -35,7 +35,7 @@ def manifest_deps(manifest: Dict[str, Any]) -> list:
     return []
 
 
-def load_manifest(path: Path) -> Dict[str, Any]:
+def load_manifest(path: Path) -> dict[str, Any]:
     """读取 plugin.json；不存在时返回最小清单（name=目录名）。
 
     存在但无法解析 / 不是对象时：记一条 warning，并在清单里带 MANIFEST_ERROR_KEY，

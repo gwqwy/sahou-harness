@@ -89,9 +89,10 @@ def register(ctx) -> None:
             return f"错误：清单最多 {MAX_ITEMS} 项（收到 {len(items)} 项），请合并同类型步骤"
 
         parsed: list[TodoItem] = []
-        for index, entry in enumerate(items, start=1):
-            if isinstance(entry, str):
-                entry = {"content": entry}
+        for index, raw_entry in enumerate(items, start=1):
+            # 不要把 str 的归一化写回循环变量：那会让「同一变量既是原始项又是解析结果」，
+            # 读到第 3 行的人无法判断 entry 此时到底是什么。
+            entry = {"content": raw_entry} if isinstance(raw_entry, str) else raw_entry
             if not isinstance(entry, dict):
                 return f"错误：第 {index} 项不是对象（收到 {type(entry).__name__}）"
             title = str(entry.get("content") or entry.get("title") or entry.get("task") or "").strip()

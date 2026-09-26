@@ -10,13 +10,12 @@
 
 from __future__ import annotations
 
-import importlib.util
+import builtins
 import logging
-import sys
-import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -31,7 +30,7 @@ class EventBus:
     """极简事件总线：emit 逐个调用 handler，单个 handler 出错不影响其余。"""
 
     def __init__(self) -> None:
-        self._handlers: Dict[str, List[Callable]] = {}
+        self._handlers: dict[str, list[Callable]] = {}
 
     def on(self, event: str, handler: Callable) -> Callable:
         """订阅事件，返回取消订阅的 disposer。"""
@@ -48,7 +47,7 @@ class EventBus:
         for handler in list(self._handlers.get(event, [])):
             try:
                 handler(**payload)
-            except Exception:  # noqa: BLE001 —— 观察者出错不阻断宿主
+            except Exception:
                 # 但不能静默：否则插件监听器坏了宿主完全无感
                 _logger.warning("事件 %r 的监听器 %r 执行失败", event, handler, exc_info=True)
 
@@ -57,10 +56,10 @@ class EventBus:
 class _Tools:
     """ctx.tools：注册 agent 可调用的工具。"""
 
-    def __init__(self, ctx: "Context") -> None:
+    def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
 
-    def register(self, source: Any, name: Optional[str] = None) -> Any:
+    def register(self, source: Any, name: str | None = None) -> Any:
         from nanoagent.tools import Tool, make_tool
 
         tool = source if isinstance(source, Tool) else make_tool(source, name=name)
@@ -71,7 +70,7 @@ class _Tools:
 class _Skills:
     """ctx.skills：声明插件携带的 SKILL.md 技能目录。"""
 
-    def __init__(self, ctx: "Context") -> None:
+    def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
 
     def add_dir(self, path: str | Path) -> None:
@@ -83,7 +82,7 @@ class _Skills:
 class _Models:
     """ctx.models：注册模型客户端（对齐 dsh 的模型适配器插件）。"""
 
-    def __init__(self, ctx: "Context") -> None:
+    def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
 
     def register(self, name: str, llm: Any) -> None:
@@ -93,7 +92,7 @@ class _Models:
 class _Commands:
     """ctx.commands：注册 REPL 斜杠命令（UI 也是插件）。"""
 
-    def __init__(self, ctx: "Context") -> None:
+    def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
 
     def register(self, name: str, handler: Callable, help_text: str = "") -> None:
@@ -106,17 +105,17 @@ class Context:
     ctx.host 指向 Harness 宿主（profile / confirm 回调等运行时设施挂在那里）。
     """
 
-    def __init__(self, plugin_name: str, bus: EventBus, host: Optional["Harness"] = None) -> None:
+    def __init__(self, plugin_name: str, bus: EventBus, host: Harness | None = None) -> None:
         self.plugin_name = plugin_name
         self.bus = bus
         self.host = host
-        self.services: Dict[str, Any] = {}
-        self.tools_list: List[Any] = []
-        self.skill_dirs: List[str] = []
-        self.models_map: Dict[str, Any] = {}
-        self.commands_map: Dict[str, Dict[str, Any]] = {}
-        self.skipped: List[str] = []
-        self._disposers: List[Callable] = []
+        self.services: dict[str, Any] = {}
+        self.tools_list: list[Any] = []
+        self.skill_dirs: list[str] = []
+        self.models_map: dict[str, Any] = {}
+        self.commands_map: dict[str, dict[str, Any]] = {}
+        self.skipped: list[str] = []
+        self._disposers: list[Callable] = []
         self.tools = _Tools(self)
         self.skills = _Skills(self)
         self.models = _Models(self)
@@ -143,7 +142,7 @@ class Context:
         self._disposers.append(dispose)
         return dispose
 
-    def effect(self, fn: Callable[[], Optional[Callable]]) -> None:
+    def effect(self, fn: Callable[[], Callable | None]) -> None:
         """执行 fn 并把其返回的 disposer 记入账本（dsh 的 ctx.effect）。"""
         disposer = fn()
         if disposer is not None:
@@ -168,15 +167,15 @@ class PluginRecord:
     name: str
     path: str
     state: str = PENDING
-    manifest: Dict[str, Any] = field(default_factory=dict)
-    ctx: Optional[Context] = None
-    provided: Dict[str, List[str]] = field(default_factory=dict)
-    skipped: List[str] = field(default_factory=list)
+    manifest: dict[str, Any] = field(default_factory=dict)
+    ctx: Context | None = None
+    provided: dict[str, list[str]] = field(default_factory=dict)
+    skipped: list[str] = field(default_factory=list)
     error: str = ""
-    deps: List[str] = field(default_factory=list)
+    deps: list[str] = field(default_factory=list)
     # 装载期就已知的问题（清单损坏、依赖缺失等）。与 skipped 分开存：
     # activate() 会用 ctx.skipped 覆写 skipped，若把装载期的问题也塞在那里会被抹掉。
-    mount_notes: List[str] = field(default_factory=list)
+    mount_notes: list[str] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {"name": self.name, "state": self.state, "provided": self.provided,
@@ -189,14 +188,14 @@ class Harness:
 
     def __init__(self) -> None:
         self.bus = EventBus()
-        self.plugins: Dict[str, PluginRecord] = {}
-        self.services: Dict[str, Any] = {}
-        self.service_conflicts: Dict[str, List[str]] = {}  # 服务名 → 提供者列表
+        self.plugins: dict[str, PluginRecord] = {}
+        self.services: dict[str, Any] = {}
+        self.service_conflicts: dict[str, list[str]] = {}  # 服务名 → 提供者列表
         self.profile = None        # 由运行时（cli）注入
-        self.confirm: Optional[Callable[[str], bool]] = None  # 权限确认回调（REPL 注入）
+        self.confirm: Callable[[str], bool] | None = None  # 权限确认回调（REPL 注入）
 
     # -- 发现 ------------------------------------------------------------
-    def mount(self, path: str | Path, name: Optional[str] = None) -> PluginRecord:
+    def mount(self, path: str | Path, name: str | None = None) -> PluginRecord:
         """装载一个插件目录（不激活）。重名自动加序号后缀。"""
         from .loader import MANIFEST_ERROR_KEY, load_manifest, manifest_deps
 
@@ -216,7 +215,7 @@ class Harness:
         self.plugins[final_name] = record
         return record
 
-    def mount_all(self, directory: str | Path) -> List[PluginRecord]:
+    def mount_all(self, directory: str | Path) -> builtins.list[PluginRecord]:
         """装载目录下全部插件子目录。"""
         root = Path(directory)
         discovered = []
@@ -227,7 +226,7 @@ class Harness:
         return discovered
 
     # -- 激活 / 卸载 ------------------------------------------------------
-    def activation_order(self) -> List[str]:
+    def activation_order(self) -> builtins.list[str]:
         """按依赖关系排出激活顺序（拓扑排序）。
 
         未声明 ``inject`` 的插件保持挂载顺序（稳定）。此前顺序**只由目录名排序决定**，
@@ -236,21 +235,21 @@ class Harness:
 
         依赖成环时不阻塞：记录一条 warning，环内成员按挂载顺序激活。
         """
-        order: List[str] = []
-        marks: Dict[str, int] = {}   # 0=访问中，1=已完成
-        cycles: List[str] = []
+        order: list[str] = []
+        marks: dict[str, int] = {}   # 0=访问中，1=已完成
+        cycles: list[str] = []
 
-        def visit(name: str, stack: List[str]) -> None:
+        def visit(name: str, stack: list[str]) -> None:
             state = marks.get(name)
             if state == 1:
                 return
             if state == 0:
-                cycles.append(" → ".join(stack + [name]))
+                cycles.append(" → ".join([*stack, name]))
                 return
             marks[name] = 0
             for dep in self.plugins[name].deps:
                 if dep in self.plugins:
-                    visit(dep, stack + [name])
+                    visit(dep, [*stack, name])
             marks[name] = 1
             order.append(name)
 
@@ -260,9 +259,9 @@ class Harness:
             _logger.warning("插件依赖成环，环内成员按挂载顺序激活：%s", chain)
         return order
 
-    def _dependency_notes(self, record: PluginRecord) -> List[str]:
+    def _dependency_notes(self, record: PluginRecord) -> builtins.list[str]:
         """检查声明的依赖是否真的可用，返回给用户看的问题列表。"""
-        notes: List[str] = []
+        notes: list[str] = []
         for dep in record.deps:
             other = self.plugins.get(dep)
             if other is None:
@@ -320,10 +319,10 @@ class Harness:
         同名服务被多个插件提供时会记 warning 并留档到 service_conflicts：
         「后者静默覆盖前者」是插件系统里最难查的一类问题，至少要让它可见。
         """
-        services: Dict[str, Any] = {}
-        owners: Dict[str, str] = {}
-        conflicts: Dict[str, List[str]] = {}
-        models: Dict[str, Any] = {}
+        services: dict[str, Any] = {}
+        owners: dict[str, str] = {}
+        conflicts: dict[str, list[str]] = {}
+        models: dict[str, Any] = {}
         for plugin in self.plugins.values():
             if plugin.state != ACTIVE or plugin.ctx is None:
                 continue
@@ -343,7 +342,7 @@ class Harness:
         self.services = services
         self.service_conflicts = conflicts
 
-    def activate_all(self) -> List[PluginRecord]:
+    def activate_all(self) -> builtins.list[PluginRecord]:
         return [self.activate(name) for name in self.activation_order()]
 
     def deactivate(self, name: str) -> PluginRecord:
@@ -376,23 +375,23 @@ class Harness:
         return self.activate(fresh.name)
 
     # -- 能力聚合 --------------------------------------------------------
-    def collect_tools(self) -> List[Any]:
-        tools: List[Any] = []
+    def collect_tools(self) -> builtins.list[Any]:
+        tools: list[Any] = []
         for record in self.plugins.values():
             if record.state == ACTIVE and record.ctx is not None:
                 tools.extend(record.ctx.tools_list)
         return tools
 
-    def collect_skill_dirs(self) -> List[str]:
-        dirs: List[str] = []
+    def collect_skill_dirs(self) -> builtins.list[str]:
+        dirs: list[str] = []
         for record in self.plugins.values():
             if record.state == ACTIVE and record.ctx is not None:
                 dirs.extend(record.ctx.skill_dirs)
         return dirs
 
-    def collect_commands(self) -> Dict[str, Dict[str, Any]]:
+    def collect_commands(self) -> dict[str, dict[str, Any]]:
         """聚合全部插件注册的 REPL 斜杠命令。"""
-        commands: Dict[str, Dict[str, Any]] = {}
+        commands: dict[str, dict[str, Any]] = {}
         for record in self.plugins.values():
             if record.state == ACTIVE and record.ctx is not None:
                 commands.update(record.ctx.commands_map)
@@ -401,5 +400,5 @@ class Harness:
     def service(self, name: str, default: Any = None) -> Any:
         return self.services.get(name, default)
 
-    def list(self) -> List[dict]:
+    def list(self) -> builtins.list[dict]:
         return [r.summary() for r in self.plugins.values()]

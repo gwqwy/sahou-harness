@@ -81,7 +81,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_status_and_get_models(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             status = app.status()
             self.assertTrue(status["ok"])
             self.assertEqual(status["model"], "m1")
@@ -131,7 +131,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_session_rename_and_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             app.chat("第一句", "t1")
             renamed = app.rename_session("t1", "我的会话")
             self.assertTrue(renamed["ok"])
@@ -180,7 +180,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_usage_and_context_usage(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             app.chat("你好", "t1")
             usage = app.usage()
             self.assertTrue(usage["ok"])
@@ -274,12 +274,12 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_choose_workspace_without_window(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             self.assertFalse(app.choose_workspace()["ok"])
 
     def test_plugin_install_and_remove(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             src = Path(tmp) / "my-plugin"
             src.mkdir()
             (src / "plugin.json").write_text('{"name": "my-plugin"}', encoding="utf-8")
@@ -313,13 +313,13 @@ class DesktopApiTests(unittest.TestCase):
     def test_plugin_remove_missing_reports_error(self):
         # P2 #14 回归：目标不存在时不再返回静默 ok:true 的半卸载状态
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             result = app.remove_plugin("不存在的插件")
             self.assertFalse(result["ok"], result)
 
     def test_theme_persist_and_validate(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             self.assertEqual(app.status()["theme"], "light")  # 默认浅色
             for mode in ("dark", "light", "system"):
                 result = app.set_theme(mode)
@@ -374,7 +374,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_market_list_uses_cached_fetch(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             calls = []
             import harness.desktop as desktop_mod
 
@@ -401,7 +401,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_market_list_reports_fetch_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             import harness.desktop as desktop_mod
 
             def boom(url, timeout=20):
@@ -418,7 +418,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_market_install_rejects_unsafe_url(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             self.assertFalse(app.market_install("http://127.0.0.1/repo")["ok"])
             self.assertFalse(app.market_install("ftp://github.com/a/b")["ok"])
             self.assertFalse(app.market_install("")["ok"])
@@ -429,7 +429,7 @@ class DesktopApiTests(unittest.TestCase):
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             # 本地 git 仓库模拟远端，把 git clone 替换为复制目录
             remote = Path(tmp) / "remote"
             remote.mkdir()
@@ -475,7 +475,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_terminal_reuses_shell_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             app.set_permission("shell", "deny")
             res = app.run_terminal("echo hi")
             self.assertTrue(res["ok"])
@@ -489,7 +489,7 @@ class DesktopApiTests(unittest.TestCase):
         import subprocess
 
         with tempfile.TemporaryDirectory() as tmp:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             app.set_workspace(tmp)
             bad = app.review()
             self.assertFalse(bad["ok"])  # 非 git 仓库
@@ -502,7 +502,7 @@ class DesktopApiTests(unittest.TestCase):
 
     def test_skills_install_list_remove(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as skill_src:
-            host, app = self._app(Path(tmp))
+            _host, app = self._app(Path(tmp))
             src = Path(skill_src) / "my-skill"
             src.mkdir()
             (src / "SKILL.md").write_text(

@@ -13,9 +13,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from nanoagent.llm import LLMResponse
+
 from harness.config import Profile
 from harness.kernel import ACTIVE, DISPOSED, FAILED, Harness
-from nanoagent.llm import LLMResponse
 
 TESTS_DIR = Path(__file__).resolve().parent
 
@@ -63,11 +64,10 @@ def allow_shell(host: Harness) -> Harness:
 
 
 def build_host(tmp: Path, **config_overrides) -> Harness:
-    from harness.cli import BUILTINS_DIR, build_runtime
+    from harness.cli import build_runtime
 
     profile = make_profile(tmp, **config_overrides)
-    host = build_runtime(profile, str(tmp))
-    return host
+    return build_runtime(profile, str(tmp))
 
 
 class StreamingFakeLLM(FakeLLM):
@@ -209,8 +209,8 @@ def register(ctx):
         旧行为：activate() 成功路径不重置 record.error，于是 /status 与 /plugins
         会长期显示一个早已不存在的错误。
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
             flag = tmp / "fail-now"
             flag.write_text("x", encoding="utf-8")
             plugin = self._plugin(tmp, "flaky", f"""
@@ -367,7 +367,7 @@ class BuiltinPluginsTests(unittest.TestCase):
                 {"name": "m2", "provider": "openai", "model": "y", "api_key": "k"},
             ])
             with patch_model_build():
-                from harness.cli import BUILTINS_DIR, build_runtime
+                from harness.cli import build_runtime
 
                 host = build_runtime(profile, str(tmp))
                 runtime = host.service("models_runtime")
@@ -400,7 +400,6 @@ class BuiltinPluginsTests(unittest.TestCase):
             read = next(t for t in host.collect_tools() if t.name == "read_file")
             write.invoke({"path": "你好.saho", "content": "打印(1)"})
             self.assertIn("打印(1)", read.invoke({"path": "你好.saho"}))
-            from nanoagent.tools import Tool
 
             with self.assertRaises(Exception):
                 read.invoke({"path": "../escape.txt"})
@@ -662,7 +661,7 @@ class CliTests(unittest.TestCase):
             names = [m["name"] for m in config["models"]]
             self.assertNotIn("mine", names)
             # 关键不变量：default_model 不能指向已不存在的模型
-            self.assertIn(config["default_model"], names + [""],
+            self.assertIn(config["default_model"], [*names, ""],
                           "删掉默认模型后不能留悬空引用")
 
             with contextlib.redirect_stderr(io.StringIO()):

@@ -213,8 +213,7 @@ def register(ctx) -> None:
         agent = get_agent()
         has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async)
                         for n in agent.tools.names())
-        for event in _stream_events(agent, message, session_id, has_async):
-            yield event
+        yield from _stream_events(agent, message, session_id, has_async)
         # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
         host.profile.save_session(session_id, agent.memory.history(session_id))
 

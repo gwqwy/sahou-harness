@@ -3,7 +3,8 @@ name = "sahou-harness"
 version = "0.1.0"
 description = "卅 harness：一个「一切皆插件」的 agent harness（参考 DeepSeek Harness 架构），执行引擎基于 nanoagent"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "nanoagent>=0.1.0",
@@ -11,13 +12,92 @@ dependencies = [
 
 [project.optional-dependencies]
 desktop = ["pywebview>=5.0"]
+dev = ["build>=1.2", "mypy>=1.11", "ruff>=0.6", "twine>=5.0"]
 
 [project.scripts]
 sha = "harness.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gwqwy/sahou-harness"
+Source = "https://github.com/gwqwy/sahou-harness"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# ---------------------------------------------------------------------------
+# 打包
+# ---------------------------------------------------------------------------
 [tool.setuptools.packages.find]
 include = ["harness*"]
+# harness/builtins/<插件>/ 是**没有 __init__.py 的普通目录**（插件按文件路径装载，
+# 不需要成为包），因此必须按命名空间包发现，否则这些目录根本不会进 wheel。
+namespaces = true
+
+[tool.setuptools.package-data]
+# plugin.json 是非 .py 文件，setuptools 默认**不会**收集它。
+# 少了它的后果很隐蔽：包能装上、能 import，但 13 个内置插件全部丢失清单 ——
+# 插件名退化成目录名、inject 依赖声明消失、拓扑激活与冲突检测静默失效。
+# py.typed 是 PEP 561 标记，让下游的 mypy 认这个包带类型信息。
+"*" = ["plugin.json", "py.typed"]
+
+# ---------------------------------------------------------------------------
+# 静态检查
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["_diag", "build_pyi", "dist"]
+
+[tool.ruff.lint]
+# 显式钉住规则集：ruff 每次升级都可能扩大默认集，不钉住的话 CI 会在某天
+# 毫无预警地变红（0.16 的默认集就比 0.6 宽得多）。
+select = [
+    "E",   # pycodestyle：缩进、空白等语法级问题
+    "W",   # pycodestyle：警告
+    "F",   # pyflakes：未使用导入/变量、未定义名 —— 真缺陷
+    "I",   # isort：导入排序
+    "UP",  # pyupgrade：py3.10+ 惯用写法（Dict → dict 等）
+    "B",   # flake8-bugbear：易错写法
+    "C4",  # 推导式/字面量简化
+    "SIM", # 可简化写法
+    "RET", # return 相关
+    "PIE", # 杂项改进
+    "ISC", # 隐式字符串拼接（漏个逗号就变成两个元素合一）
+    "PLW", # pylint warning
+    "RUF", # ruff 自研
+    "BLE", # 盲 except（代码库已用 `# noqa: BLE001` 标注刻意为之处）
+]
+ignore = [
+    "E501", # 行宽由 line-length 与格式化负责，lint 不重复报
+
+    # 中文项目必须关掉：这两族规则把全角标点（，。：（）「」）判为「歧义 Unicode」，
+    # 而中文注释与文案本来就用全角标点 —— 开着只会产出 1400 条噪声，
+    # 把真正的信号淹掉。
+    "RUF001", # 歧义 Unicode 字符（字符串）
+    "RUF002", # 歧义 Unicode 字符（文档字符串）
+    "RUF003", # 歧义 Unicode 字符（注释）
+
+    # 刻意保留显式 try/except 而不是 contextlib.suppress：
+    # 这些位置（事件推送、审计写入）需要在 except 行上写「为什么可以吞」。
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里 assertRaises(Exception) 是刻意的宽断言（只关心「抛了」）
+"tests/*" = ["B017"]
+
+# ---------------------------------------------------------------------------
+# 类型检查（advisory：CI 里不阻塞，见 .github/workflows）
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+files = ["harness"]
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# 插件通过 ctx.host 访问宿主，宿主属性是运行期注入的，静态上只能是 Any；
+# 这里不追求全量标注，只求把真正的类型矛盾（如 str/None 混用）暴露出来。
+disallow_untyped_defs = false
