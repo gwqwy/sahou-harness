@@ -179,6 +179,37 @@ def register(ctx):
             self.assertEqual(host.service("b"), 2)
 
 
+    def test_reactivation_clears_stale_error(self):
+        """缺陷修复：FAILED 插件修好后重新激活，不得留着上一次的失败原因。
+
+        旧行为：activate() 成功路径不重置 record.error，于是 /status 与 /plugins
+        会长期显示一个早已不存在的错误。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            flag = tmp / "fail-now"
+            flag.write_text("x", encoding="utf-8")
+            plugin = self._plugin(tmp, "flaky", f"""
+from pathlib import Path
+
+def register(ctx):
+    if Path(r"{flag}").exists():
+        raise RuntimeError("首次故意失败")
+    ctx.provide("svc", 1)
+""")
+            host = Harness()
+            record = host.mount(plugin)
+            host.activate(record.name)
+            self.assertEqual(record.state, FAILED)
+            self.assertIn("首次故意失败", record.error)
+
+            flag.unlink()
+            host.activate(record.name)
+            self.assertEqual(record.state, ACTIVE)
+            self.assertEqual(record.error, "", "重新激活成功后必须清空陈旧错误")
+            self.assertEqual(record.provided["services"], ["svc"])
+
+
 class BuiltinPluginsTests(unittest.TestCase):
     def test_builtin_plugins_all_activate(self):
         with tempfile.TemporaryDirectory() as tmp, patch_model_build():
@@ -270,6 +301,67 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(result["tool_calls"][0]["result"], "已写入 demo.txt（1 行）")
             self.assertEqual(result["reply"], "写好了")
             self.assertTrue((Path(tmp) / "demo.txt").is_file())
+
+
+class SessionTests(unittest.TestCase):
+    """缺陷修复：/new 必须真正开新会话（换 id + 清 agent），旧会话仍保留在磁盘。"""
+
+    def test_new_session_does_not_replay_old_history(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ask = host.service("ask")
+            new_session = host.service("new_session")
+
+            ask("第一句", session_id="default")
+            self.assertEqual(len(host.profile.load_session("default")), 2)
+
+            sid = new_session()
+            self.assertNotEqual(sid, "default", "new_session 必须换一个会话 id")
+
+            ask("第二句", session_id=sid)
+            agent = host.service("agent_factory")()
+            contents = [m.get("content") for m in agent.memory.history(sid)]
+            self.assertNotIn("第一句", contents, "新会话里不得回放旧会话的历史")
+            self.assertIn("第二句", contents)
+            # 旧会话不是被销毁，只是不再续用
+            self.assertEqual(len(host.profile.load_session("default")), 2)
+
+    def test_ask_defaults_to_current_session(self):
+        """ask 省略 session_id 时用当前会话 —— 调用方忘记传新 id 也不会串回旧会话。"""
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ask = host.service("ask")
+            sid = host.service("new_session")()
+
+            ask("第一句")
+            ask("第二句")
+            self.assertEqual(len(host.profile.load_session(sid)), 4)
+            self.assertEqual(host.profile.load_session("default"), [])
+
+    def test_switching_session_rebuilds_agent(self):
+        """切到另一个会话必须重建 agent，否则记忆里仍是上一个会话的内容。"""
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ask = host.service("ask")
+
+            ask("会话甲的提问", session_id="a")
+            ask("会话乙的提问", session_id="b")
+            agent = host.service("agent_factory")()
+            contents = [m.get("content") for m in agent.memory.history("b")]
+            self.assertIn("会话乙的提问", contents)
+            self.assertNotIn("会话甲的提问", contents, "会话之间不得串味")
+
+    def test_new_session_ids_do_not_collide_within_one_second(self):
+        """同一秒内连续新建会话时，id 必须仍然唯一（否则会覆盖彼此的历史）。"""
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ask = host.service("ask")
+            new_session = host.service("new_session")
+
+            first = new_session()
+            ask("落盘", first)  # 使其出现在 session_ids()
+            second = new_session()
+            self.assertNotEqual(first, second)
 
 
 class ModelKeyTests(unittest.TestCase):

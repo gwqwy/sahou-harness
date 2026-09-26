@@ -244,6 +244,9 @@ class Harness:
 
         record.ctx = ctx
         record.state = ACTIVE
+        # 必须清空：FAILED 插件修好后重新激活能走到这里，
+        # 若留着旧 error，/status 会长期显示一个早已不存在的失败原因。
+        record.error = ""
         record.provided = {
             "tools": [t.name for t in ctx.tools_list],
             "services": sorted(ctx.services),

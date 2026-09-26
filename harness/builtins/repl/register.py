@@ -18,11 +18,15 @@ def register(ctx) -> None:
             return "\n".join(lines)
 
         def run_command(line: str) -> None:
+            nonlocal session_id
             name, _, args = line.partition(" ")
             if name == "/exit":
                 raise SystemExit(0)
             if name == "/new":
-                print(new_session())
+                # new_session() 返回**新的会话 id**；不更新本地变量的话，
+                # 下一轮仍会按旧 id 提问，等于没换会话。
+                session_id = new_session()
+                print(f"已开始新会话 {session_id}")
                 return
             if name == "/plugins":
                 for plugin in host.list():

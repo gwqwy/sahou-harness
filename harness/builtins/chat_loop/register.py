@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 INSTRUCTIONS = (
     "你是卅 harness 的中文编程助手，简洁、诚实、善用工具。"
     "无论用户用什么语言提问，回复必须始终使用简体中文："
@@ -49,6 +51,24 @@ def register(ctx) -> None:
     host = ctx.host
     state = {"agent": None, "session_id": "default"}
 
+    def _new_session_id() -> str:
+        """生成一个尚未被占用的会话 id（时间戳 + 递增序号兜底）。
+
+        会话 id 会直接作为 ``sessions/<id>.json`` 的文件名，因此不能用冒号等
+        Windows 非法字符。
+        """
+        base = time.strftime("s-%Y%m%d-%H%M%S")
+        try:
+            existing = set(host.profile.session_ids())
+        except OSError:
+            existing = set()
+        if base not in existing:
+            return base
+        counter = 2
+        while f"{base}-{counter}" in existing:
+            counter += 1
+        return f"{base}-{counter}"
+
     def get_agent():
         if state["agent"] is None:
             from pathlib import Path
@@ -85,9 +105,19 @@ def register(ctx) -> None:
             state["agent"] = agent
         return state["agent"]
 
-    def ask(message: str, session_id: str = "default") -> dict:
-        """执行一轮对话（自动适配同步/异步工具），并持久化会话。"""
-        state["session_id"] = session_id  # 先定会话：懒构建时按它回放历史
+    def ask(message: str, session_id: str | None = None) -> dict:
+        """执行一轮对话（自动适配同步/异步工具），并持久化会话。
+
+        Args:
+            message: 用户输入
+            session_id: 目标会话；省略则沿用当前会话（由 new_session 维护）
+        """
+        # 会话切换必须重建 agent：否则记忆里仍是上一个会话的历史（跨会话串味）
+        if session_id is None:
+            session_id = state["session_id"]
+        elif session_id != state["session_id"]:
+            state["agent"] = None
+            state["session_id"] = session_id
         agent = get_agent()
         has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async) for n in agent.tools.names())
         if has_async:
@@ -102,10 +132,22 @@ def register(ctx) -> None:
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
 
-    def new_session() -> str:
-        state["agent"] = None  # 下次 ask 重建（记忆随之清空）
-        return "已开始新会话。"
+    def new_session(session_id: str | None = None) -> str:
+        """开始一个新会话，返回新的会话 id（旧会话历史仍保留在磁盘上）。
+
+        必须**同时**换 id 与清 agent。旧实现只把 agent 置空、id 保持不变，
+        于是下一次 ask 又按同一个 id 从磁盘把旧历史回放回来 ——
+        `/new` 看起来说了「已开始新会话」，实际一条都没清掉。
+        """
+        state["session_id"] = session_id or _new_session_id()
+        state["agent"] = None
+        return state["session_id"]
+
+    def current_session() -> str:
+        """当前会话 id（供界面显示 / 保存）。"""
+        return state["session_id"]
 
     ctx.provide("agent_factory", get_agent)
     ctx.provide("ask", ask)
     ctx.provide("new_session", new_session)
+    ctx.provide("current_session", current_session)

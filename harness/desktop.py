@@ -371,7 +371,7 @@ class DesktopApp:
         session_id = time.strftime("s-%Y%m%d-%H%M%S")
         reset = self.host.service("new_session")
         if callable(reset):
-            reset()
+            reset(session_id)  # 把 id 一并告知对话插件，避免两边各生成一个
         self._current_session = session_id
         self._touch_session(session_id)
         return {"ok": True, "session": session_id}
@@ -395,7 +395,7 @@ class DesktopApp:
             if session_id != self._current_session:
                 reset = self.host.service("new_session")
                 if callable(reset):
-                    reset()  # 重建 agent：按目标会话回放历史
+                    reset(session_id)  # 重建 agent：按目标会话回放历史
                 self._current_session = session_id
             ask = self.host.service("ask")
             if not callable(ask):
