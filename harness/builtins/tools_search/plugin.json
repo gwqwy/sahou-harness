@@ -1,0 +1,4 @@
+{
+  "name": "tools_search",
+  "description": "搜索工具插件：在工作区内按内容搜索（grep 式），支持 glob 限定、正则与结果上限"
+}

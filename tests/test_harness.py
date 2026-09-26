@@ -68,6 +68,11 @@ def build_host(tmp: Path, **config_overrides) -> Harness:
     return host
 
 
+def tool(host, name: str):
+    """按名字取出已聚合的工具（不存在直接失败，避免测试静默跑空）。"""
+    return next(t for t in host.collect_tools() if t.name == name)
+
+
 def patch_model_build():
     """把 models 插件的 LLM 构建替换为 FakeLLM（离线测试）。
 
@@ -215,7 +220,8 @@ class BuiltinPluginsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch_model_build():
             host = build_host(Path(tmp))
             states = {p["name"]: p["state"] for p in host.list()}
-            for name in ("chat_loop", "models", "tools_fs", "tools_shell", "skills", "repl"):
+            for name in ("chat_loop", "models", "tools_fs", "tools_shell", "tools_search",
+                         "tools_todo", "skills", "repl"):
                 self.assertEqual(states.get(name), ACTIVE, name)
             self.assertIn("ask", host.services)
             self.assertIn("ui", host.services)
@@ -228,6 +234,8 @@ class BuiltinPluginsTests(unittest.TestCase):
             self.assertIn("write_file", names)
             self.assertIn("run_command", names)
             self.assertIn("switch_model", names)
+            for extra in ("edit_file", "search_text", "todo_write", "todo_read"):
+                self.assertIn(extra, names)
 
     def test_model_switch_persists_and_updates_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +281,138 @@ class BuiltinPluginsTests(unittest.TestCase):
 
             with self.assertRaises(Exception):
                 read.invoke({"path": "../escape.txt"})
+
+
+class ToolTests(unittest.TestCase):
+    """工具集补强：edit_file / read 分页 / list 上限 / search_text / todo / shell cwd·env。"""
+
+    def test_edit_file_replaces_exactly(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_fs(build_host(Path(tmp)))
+            tool(host, "write_file").invoke({"path": "a.py", "content": "x = 1\ny = 2\n"})
+            out = tool(host, "edit_file").invoke(
+                {"path": "a.py", "old": "y = 2", "new": "y = 3"})
+            self.assertIn("替换 1 处", out)
+            self.assertIn("y = 3", tool(host, "read_file").invoke({"path": "a.py"}))
+            self.assertNotIn("y = 2", tool(host, "read_file").invoke({"path": "a.py"}))
+
+    def test_edit_file_refuses_ambiguous_or_missing(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_fs(build_host(Path(tmp)))
+            edit = tool(host, "edit_file")
+            tool(host, "write_file").invoke({"path": "b.txt", "content": "a\na\n"})
+
+            out = edit.invoke({"path": "b.txt", "old": "a", "new": "z"})
+            self.assertIn("匹配到 2 处", out)
+            self.assertEqual(tool(host, "read_file").invoke({"path": "b.txt"}).count("a"), 2,
+                             "命中数不符时不得改动文件")
+
+            self.assertIn("未找到", edit.invoke({"path": "b.txt", "old": "没有的", "new": "z"}))
+            # 显式声明期望处数即可批量替换
+            self.assertIn("替换 2 处", edit.invoke(
+                {"path": "b.txt", "old": "a", "new": "z", "count": 2}))
+
+    def test_edit_file_respects_permission_gate(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))  # fs=ask 且无 confirm → fail-closed
+            allow_fs(host)
+            tool(host, "write_file").invoke({"path": "c.txt", "content": "hello"})
+            host.profile.update_config(permissions={"fs": "ask"})
+            out = tool(host, "edit_file").invoke({"path": "c.txt", "old": "hello", "new": "bye"})
+            self.assertIn("未获人工确认", out)
+            self.assertIn("hello", tool(host, "read_file").invoke({"path": "c.txt"}))
+
+    def test_read_file_pagination(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_fs(build_host(Path(tmp)))
+            content = "\n".join(f"line{i}" for i in range(1, 301))
+            tool(host, "write_file").invoke({"path": "big.txt", "content": content})
+            read = tool(host, "read_file")
+
+            out = read.invoke({"path": "big.txt", "offset": 101, "limit": 50})
+            self.assertIn("101: line101", out)
+            self.assertIn("150: line150", out)
+            self.assertNotIn("151: line151", out)
+            self.assertIn("offset=151", out, "应给出续读提示")
+            self.assertIn("超出文件末尾", read.invoke({"path": "big.txt", "offset": 9999}))
+
+    def test_list_files_is_capped(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_fs(build_host(Path(tmp)))
+            write = tool(host, "write_file")
+            for i in range(6):
+                write.invoke({"path": f"f{i}.txt", "content": "x"})
+            out = tool(host, "list_files").invoke({"pattern": "*.txt", "max_results": 3})
+            self.assertEqual(len([ln for ln in out.splitlines() if ln.endswith(".txt")]), 3)
+            self.assertIn("已达上限 3 条", out)
+            # 非法模式必须回一条可读错误，而不是把异常抛给模型
+            self.assertIn("错误：", tool(host, "list_files").invoke({"pattern": "../*"}))
+
+    def test_search_text(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_fs(build_host(Path(tmp)))
+            write = tool(host, "write_file")
+            write.invoke({"path": "pkg/a.py", "content": "def foo():\n    return 1\n"})
+            write.invoke({"path": "note.md", "content": "foo 出现在文档里\n"})
+            search = tool(host, "search_text")
+
+            out = search.invoke({"pattern": "foo"})
+            self.assertIn("pkg/a.py:1", out)
+            self.assertIn("note.md:1", out)
+
+            scoped = search.invoke({"pattern": "foo", "glob": "**/*.py"})
+            self.assertIn("pkg/a.py:1", scoped)
+            self.assertNotIn("note.md", scoped)
+
+            self.assertIn("无匹配", search.invoke({"pattern": "绝不存在的串"}))
+            self.assertIn("正则表达式无效", search.invoke({"pattern": "([", "regex": True}))
+            self.assertIn("错误：", search.invoke({"pattern": "foo", "glob": "../*"}))
+
+    def test_todo_tools(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            write_todo, read_todo = tool(host, "todo_write"), tool(host, "todo_read")
+
+            out = write_todo.invoke({"items": [
+                {"content": "第一步", "status": "pending"},
+                {"content": "第二步", "status": "进行中"},  # 中文别名
+            ]})
+            self.assertIn("[ ] 1. 第一步", out)
+            self.assertIn("[~] 2. 第二步", out)
+            self.assertIn("0/2 已完成", out)
+
+            done = write_todo.invoke({"items": [
+                {"content": "第一步", "status": "done"},
+                {"content": "第二步", "status": "completed"},
+            ]})
+            self.assertIn("2/2 已完成", done)
+            self.assertIn("待办清单（", read_todo.invoke({}))
+
+            self.assertIn("status 非法", write_todo.invoke(
+                {"items": [{"content": "x", "status": "胡说"}]}))
+            self.assertIn("缺少 content", write_todo.invoke({"items": [{"status": "done"}]}))
+            self.assertIn("需要是数组", write_todo.invoke({"items": {"content": "x"}}))
+
+    def test_shell_cwd_and_env(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = allow_shell(build_host(Path(tmp)))
+            sub = Path(tmp) / "sub"
+            sub.mkdir()
+            (sub / "probe.py").write_text(
+                "import os\n"
+                "print('CWD', os.path.basename(os.getcwd()))\n"
+                "print('ENV', os.environ.get('HARNESS_PROBE', ''))\n",
+                encoding="utf-8")
+            run = tool(host, "run_command")
+
+            out = run.invoke({"command": f'"{sys.executable}" probe.py', "cwd": "sub",
+                              "env": {"HARNESS_PROBE": "ok"}})
+            self.assertIn("exit 0", out)
+            self.assertIn("CWD sub", out)
+            self.assertIn("ENV ok", out)
+
+            self.assertIn("越出工作区", run.invoke({"command": "echo x", "cwd": "../"}))
+            self.assertIn("不是目录", run.invoke({"command": "echo x", "cwd": "nope"}))
 
 
 class EndToEndTests(unittest.TestCase):
