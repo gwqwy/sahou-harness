@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """生成应用图标：深色圆角方块 + 「卅」字，输出多尺寸 .ico。"""
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "assets" / "sha.ico"
 OUT.parent.mkdir(exist_ok=True)
 
