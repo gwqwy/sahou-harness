@@ -58,11 +58,21 @@ def register(ctx) -> None:
     config = host.profile.load_config()
     pool: dict = {}
     order: list = []
+    errors: dict = {}
     for entry in config.get("models") or []:
         name = str(entry.get("name") or "").strip()
         if not name:
             continue
-        pool[name] = _build_llm(entry)
+        # 逐个模型容错：某一条写错（如 ${ENV} 指向的变量没设）只跳过它自己。
+        # 旧行为是整段 register 抛异常 → models 插件直接 FAILED → 所有模型一起消失，
+        # 而 `sha model list` 只会显示「可用模型: 」，看不出是谁坏了。
+        try:
+            pool[name] = _build_llm(entry)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
+            errors[name] = reason
+            ctx.skipped.append(f"model:{name}: {reason}")
+            continue
         order.append(name)
 
     def set_current(name: str) -> str:
@@ -80,7 +90,9 @@ def register(ctx) -> None:
                 pass
         return f"已切换到模型 {name}"
 
-    runtime = {"pool": pool, "order": order, "current": config.get("default_model") or (order[0] if order else ""), "set": set_current}
+    runtime = {"pool": pool, "order": order, "errors": errors,
+               "current": config.get("default_model") or (order[0] if order else ""),
+               "set": set_current}
     if runtime["current"] not in pool and order:
         runtime["current"] = order[0]
 
@@ -95,7 +107,11 @@ def register(ctx) -> None:
 
     def list_models() -> str:
         """列出配置里的全部模型与当前使用的模型。"""
-        return "可用模型: " + ", ".join(order) + f"（当前: {runtime['current']}）"
+        text = ("可用模型: " + (", ".join(order) or "（无）")
+                + f"（当前: {runtime['current'] or '（未设置）'}）")
+        if errors:
+            text += "\n不可用: " + "; ".join(f"{k}（{v}）" for k, v in sorted(errors.items()))
+        return text
 
     def switch_model(name: str) -> str:
         """切换当前使用的模型（重启对话后仍生效）。

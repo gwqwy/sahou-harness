@@ -504,6 +504,140 @@ class SessionTests(unittest.TestCase):
             self.assertNotEqual(first, second)
 
 
+class CliTests(unittest.TestCase):
+    """批次C：CLI 与桌面端能力对齐（模型增删 / 会话列表 / 插件脚手架 / 坏条目容错）。"""
+
+    def test_model_add_use_remove_roundtrip(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main([*base, "model", "add", "mine", "--model", "gpt-x",
+                           "--api-key", "sk-1", "--default"])
+            self.assertEqual(rc, 0)
+            self.assertIn("已添加模型 mine", buf.getvalue())
+
+            # 重名必须拒绝，不能悄悄覆盖
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main([*base, "model", "add", "mine", "--model", "y"]), 1)
+
+            config = json.loads((Path(tmp) / "profiles" / "default" / "config.json")
+                                .read_text(encoding="utf-8"))
+            names = [m["name"] for m in config["models"]]
+            self.assertIn("mine", names)
+            self.assertEqual(config["default_model"], "mine")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*base, "model", "remove", "mine"]), 0)
+            config = json.loads((Path(tmp) / "profiles" / "default" / "config.json")
+                                .read_text(encoding="utf-8"))
+            names = [m["name"] for m in config["models"]]
+            self.assertNotIn("mine", names)
+            # 关键不变量：default_model 不能指向已不存在的模型
+            self.assertIn(config["default_model"], names + [""],
+                          "删掉默认模型后不能留悬空引用")
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main([*base, "model", "remove", "mine"]), 1)
+
+    def test_bad_model_entry_only_skips_itself(self):
+        """一个模型写错（如 ${ENV} 未设置）不能连累其它模型全部消失。"""
+        self.assertNotIn("HARNESS_UNSET_KEY_XYZ", os.environ)
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp), models=[
+                {"name": "ok", "provider": "openai", "model": "x", "api_key": "k"},
+                {"name": "bad", "provider": "openai", "model": "y",
+                 "api_key": "${HARNESS_UNSET_KEY_XYZ}"},
+            ], default="ok")
+            with patch_model_build():
+                from harness.cli import build_runtime
+
+                host = build_runtime(profile, str(tmp))
+                runtime = host.service("models_runtime")
+                self.assertEqual(runtime["order"], ["ok"])
+                self.assertIn("bad", runtime["errors"])
+                self.assertEqual(runtime["current"], "ok")
+                states = {p["name"]: p["state"] for p in host.list()}
+                self.assertEqual(states["models"], ACTIVE, "models 插件本身必须仍然激活")
+
+    def test_plugin_new_scaffold_then_install(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*base, "plugin", "new", "demo", "--dir", tmp]), 0)
+            target = Path(tmp) / "demo"
+            self.assertTrue((target / "plugin.json").is_file())
+            source = (target / "register.py").read_text(encoding="utf-8")
+            self.assertIn("def register(ctx)", source)
+            self.assertIn("demo 插件", source, "模板里的占位名应被替换")
+            self.assertNotIn("__NAME__", source)
+
+            # 重名与非法名都要拒绝
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main([*base, "plugin", "new", "demo", "--dir", tmp]), 1)
+                self.assertEqual(main([*base, "plugin", "new", "a/b", "--dir", tmp]), 1)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "plugin", "add", str(target)]), 0)
+            self.assertIn("已激活: demo", buf.getvalue(), "装完应当场校验并激活")
+
+    def test_sessions_command_lists_history(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            host.service("ask")("问题一", session_id="sess-a")
+            host.service("ask")("问题二", session_id="sess-b")
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["--home", str(Path(tmp) / ".harness"), "--profile", "test",
+                           "sessions"])
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("sess-a", text)
+            self.assertIn("sess-b", text)
+            self.assertIn("2 条消息", text)
+
+
+class ReplSessionTests(unittest.TestCase):
+    """启动时默认续用最近一次会话 —— 这也是与桌面端对齐的一部分。"""
+
+    def test_latest_session_picks_most_recent(self):
+        import time as _time
+
+        from harness.builtins.repl.register import _latest_session
+
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ask = host.service("ask")
+            ask("旧会话", session_id="old")
+            _time.sleep(1.1)  # 文件 mtime 精度按秒
+            ask("新会话", session_id="new")
+            self.assertEqual(_latest_session(host), "new")
+
+    def test_latest_session_falls_back_when_empty(self):
+        from harness.builtins.repl.register import _latest_session
+
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            self.assertEqual(_latest_session(host), "default")
+
+
 class ModelKeyTests(unittest.TestCase):
     """第三批 #15：API Key 支持环境变量注入，避免明文落盘。"""
 

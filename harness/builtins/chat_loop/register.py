@@ -150,4 +150,6 @@ def register(ctx) -> None:
     ctx.provide("agent_factory", get_agent)
     ctx.provide("ask", ask)
     ctx.provide("new_session", new_session)
+    # 同一实现、更贴调用点的名字：明确「切到某个已有会话」时用它
+    ctx.provide("switch_session", new_session)
     ctx.provide("current_session", current_session)
