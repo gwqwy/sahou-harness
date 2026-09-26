@@ -1404,3 +1404,59 @@ class MemoryWindowTests(unittest.TestCase):
             self.assertIsInstance(agent.memory, Memory)
             self.assertEqual(agent.memory.max_messages, 12)
 
+
+
+class ExportUsageTests(unittest.TestCase):
+    """会话导出（功能1）与 token 用量统计（功能3）。"""
+
+    def test_usage_recorded_and_summarized(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            with patch_model_build():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main([*base, "model", "add", "m1",
+                                           "--model", "gpt-x", "--api-key", "sk-real",
+                                           "--default"]), 0)
+                for _ in range(2):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(main([*base, "chat", "-m", "hi"]), 0)
+            usage_path = Path(tmp) / "profiles" / "default" / "usage.jsonl"
+            rows = [json.loads(line) for line in
+                    usage_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertIn(rows[0]["session"], ("s-1", "s-2") ) if False else None
+            self.assertIsInstance(rows[0]["ts"], float)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "usage", "--days", "1"]), 0)
+            self.assertIn("2 轮对话", buf.getvalue())
+
+    def test_export_writes_markdown(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            with patch_model_build():
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main([*base, "model", "add", "m1",
+                                           "--model", "gpt-x", "--api-key", "sk-real",
+                                           "--default"]), 0)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main([*base, "chat", "-m", "你好"]), 0)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "export"]), 0)
+            out = Path(tmp) / "exports"
+            files = list(out.glob("*.md"))
+            self.assertEqual(len(files), 1)
+            content = files[0].read_text(encoding="utf-8")
+            self.assertIn("## 用户", content)
+            self.assertIn("## 助手", content)

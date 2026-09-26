@@ -90,6 +90,14 @@ def _make_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="插件与能力总览")
     sub.add_parser("sessions", help="列出历史会话")
     sub.add_parser("trace", help="查看最近一次对话的 trace 摘要（需 tracing 插件）")
+    export = sub.add_parser("export", help="导出会话为 Markdown")
+    export.add_argument("session", nargs="?", default=None,
+                        help="会话 id（省略则导出全部会话）")
+    export.add_argument("--out", default=None, help="输出目录（默认 <工作区>/exports）")
+    export.add_argument("--usage", dest="usage", action="store_true",
+                        help="附带 token 用量汇总")
+    usage_p = sub.add_parser("usage", help="token 用量统计（按天/会话汇总）")
+    usage_p.add_argument("--days", type=int, default=7, help="统计最近 N 天（默认 7）")
 
     plugin = sub.add_parser("plugin", help="插件管理")
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
@@ -280,6 +288,97 @@ def _list_sessions(profile: Profile) -> int:
     return 0
 
 
+def _usage_records(profile: Profile) -> list[dict]:
+    """读 usage.jsonl（功能3：ask 每轮追加一条）；文件不存在或行损坏即跳过。"""
+    path = profile.root / "usage.jsonl"
+    if not path.is_file():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def _export_sessions(profile: Profile, args) -> int:
+    """把会话导出为 Markdown（含可选的 token 用量附录）。"""
+    ids = [args.session] if args.session else profile.session_ids()
+    if not ids:
+        print("（没有可导出的会话）", file=sys.stderr)
+        return 1
+    out_dir = Path(args.out) if args.out else Path(args.workspace) / "exports"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    usage_by_session: dict[str, list[dict]] = {}
+    if args.usage:
+        for rec in _usage_records(profile):
+            usage_by_session.setdefault(str(rec.get("session")), []).append(rec)
+    exported = 0
+    for sid in ids:
+        history = profile.load_session(sid)
+        if not history:
+            print(f"跳过 {sid}：会话为空或不存在")
+            continue
+        lines = [f"# 会话 {sid}", ""]
+        for item in history:
+            role = {"user": "用户", "assistant": "助手"}.get(item.get("role"), str(item.get("role")))
+            content = str(item.get("content", ""))
+            lines += [f"## {role}", "", content or "（空）", ""]
+        session_usage = usage_by_session.get(sid) or []
+        if session_usage:
+            p_tok = sum(int(r.get("prompt_tokens") or 0) for r in session_usage)
+            c_tok = sum(int(r.get("completion_tokens") or 0) for r in session_usage)
+            lines += ["---", "", (f"**Token 用量**：{len(session_usage)} 轮对话，"
+                       f"输入 {p_tok} + 输出 {c_tok} = {p_tok + c_tok} tokens"), ""]
+        dest = out_dir / f"{sid}.md"
+        dest.write_text("\n".join(lines), encoding="utf-8")
+        print(f"已导出: {dest}")
+        exported += 1
+    if not exported:
+        return 1
+    print(f"共导出 {exported} 个会话 → {out_dir}")
+    return 0
+
+
+def _usage_summary(profile: Profile, args) -> int:
+    """按天 / 会话汇总 token 用量（数据来自 <profile>/usage.jsonl）。"""
+    records = _usage_records(profile)
+    if not records:
+        print("暂无用量记录（对话后自动累积）")
+        return 0
+    cutoff = time.time() - max(args.days, 1) * 86400
+    by_day: dict[str, dict[str, int]] = {}
+    by_session: dict[str, dict[str, int]] = {}
+    total = {"calls": 0, "prompt": 0, "completion": 0}
+    for rec in records:
+        ts = rec.get("ts")
+        if not isinstance(ts, (int, float)) or ts < cutoff:
+            continue
+        p = int(rec.get("prompt_tokens") or 0)
+        c = int(rec.get("completion_tokens") or 0)
+        day = time.strftime("%Y-%m-%d", time.localtime(ts))
+        day_acc = by_day.setdefault(day, {"calls": 0, "prompt": 0, "completion": 0})
+        sess_acc = by_session.setdefault(str(rec.get("session") or "?"),
+                                         {"calls": 0, "prompt": 0, "completion": 0})
+        for acc in (day_acc, sess_acc, total):
+            acc["calls"] += 1
+            acc["prompt"] += p
+            acc["completion"] += c
+    print(f"最近 {args.days} 天（{total['calls']} 轮对话，"
+          f"输入 {total['prompt']} + 输出 {total['completion']} tokens）\n")
+    print("按天:")
+    for day in sorted(by_day, reverse=True):
+        acc = by_day[day]
+        print(f"  {day}  {acc['calls']} 轮  {acc['prompt']}+{acc['completion']} tokens")
+    print("\n按会话:")
+    for sid, acc in sorted(by_session.items(), key=lambda kv: -kv[1]["prompt"])[:10]:
+        print(f"  {sid}  {acc['calls']} 轮  {acc['prompt']}+{acc['completion']} tokens")
+    return 0
+
+
 def main(argv: list | None = None) -> int:
     args = _make_parser().parse_args(argv)
 
@@ -327,6 +426,12 @@ def main(argv: list | None = None) -> int:
 
     if command == "sessions":
         return _list_sessions(profile)
+
+    if command == "export":
+        return _export_sessions(profile, args)
+
+    if command == "usage":
+        return _usage_summary(profile, args)
 
     # 以下命令需要激活运行时
     try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -72,6 +73,18 @@ def _build_memory(cfg: dict, llm):
     if mtype == "sliding":
         return Memory(max_messages=int(cfg.get("max_messages") or 40))
     return Memory()
+
+
+def _record_usage(host, session_id: str, model: str, usage: dict) -> None:
+    """每轮对话追加一条用量记录到 <profile>/usage.jsonl（`sha usage` 的数据源）。"""
+    rec = {"ts": time.time(), "session": session_id, "model": model,
+           "prompt_tokens": int((usage or {}).get("prompt_tokens") or 0),
+           "completion_tokens": int((usage or {}).get("completion_tokens") or 0)}
+    try:
+        with open(host.profile.root / "usage.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 —— 统计失败不影响对话
+        pass
 
 
 def register(ctx) -> None:
@@ -187,6 +200,7 @@ def register(ctx) -> None:
         result = agent.run(message, session_id=session_id)
         host.profile.save_session(session_id, agent.memory.history(session_id))
         runtime = host.service("models_runtime") or {}
+        _record_usage(host, session_id, runtime.get("current", ""), result.usage)
         return {"reply": result.content, "reasoning": getattr(result, "reasoning", ""),
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
