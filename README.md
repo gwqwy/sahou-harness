@@ -110,3 +110,7 @@ python -m unittest discover tests
 ```
 
 全部测试使用假模型客户端离线运行，不需要 API Key。
+
+## 许可证
+
+本项目采用 MIT 协议，详见 [LICENSE](LICENSE)。
