@@ -29,6 +29,48 @@ class FakeWindow:
         return None
 
 
+class DesktopEntrypointTests(unittest.TestCase):
+    """批次F：desktop.run 的启动路径（不需要真窗口）。"""
+
+    def test_run_reports_corrupt_config_instead_of_crashing(self):
+        """config.json 损坏时应打印可读错误并返回 2。
+
+        回归：该分支用了 ``sys.stderr`` 却没 ``import sys``，真实效果是 NameError
+        把 ConfigError 盖掉 —— 用户看到一句跟配置毫无关系的报错，而真正的
+        「原文件已备份为 xxx，请修复后再启动」根本没机会显示。
+        """
+        import contextlib
+        import io
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            from harness.desktop import run
+
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            host.profile.config_path.write_text("{ 这不是合法 json", encoding="utf-8")
+
+            # 把 pywebview 换成一个什么都不做的假模块，绕开「需要装界面库」的早退
+            fake = types.ModuleType("webview")
+            fake.create_window = lambda *a, **k: object()
+            fake.start = lambda *a, **k: None
+            saved = sys.modules.get("webview")
+            sys.modules["webview"] = fake
+            stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr):
+                    code = run(host)
+            finally:
+                if saved is None:
+                    sys.modules.pop("webview", None)
+                else:
+                    sys.modules["webview"] = saved
+
+            self.assertEqual(code, 2)
+            self.assertIn("错误", stderr.getvalue())
+            self.assertIn("config.json", stderr.getvalue())
+
+
 class DesktopApiTests(unittest.TestCase):
     def _app(self, tmp: Path):
         from harness.desktop import DesktopApp

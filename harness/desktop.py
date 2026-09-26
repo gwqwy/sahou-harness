@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -42,7 +43,7 @@ def _validate_url(url: str) -> str:
     if parsed.scheme not in ("http", "https"):
         raise ValueError("仅允许 http/https 链接")
     host = (parsed.hostname or "").lower()
-    if not host or host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+    if not host or host == "localhost" or host.endswith((".localhost", ".local")):
         raise ValueError(f"不允许访问本地地址: {host or '(空)'}")
     try:
         ip = ipaddress.ip_address(host)

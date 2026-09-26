@@ -16,6 +16,7 @@ profile 目录结构（默认 .harness/profiles/default/）：
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
@@ -32,7 +33,14 @@ DEFAULT_PERMISSION_MODE = "ask"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "default_model": "",
     "models": [],          # [{name, provider, base_url, api_key, model}]
-    "permissions": {"shell": DEFAULT_PERMISSION_MODE, "fs": DEFAULT_PERMISSION_MODE},
+    "permissions": {
+        "shell": DEFAULT_PERMISSION_MODE,
+        "fs": DEFAULT_PERMISSION_MODE,
+        # 免二次确认的命令 glob（只在 shell=ask 时起作用；shell=deny 仍然一律拒绝）
+        "shell_allow": [],
+        # 审批决定是否写审计日志（<profile>/audit/shell.jsonl）
+        "audit": True,
+    },
 }
 
 CONFIG_EXAMPLE = {
@@ -42,7 +50,11 @@ CONFIG_EXAMPLE = {
          "base_url": "https://api.deepseek.com/v1",
          "api_key": "sk-...", "model": "deepseek-chat"},
     ],
-    "permissions": {"shell": "ask", "fs": "ask"},
+    "permissions": {
+        "shell": "ask", "fs": "ask",
+        "shell_allow": ["git status", "git diff*", "python -m unittest*"],
+        "audit": True,
+    },
 }
 
 
@@ -86,6 +98,78 @@ def permission_mode(config: Dict[str, Any], key: str, default: str = DEFAULT_PER
     if normalized != mode:
         _warn(f"permissions.{key} 取值非法（{raw!r}），已按最保守的 {mode!r} 处理")
     return mode
+
+
+def collapse_whitespace(text: Any) -> str:
+    """折叠空白：``"git  status\\n"`` → ``"git status"``。
+
+    白名单匹配与「会话内已批准」记忆都用它做归一，否则 ``ls  -la`` 与 ``ls -la``
+    会被当成两条不同命令，用户得反复确认同一件事。
+    """
+    return " ".join(str(text or "").split())
+
+
+def normalize_allowlist(raw: Any) -> List[str]:
+    """把 ``permissions.shell_allow`` 归一为去空、去重、保序的字符串列表。
+
+    fail-closed：整段不是列表、或元素不是字符串，一律**丢弃**而不是猜。
+    读不懂的白名单条目不能成为放行的理由。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        _warn(f"permissions.shell_allow 不是列表（{type(raw).__name__}），已全部忽略")
+        return []
+    result: List[str] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = collapse_whitespace(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if text == "*":
+            _warn("permissions.shell_allow 含 '*'，等价于把 permissions.shell 设为 allow")
+        result.append(text)
+    return result
+
+
+def shell_allowlist(config: Dict[str, Any]) -> List[str]:
+    """读取 ``permissions.shell_allow``；缺失或非法一律当空列表（即没有白名单）。"""
+    perms = config.get("permissions")
+    return normalize_allowlist(perms.get("shell_allow") if isinstance(perms, dict) else None)
+
+
+def matches_allowlist(command: str, patterns: List[str]) -> Optional[str]:
+    """命令是否命中白名单，命中则返回命中的那条模式，否则 None。
+
+    模式是 glob：``git status`` 精确匹配，``git log*`` 匹配一切以它开头的命令。
+    命令与模式都会先折叠空白，所以 ``git  status`` 与 ``git status`` 等价。
+    """
+    text = collapse_whitespace(command)
+    if not text:
+        return None
+    for pattern in patterns:
+        if fnmatch.fnmatchcase(text, pattern):
+            return pattern
+    return None
+
+
+def audit_enabled(config: Dict[str, Any]) -> bool:
+    """是否把审批决定写审计日志。
+
+    默认开启：审批是**有副作用的决定**，事后要能回答「这条命令是谁在什么时候放行的」。
+    显式配置 ``false`` 可关；取值不是 bool 时保持开启并告警（不因为配置写错就丢掉记录）。
+    """
+    perms = config.get("permissions")
+    raw = perms.get("audit") if isinstance(perms, dict) else None
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    _warn(f"permissions.audit 取值非法（{raw!r}），已按 True 处理")
+    return True
 
 
 # 同一配置文件的进程内互斥锁（桌面端每个 js_api 调用都在独立线程）
@@ -302,10 +386,17 @@ class Profile:
         return sorted(p.stem for p in self.sessions_dir.glob("*.json"))
 
 
-def _normalize_permissions(raw: Any) -> Dict[str, str]:
-    """把 permissions 段归一为 {'shell': mode, 'fs': mode}，缺键补默认、非法值收敛。"""
+def _normalize_permissions(raw: Any) -> Dict[str, Any]:
+    """把 permissions 段归一为完整形状：缺键补默认、非法值收敛。
+
+    注意新增键（``shell_allow`` / ``audit``）也必须在这里归一 —— 否则 ``update_config``
+    的深合并会**静默丢掉**它们（H-07 是同一类问题的前科）。
+    """
     perms = raw if isinstance(raw, dict) else {}
-    return {key: normalize_permission(perms.get(key)) for key in ("shell", "fs")}
+    result: Dict[str, Any] = {key: normalize_permission(perms.get(key)) for key in ("shell", "fs")}
+    result["shell_allow"] = normalize_allowlist(perms.get("shell_allow"))
+    result["audit"] = audit_enabled({"permissions": perms})
+    return result
 
 
 def _merged(raw: Any) -> Dict[str, Any]:

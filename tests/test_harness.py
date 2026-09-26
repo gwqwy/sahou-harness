@@ -896,6 +896,193 @@ class NanoagentWiringTests(unittest.TestCase):
             self.assertTrue(profile.remove_plugin(dest.name))
 
 
+class ShellApprovalTests(unittest.TestCase):
+    """批次F：shell 权限门的三级判定（白名单 → 会话记忆 → 询问）与审批审计。"""
+
+    def _host(self, tmp, **permissions):
+        host = build_host(Path(tmp))
+        base = {"shell": "ask", "fs": "ask"}
+        base.update(permissions)
+        host.profile.update_config(permissions=base)
+        return host
+
+    def _shell(self, host):
+        return next(t for t in host.collect_tools() if t.name == "run_command")
+
+    def _audit_records(self, host):
+        path = Path(host.profile.root) / "audit" / "shell.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_allowlist_skips_confirmation(self):
+        """白名单命中即放行 —— 即使确认回调明确说不。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["echo hi"])
+            host.confirm = lambda prompt: False
+            self.assertIn("hi", self._shell(host).invoke({"command": "echo hi"}))
+
+    def test_allowlist_glob_matches_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["echo*"])
+            host.confirm = lambda prompt: False
+            self.assertIn("world", self._shell(host).invoke({"command": "echo world"}))
+
+    def test_allowlist_whitespace_folded(self):
+        """`echo    hi` 与白名单里的 `echo hi` 视为同一条命令。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["echo hi"])
+            host.confirm = lambda prompt: False
+            self.assertIn("hi", self._shell(host).invoke({"command": "echo   hi"}))
+
+    def test_non_matching_command_still_asks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["git status"])
+            host.confirm = lambda prompt: False
+            self.assertIn("拒绝", self._shell(host).invoke({"command": "echo hi"}))
+
+    def test_session_remembers_user_approval(self):
+        """批准一次之后，同一条命令本会话内不再询问。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp)
+            calls = []
+
+            def confirm(prompt):
+                calls.append(prompt)
+                return True
+
+            host.confirm = confirm
+            tool = self._shell(host)
+            self.assertIn("hi", tool.invoke({"command": "echo hi"}))
+            self.assertEqual(len(calls), 1)
+            # 第二次：确认回调换成「一律拒绝」，但因为已记住，仍然放行且不再询问
+            host.confirm = lambda prompt: False
+            self.assertIn("hi", tool.invoke({"command": "echo hi"}))
+            self.assertEqual(len(calls), 1, "已批准的命令不该重复询问")
+
+    def test_session_memory_is_exact_not_prefix(self):
+        """`echo hi` 获批 ≠ `echo hi && rm -rf x` 获批：会话记忆不做前缀推断。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp)
+            host.confirm = lambda prompt: True
+            tool = self._shell(host)
+            tool.invoke({"command": "echo hi"})
+            host.confirm = lambda prompt: False
+            self.assertIn("拒绝", tool.invoke({"command": "echo hi && echo bye"}))
+
+    def test_deny_overrides_allowlist_and_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell="deny", shell_allow=["echo*"])
+            host.confirm = lambda prompt: True
+            self.assertIn("拒绝", self._shell(host).invoke({"command": "echo hi"}))
+
+    def test_audit_log_records_each_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["echo*"])
+            host.confirm = lambda prompt: False
+            tool = self._shell(host)
+            tool.invoke({"command": "echo hi"})        # 白名单放行
+            tool.invoke({"command": "rm -rf /nonexistent"})  # 用户拒绝
+            records = self._audit_records(host)
+            sources = {r["source"] for r in records}
+            self.assertIn("allowlist:echo*", sources)
+            self.assertIn("user-denied", sources)
+            decisions = {r["decision"] for r in records}
+            self.assertEqual(decisions, {"allow", "deny"})
+            self.assertTrue(all("ts" in r and "command" in r for r in records))
+
+    def test_audit_records_no_confirmer_when_channel_absent(self):
+        """没有确认通道（非交互环境）时也必须留档：拒绝的理由是「没人能确认」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp)
+            host.confirm = None
+            self.assertIn("拒绝", self._shell(host).invoke({"command": "echo hi"}))
+            self.assertEqual([r["source"] for r in self._audit_records(host)], ["no-confirmer"])
+
+    def test_audit_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp, shell_allow=["echo*"], audit=False)
+            host.confirm = lambda prompt: False
+            self._shell(host).invoke({"command": "echo hi"})
+            self.assertEqual(self._audit_records(host), [])
+
+    def test_clear_session_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host(tmp)
+            host.confirm = lambda prompt: True
+            self._shell(host).invoke({"command": "echo hi"})
+            service = host.service("shell_permissions")
+            self.assertEqual(service["approved"](), ["echo hi"])
+            self.assertEqual(service["clear"](), 1)
+            self.assertEqual(service["approved"](), [])
+
+
+class AllowlistConfigTests(unittest.TestCase):
+    """批次F：白名单的归一化与匹配（配置层，不依赖 harness 运行时）。"""
+
+    def test_normalize_drops_junk_and_dedupes(self):
+        from harness.config import normalize_allowlist
+        self.assertEqual(normalize_allowlist(None), [])
+        self.assertEqual(normalize_allowlist("echo hi"), [], "非列表整段忽略（fail-closed）")
+        self.assertEqual(normalize_allowlist(["git status", "  ", 3, None, "git   status"]),
+                         ["git status"], "空白条目与非字符串丢弃，空白折叠后去重")
+
+    def test_shell_allowlist_missing_is_empty(self):
+        from harness.config import shell_allowlist
+        self.assertEqual(shell_allowlist({}), [])
+        self.assertEqual(shell_allowlist({"permissions": "oops"}), [])
+
+    def test_matches_allowlist(self):
+        from harness.config import matches_allowlist
+        patterns = ["git status", "git log*"]
+        self.assertEqual(matches_allowlist("git status", patterns), "git status")
+        self.assertEqual(matches_allowlist("git  status", patterns), "git status")
+        self.assertEqual(matches_allowlist("git log --oneline", patterns), "git log*")
+        self.assertIsNone(matches_allowlist("git push", patterns))
+        self.assertIsNone(matches_allowlist("", patterns))
+
+    def test_audit_enabled_defaults_true_and_validates(self):
+        from harness.config import audit_enabled
+        self.assertTrue(audit_enabled({}))
+        self.assertFalse(audit_enabled({"permissions": {"audit": False}}))
+        self.assertTrue(audit_enabled({"permissions": {"audit": "no"}}), "非法值不丢记录")
+
+    def test_permissions_roundtrip_keeps_new_keys(self):
+        """新增键必须在 save/load 往返中存活（H-07 同类问题：归一会丢键）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            profile.update_config(permissions={
+                "shell": "ask", "fs": "ask",
+                "shell_allow": ["git status"], "audit": False,
+            })
+            perms = profile.load_config()["permissions"]
+            self.assertEqual(perms["shell_allow"], ["git status"])
+            self.assertIs(perms["audit"], False)
+
+    def test_partial_permission_edit_uses_mutate_config(self):
+        """改单个权限键必须走 mutate_config —— update_config 会替换整个 permissions 段。
+
+        这是既有的约定（cli.py 改 models 就用 mutate_config），新增的 shell_allow /
+        audit 让「顺手用 update_config 改 shell」的代价从「丢一个键」变成「丢三个键」，
+        所以在这里把正确姿势钉成测试。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            profile.update_config(permissions={
+                "shell": "ask", "fs": "ask",
+                "shell_allow": ["git status"], "audit": False,
+            })
+
+            def _enable_shell(config):
+                config["permissions"]["shell"] = "allow"
+
+            profile.mutate_config(_enable_shell)
+            perms = profile.load_config()["permissions"]
+            self.assertEqual(perms["shell"], "allow")
+            self.assertEqual(perms["shell_allow"], ["git status"], "兄弟键必须还在")
+            self.assertIs(perms["audit"], False, "兄弟键必须还在")
+
+
 class ModelKeyTests(unittest.TestCase):
     """第三批 #15：API Key 支持环境变量注入，避免明文落盘。"""
 

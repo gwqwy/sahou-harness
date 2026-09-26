@@ -110,8 +110,10 @@ def register(ctx) -> None:
             session_id = switch_session(_latest_session(host))
 
         def print_help() -> str:
-            lines = ["内置: /exit /new /help /sessions /resume <id> /usage /reload <插件> "
-                     "/plugins /status"]
+            lines = [(
+                "内置: /exit /new /help /sessions /resume <id> /usage /reload <插件> "
+                "/plugins /status /approvals"
+            )]
             for name, cmd in sorted(host.collect_commands().items()):
                 lines.append(f"  /{name}  {cmd.get('help', '')}")
             return "\n".join(lines)
