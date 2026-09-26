@@ -12,8 +12,8 @@
 sha CLI（cli.py）
    │  组装
    ▼
-Harness 微内核（kernel.py）──────── 一切皆插件（13 个内置）：
-   │  ctx.provide / on / effect      ├─ chat_loop    对话循环（流式 / 护栏 / 追踪接线）
+Harness 微内核（kernel.py）──────── 一切皆插件（16 个内置）：
+   │  ctx.provide / on / effect      ├─ chat_loop    对话循环（流式 / 护栏 / 追踪 / 图片输入）
    │  effect 必返回 disposer，        ├─ models       模型池 + 自主切换（switch_model）
    │  卸载时 LIFO 回滚、幂等          ├─ tools_fs     文件读写 / 局部编辑（路径监狱）
    │  状态机 PENDING→ACTIVE→         ├─ tools_search 全工作区文本搜索
@@ -25,6 +25,9 @@ Harness 微内核（kernel.py）──────── 一切皆插件（13 �
    │                                 ├─ tracing      按天 JSONL 追踪
    │                                 ├─ subagent     spawn_subagent 子 agent
    │                                 ├─ knowledge    RAG 知识库（索引 / 检索）
+   │                                 ├─ browser      fetch_url 抓网页转纯文本
+   │                                 ├─ notifications notify webhook 通知
+   │                                 ├─ scheduler    定时任务（到点独立 agent 执行）
    │                                 └─ repl         终端界面（UI 也是插件，可换掉）
    ▼
 profile 隔离目录（.harness/profiles/<名>/）
@@ -51,6 +54,7 @@ sha desktop                          :: 打开桌面窗口
 桌面端能力（全部基于同一套插件运行时，与 CLI 共享 profile）：
 
 - **对话**：会话侧栏（历史会话点击回放 / 新会话），工具调用与模型信息随回复展示
+- **图片输入**：📎 按钮选图或直接粘贴图片路径，随下一条消息发给视觉模型（路径受工作区监狱约束）
 - **模型可视化设置**：弹窗内增删改模型卡片（名称/提供商/Base URL/模型 ID/API Key/默认），
   保存即校验（名称、模型、Key 必填，provider 仅 openai/anthropic，名称唯一）并**热重建模型池**，无需重启
 - **当前模型下拉切换**：等价 `/model`，持久化到 config.json

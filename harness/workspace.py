@@ -102,3 +102,36 @@ def read_text_file(path: Path, max_bytes: int = MAX_FILE_BYTES) -> str | None:
     if b"\x00" in raw[:8192]:  # 含 NUL 字节基本可判定为二进制
         return None
     return raw.decode("utf-8", "replace")
+
+
+# 多模态输入接受的图片扩展名（服务商按魔数识别，这里只是早期拒绝的闸门）
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def safe_image(host, source) -> str:
+    """校验一个图片源（多模态输入），返回可直接传给 nanoagent 的形态。
+
+    - http(s) URL / data: URL：原样放行（由服务商下载/解码）
+    - 本地路径：必须落在工作区路径监狱内、文件存在、扩展名像图片
+    - 其余一律抛 ValueError（给界面/模型看可读错误，而不是让服务商报 400）
+    """
+    text = str(source or "").strip()
+    if not text:
+        raise ValueError("图片路径不能为空")
+    if text.startswith(("http://", "https://", "data:")):
+        return text
+    path = safe_path(host, text, must_exist=True)
+    if path.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError(
+            f"不像图片文件: {path.name}（支持 {'/'.join(sorted(IMAGE_SUFFIXES))}）")
+    return str(path)
+
+
+def safe_images(host, sources) -> list[str] | None:
+    """批量校验图片源；空输入返回 None（保持「无图」语义）。"""
+    if sources is None:
+        return None
+    if not isinstance(sources, (list, tuple)):
+        raise ValueError("images 必须是路径/URL 列表")
+    result = [safe_image(host, item) for item in sources]
+    return result or None

@@ -54,7 +54,7 @@ def _install_readline(host, profile_root) -> None:
     atexit.register(save_history)
 
     candidates = ["/exit", "/new", "/help", "/sessions", "/resume", "/usage",
-                  "/reload", "/plugins", "/status"]
+                  "/image", "/reload", "/plugins", "/status", "/approvals"]
     candidates += [f"/{name}" for name in host.collect_commands()]
 
     def completer(text: str, state: int):
@@ -78,6 +78,26 @@ def register(ctx) -> None:
         can_stream = host.service("can_stream")
         new_session = host.service("new_session")
         switch_session = host.service("switch_session")
+        # 功能7：/image 附加的图片，随**下一轮**消息发出（用后即清，不污染后续轮次）
+        pending_images: list[str] = []
+
+        def add_image(raw: str) -> None:
+            from harness.workspace import safe_image
+
+            text = raw.strip().strip('"').strip("'")
+            if not text:
+                print("用法：/image <图片路径|URL>；/image clear 清空待发图片")
+                return
+            if text == "clear":
+                pending_images.clear()
+                print("已清空待发图片")
+                return
+            try:
+                pending_images.append(safe_image(host, text))
+            except (ValueError, OSError) as exc:
+                print(f"[出错] {exc}")
+                return
+            print(f"已附加第 {len(pending_images)} 张图片（随下一条消息发送）")
 
         def streaming_ready() -> bool:
             """是否走流式：不支持就一次性，不做「先试再回退」（会重复工具副作用）。"""
@@ -85,11 +105,13 @@ def register(ctx) -> None:
 
         def run_turn(text: str) -> None:
             """执行一轮对话并打印（支持则逐字输出，工具调用插在中间）。"""
+            images = pending_images or None
+            pending_images.clear()
             if not streaming_ready():
-                print(ask(text, session_id)["reply"])
+                print(ask(text, session_id, images=images)["reply"])
                 return
             printed = False
-            for event in ask_stream(text, session_id):
+            for event in ask_stream(text, session_id, images=images):
                 kind = event.get("type")
                 if kind == "delta":
                     print(event["text"], end="", flush=True)
@@ -113,8 +135,8 @@ def register(ctx) -> None:
 
         def print_help() -> str:
             lines = [(
-                "内置: /exit /new /help /sessions /resume <id> /usage /reload <插件> "
-                "/plugins /status /approvals"
+                "内置: /exit /new /help /sessions /resume <id> /usage /image <路径|URL> "
+                "/reload <插件> /plugins /status /approvals"
             )]
             for name, cmd in sorted(host.collect_commands().items()):
                 lines.append(f"  /{name}  {cmd.get('help', '')}")
@@ -171,6 +193,9 @@ def register(ctx) -> None:
                 return
             if name == "/usage":
                 show_usage()
+                return
+            if name == "/image":
+                add_image(args)
                 return
             if name == "/reload":
                 target = args.strip()

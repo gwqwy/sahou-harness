@@ -15,6 +15,7 @@
     sha model list | use <名>      # 查看 / 切换模型
     sha model add | remove <名>    # 增删模型（此前只能手改 config.json）
     sha skill list                 # 列出技能
+    sha schedule add|list|remove   # 定时任务（scheduler 插件到点执行）
     sha status                     # 插件与能力总览
 """
 
@@ -137,6 +138,18 @@ def _make_parser() -> argparse.ArgumentParser:
     skill = sub.add_parser("skill", help="技能管理")
     skill_sub = skill.add_subparsers(dest="skill_command", required=True)
     skill_sub.add_parser("list", help="列出技能")
+
+    sched = sub.add_parser("schedule", help="定时任务管理（scheduler 插件到点执行）")
+    sched_sub = sched.add_subparsers(dest="schedule_command", required=True)
+    s_add = sched_sub.add_parser("add", help="新增任务")
+    s_add.add_argument("name", help="任务名（也是日志文件名）")
+    s_add.add_argument("--every", type=int, required=True,
+                       help="执行间隔（秒），最小 1")
+    s_add.add_argument("--prompt", required=True, help="到点执行的提示词")
+    s_add.add_argument("--disabled", action="store_true", help="创建为停用状态")
+    sched_sub.add_parser("list", help="列出任务")
+    s_rm = sched_sub.add_parser("remove", help="删除任务")
+    s_rm.add_argument("name")
     return parser
 
 
@@ -275,6 +288,43 @@ def _model_remove(profile: Profile, name: str) -> int:
     return 0
 
 
+def _schedule(profile: Profile, args) -> int:
+    """定时任务管理（功能5）：与 scheduler 插件共用 schedule_store 的同一份 tasks.json。"""
+    from .schedule_store import ScheduleError, add_task, load_tasks, remove_task
+
+    command = args.schedule_command
+    try:
+        if command == "add":
+            task = add_task(profile, args.name, args.every, args.prompt,
+                            enabled=not args.disabled)
+            print(f"已添加任务 {task['name']}（每 {task['every']} 秒）")
+            print(f"  提示词: {task['prompt']}")
+            print(f"  结果日志: {profile.root / 'scheduled' / (task['name'] + '.log')}")
+            print("  注：scheduler 插件激活时（sha chat / desktop）到点执行；日志同目录 tasks.json 可手改")
+            return 0
+        if command == "remove":
+            if remove_task(profile, args.name):
+                print(f"已删除任务 {args.name}")
+                return 0
+            print(f"错误：没有任务 '{args.name}'", file=sys.stderr)
+            return 1
+        # list
+        tasks = load_tasks(profile)
+        if not tasks:
+            print("（没有定时任务；用 sha schedule add <名> --every <秒> --prompt <提示词> 创建）")
+            return 0
+        for task in tasks:
+            state = "启用" if task.get("enabled", True) else "停用"
+            last = task.get("last_run") or 0
+            last_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last)) if last else "从未"
+            print(f"  {task['name']}  [{state}]  每 {task['every']} 秒  上次: {last_text}")
+            print(f"    {task.get('prompt', '')}")
+        return 0
+    except ScheduleError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+
 def _list_sessions(profile: Profile) -> int:
     ids = profile.session_ids()
     if not ids:
@@ -330,7 +380,8 @@ def _export_sessions(profile: Profile, args) -> int:
             continue
         lines = [f"# 会话 {sid}", ""]
         for item in history:
-            role = {"user": "用户", "assistant": "助手"}.get(item.get("role"), str(item.get("role")))
+            role = {"user": "用户", "assistant": "助手"}.get(
+                str(item.get("role")), str(item.get("role")))
             content = str(item.get("content", ""))
             lines += [f"## {role}", "", content or "（空）", ""]
         session_usage = usage_by_session.get(sid) or []
@@ -478,6 +529,9 @@ def main(argv: list | None = None) -> int:
 
     if command == "sessions":
         return _list_sessions(profile)
+
+    if command == "schedule":
+        return _schedule(profile, args)
 
     if command == "export":
         return _export_sessions(profile, args)

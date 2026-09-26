@@ -1,0 +1,4 @@
+{
+  "name": "scheduler",
+  "description": "定时任务插件：到点用独立 agent 执行任务提示词，结果落 <profile>/scheduled/<名>.log；sha schedule add|list|remove 管理"
+}

@@ -252,6 +252,32 @@ class DesktopApp:
             return {"ok": False, "error": ""}
         return self.set_workspace(picked[0] if isinstance(picked, (list, tuple)) else picked)
 
+    def pick_image(self) -> dict[str, Any]:
+        """弹出原生文件对话框选图片（可多选），返回绝对路径列表（功能7）。"""
+        if self._window is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        try:
+            import webview
+
+            picked = self._window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=True,
+                file_types=("图片 (*.png;*.jpg;*.jpeg;*.gif;*.webp)", "所有文件 (*.*)"))
+        except Exception as exc:  # noqa: BLE001 —— 用户取消或对话框失败
+            return {"ok": False, "error": str(exc)}
+        if not picked:
+            return {"ok": True, "paths": []}
+        paths = picked if isinstance(picked, (list, tuple)) else [picked]
+        return {"ok": True, "paths": [str(p) for p in paths]}
+
+    def check_image(self, path: str) -> dict[str, Any]:
+        """校验图片路径（工作区路径监狱 + 扩展名），通过才允许附加（功能7）。"""
+        from harness.workspace import safe_image
+
+        try:
+            return {"ok": True, "path": safe_image(self.host, path)}
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+
     def rename_workspace(self, name: str) -> dict[str, Any]:
         name = str(name or "").strip()
         if not name:
@@ -397,7 +423,7 @@ class DesktopApp:
         self.host.profile.update_config(sessions_meta=meta)
         return {"ok": True, "session": session_id, "name": name}
 
-    def chat(self, message: str, session_id: str = "") -> dict[str, Any]:
+    def chat(self, message: str, session_id: str = "", images: list | None = None) -> dict[str, Any]:
         session_id = session_id or self._current_session
         with self._lock:
             if session_id != self._current_session:
@@ -410,7 +436,9 @@ class DesktopApp:
                 return {"ok": False, "error": "对话插件未激活"}
             self.host.emit_agent_event = self._push_event  # 实时步骤 → 界面
             try:
-                result = ask(message, session_id=session_id)
+                # images（功能7）：前端附加的图片源（http(s) URL 或本地路径），
+                # 路径校验在 chat_loop.ask 内做（工作区路径监狱），越界回 ok=False
+                result = ask(message, session_id=session_id, images=images or None)
             except Exception as exc:  # noqa: BLE001 —— 错误回到界面而不是崩窗口
                 return {"ok": False, "error": str(exc)}
             finally:
@@ -1202,10 +1230,12 @@ body.panel-hidden aside.right { display:none; }
       </div>
       <div class="composer">
         <textarea id="input" rows="1"
-          placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行）"></textarea>
+          placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行，可粘贴图片路径附加）"></textarea>
+        <div id="imgChips" style="display:none;flex-wrap:wrap;gap:6px;padding:0 10px;"></div>
         <div class="composer-row">
           <button id="permBadge" class="badge" title="执行权限" onclick="togglePermMenu()"></button>
           <span class="flex1"></span>
+          <button id="imgBtn" title="附加图片（或直接粘贴图片路径）" onclick="attachImage()">📎</button>
           <button id="ctxBtn" title="上下文占用" onclick="toggleCtxCard()">…</button>
           <select id="thinkSel" title="思考级别（映射 reasoning_effort）"></select>
           <select id="modelSel" title="当前模型"></select>
@@ -1737,12 +1767,14 @@ function setBusy(busy) {
 async function send() {
   const input = $('input');
   const text = input.value.trim();
-  if (!text || $('send').disabled) return;
+  if ((!text && !pendingImages.length) || $('send').disabled) return;
+  const images = pendingImages.slice();
+  pendingImages = []; renderImgChips();
   input.value = ''; input.style.height = 'auto';
-  add(text, 'user');
+  add(text || '（图片）', 'user', images.length ? images.map(p => '🖼 ' + p) : null);
   showLiveBlock();
   setBusy(true);
-  const res = await api().chat(text, currentSession);
+  const res = await api().chat(text, currentSession, images.length ? images : null);
   removeLiveBlock();
   setBusy(false);
   $('input').focus();
@@ -1754,6 +1786,40 @@ async function send() {
   refreshSidebar();
   refreshStatus();
 }
+
+/* ---------- 图片附加（功能7） ---------- */
+let pendingImages = [];
+function renderImgChips() {
+  const box = $('imgChips');
+  box.innerHTML = pendingImages.map((p, i) =>
+    '<span class="img-chip">🖼 ' + esc(p.split(/[\\\\/]/).pop()) +
+    ' <a style="cursor:pointer" onclick="removeImage(' + i + ')">✕</a></span>').join('');
+  box.style.display = pendingImages.length ? 'flex' : 'none';
+}
+function addImagePath(p) {
+  if (!p || pendingImages.includes(p)) return;
+  pendingImages.push(p);
+  renderImgChips();
+}
+function removeImage(i) { pendingImages.splice(i, 1); renderImgChips(); }
+async function attachImage() {
+  const res = await api().pick_image();
+  if (!res.ok) { add(res.error || '无法打开文件对话框', 'bot error'); return; }
+  for (const p of (res.paths || [])) {
+    const chk = await api().check_image(p);
+    if (chk.ok) addImagePath(chk.path);
+    else add(chk.error, 'bot error');
+  }
+}
+$('input').addEventListener('paste', async (e) => {
+  // 粘贴单个图片路径 → 自动附加而不是插进文本（拖入文件路径同理手动 /image 不适用，走 📎）
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  if (!text) return;
+  const t = text.trim();
+  if (!/^[^\r\n]+\.(png|jpe?g|gif|webp)$/i.test(t)) return;
+  const chk = await api().check_image(t);
+  if (chk.ok) { e.preventDefault(); addImagePath(chk.path); }
+});
 
 $('input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }

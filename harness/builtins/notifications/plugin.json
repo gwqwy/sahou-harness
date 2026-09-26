@@ -1,0 +1,4 @@
+{
+  "name": "notifications",
+  "description": "通知插件：notify(message) 工具向配置的 webhook POST JSON；可选订阅宿主 error 事件推送失败告警"
+}

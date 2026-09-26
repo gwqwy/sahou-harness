@@ -1,0 +1,4 @@
+{
+  "name": "browser",
+  "description": "浏览器工具插件：fetch_url(url, max_chars) 抓取网页并转为纯文本（可选域名白名单）"
+}

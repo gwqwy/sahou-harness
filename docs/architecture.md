@@ -92,14 +92,15 @@ harness/
   kernel.py     微内核：ctx、生命周期状态机、拓扑激活、服务表、reload
   loader.py     插件装载：读 plugin.json、exec register.py、manifest_deps
   config.py     profile 配置：模型池 / 权限 / 会话存取 / 插件安装（含 git）
-  workspace.py  路径监狱（safe_path / guard_pattern / iter_files / read_text_file）
+  workspace.py  路径监狱（safe_path / guard_pattern / iter_files / read_text_file / safe_image）
+  schedule_store.py 定时任务存储（tasks.json 读写/校验，scheduler 插件与 sha schedule 共用）
   cli.py        sha 命令行（组装运行时，无业务逻辑）
   desktop.py    pywebview 桌面端：DesktopApp 纯 API 层 + 单页 HTML 渲染层
-  builtins/     13 个内置插件（每个一个目录：plugin.json + register.py）
+  builtins/     16 个内置插件（每个一个目录：plugin.json + register.py）
   py.typed      PEP 561 标记
 
 内置插件一览：
-  chat_loop   对话循环（nanoagent Agent：流式 / 护栏 / 追踪接线）
+  chat_loop   对话循环（nanoagent Agent：流式 / 护栏 / 追踪 / 图片输入）
   models      模型池 + switch_model 工具（逐条容错，坏条目不连坐）
   tools_fs    文件读写 / 局部编辑 / 分页读（路径监狱）
   tools_search 全工作区文本搜索
@@ -111,6 +112,9 @@ harness/
   tracing     按天 JSONL 追踪
   subagent   spawn_subagent（剪掉递归工具）
   knowledge   RAG 知识库（索引 / 检索）
+  browser     fetch_url：抓网页转纯文本（可选域名白名单）
+  notifications notify 工具：POST JSON 到 webhook（缺 url 则插件缺席）
+  scheduler   定时任务：worker 线程到点用独立 agent 执行，结果落 scheduled/<名>.log
   repl        终端界面（本身也是插件，可整个换掉）
 ```
 

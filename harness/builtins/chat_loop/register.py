@@ -163,14 +163,14 @@ def register(ctx) -> None:
             return False
         return callable(getattr(llm, "chat_stream", None))
 
-    def _stream_events(agent, message: str, session_id: str):
+    def _stream_events(agent, message: str, session_id: str, images: list | None = None):
         """同步流式：直接透传 ``run_stream`` 的事件（delta / tool_call / done）。
 
         工具是同步执行的（MCP 已包装为同步闭包，其余协程工具由 nanoagent
         单独起循环跑完），因此不存在「异步工具要走 arun_stream」的分支——
         那条路径需要 AsyncLLM，而 models 只构建同步 LLM（H-02 的流式面）。
         """
-        yield from agent.run_stream(message, session_id=session_id)
+        yield from agent.run_stream(message, session_id=session_id, images=images)
 
     def _bind_session(session_id: str | None) -> str:
         """确定本轮会话；跨会话时必须丢掉 agent，否则记忆里仍是上一个会话的历史。"""
@@ -181,7 +181,19 @@ def register(ctx) -> None:
             state["session_id"] = session_id
         return session_id
 
-    def ask(message: str, session_id: str | None = None) -> dict:
+    def _validate_images(images):
+        """多模态输入校验（功能7）：本地路径须落在工作区路径监狱内，URL 原样放行。
+
+        校验失败抛 ValueError（界面已把异常文本直接展示给用户，可读即可）。
+        """
+        from harness.workspace import safe_images
+
+        try:
+            return safe_images(host, images)
+        except OSError as exc:  # FileNotFoundError 等 → 统一成可读 ValueError
+            raise ValueError(f"图片输入无效: {exc}") from exc
+
+    def ask(message: str, session_id: str | None = None, images: list | None = None) -> dict:
         """执行一轮对话，并持久化会话。
 
         统一走同步 :meth:`agent.run`：MCP 工具已由 mcp_client 包装成同步闭包
@@ -193,11 +205,13 @@ def register(ctx) -> None:
         Args:
             message: 用户输入
             session_id: 目标会话；省略则沿用当前会话（由 new_session 维护）
+            images: 可选图片源列表（http(s)/data URL 或工作区内本地路径），
+                非空时本轮消息升级为多模态（模型需支持 vision）
         """
         # 会话切换必须重建 agent：否则记忆里仍是上一个会话的历史（跨会话串味）
         session_id = _bind_session(session_id)
         agent = get_agent()
-        result = agent.run(message, session_id=session_id)
+        result = agent.run(message, session_id=session_id, images=_validate_images(images))
         host.profile.save_session(session_id, agent.memory.history(session_id))
         runtime = host.service("models_runtime") or {}
         _record_usage(host, session_id, runtime.get("current", ""), result.usage)
@@ -205,7 +219,7 @@ def register(ctx) -> None:
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
 
-    def ask_stream(message: str, session_id: str | None = None):
+    def ask_stream(message: str, session_id: str | None = None, images: list | None = None):
         """流式对话：依次产出 ``delta`` / ``tool_call`` / ``done`` 事件。
 
         ``done`` 事件里的 ``result`` 与 :func:`ask` 同源（完整 AgentResult）。
@@ -220,7 +234,7 @@ def register(ctx) -> None:
         """
         session_id = _bind_session(session_id)
         agent = get_agent()
-        yield from _stream_events(agent, message, session_id)
+        yield from _stream_events(agent, message, session_id, _validate_images(images))
         # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
         host.profile.save_session(session_id, agent.memory.history(session_id))
 

@@ -6,6 +6,34 @@
 版本号依据 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。
 类型：新增 / 变更 / 修复 / 工程。
 
+## [未发布] —— 2026-09-27 功能扩展（第二日）
+
+### 新增
+
+**三个新内置插件（13 → 16 个）**
+- `notifications`：`notify(message, title)` 工具向 `config.notifications.url` POST JSON；
+  `on_error=true` 时订阅宿主 `error` 事件推送告警；未配置 url 时插件**缺席**（status 可见原因）
+- `scheduler`：定时任务——任务存 `<profile>/scheduled/tasks.json`，后台 daemon 线程
+  每秒检查、**独立 agent**（全新 Memory）串行执行，结果追加写 `scheduled/<名>.log`；
+  worker 每轮重新读盘，`sha schedule add/list/remove` 对运行中的 harness 立即生效；
+  任务名走白名单（对齐会话 id 的 H-04 教训），间隔 1 秒 ~ 30 天
+- `browser`：`fetch_url(url, max_chars)` —— httpx GET + HTML 去标签转纯文本
+  （script/style 剔除、实体解码、相邻重复行折叠），仅 http/https，
+  可选 `config.browser.allowed_domains` 域名白名单，超时/非 2xx/超限返回可读中文错误
+
+**多模态图片输入（功能7）**
+- `chat_loop.ask / ask_stream` 新增 `images` 参数；本地路径经工作区路径监狱校验
+  （`workspace.safe_image`：须在区内、文件存在、png/jpg/jpeg/gif/webp），URL 原样放行
+- REPL 新增 `/image <路径|URL>`（附加到下一轮，`/image clear` 清空）、Tab 补全与 /help 同步
+- 桌面端：📎 按钮原生文件对话框选图（可多选）、**粘贴图片路径自动附加**成 chip、
+  发送时随消息发出；`chat` js_api 透传 images
+
+### 工程
+
+- 测试 127 → 142（notifications 3 / schedule 存储+端到端 4 / browser 4 / 多模态 4），
+  全部离线（本地 http.server 当 webhook 与被抓页面；FakeLLM 验证多模态消息构造）
+- ruff / mypy 保持双清零
+
 ## [未发布] —— 2026-09-26 大版本升级（A–F 六批次）
 
 ### 新增
