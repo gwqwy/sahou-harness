@@ -1,0 +1,4 @@
+{
+  "name": "guardrails",
+  "description": "护栏插件：按 config.json 的 guardrails 配置拦截危险/敏感内容（关键词、正则、输入长度），输入输出双向"
+}

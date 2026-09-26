@@ -200,18 +200,69 @@ class Profile:
             return config
 
     # -- 插件安装 --------------------------------------------------------
-    def install_plugin(self, source: str | Path) -> Path:
-        """把本地插件目录复制进 profile（git URL 请先 clone 到本地再装）。"""
-        source = Path(source)
-        if not source.is_dir():
-            raise FileNotFoundError(f"插件目录不存在: {source}")
-        dest = self.plugins_dir / source.name
+    def _unique_dest(self, name: str) -> Path:
+        dest = self.plugins_dir / name
         counter = 2
         while dest.exists():
-            dest = self.plugins_dir / f"{source.name}-{counter}"
+            dest = self.plugins_dir / f"{name}-{counter}"
             counter += 1
-        shutil.copytree(source, dest)
         return dest
+
+    def install_plugin(self, source: str | Path) -> Path:
+        """把插件装进 profile。
+
+        - 本地目录：直接复制（``git`` 地址与 http(s) 地址走浅克隆）
+        - git/http(s) 地址：``git clone --depth 1`` 到临时目录后再复制，不会留下 .git
+
+        仓库根不是插件时（常见的 ``repo/plugin/`` 结构），若恰好只有一个子目录
+        带 plugin.json / register.py，就取它。
+        """
+        text = str(source).strip()
+        if text.startswith(("http://", "https://", "git@", "ssh://", "file://")):
+            return self._install_plugin_from_git(text)
+        source_path = Path(source)
+        if not source_path.is_dir():
+            raise FileNotFoundError(f"插件目录不存在: {source}")
+        dest = self._unique_dest(source_path.name)
+        shutil.copytree(source_path, dest)
+        return dest
+
+    def _install_plugin_from_git(self, url: str) -> Path:
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                subprocess.run(["git", "clone", "--depth", "1", url, tmp],
+                               check=True, capture_output=True, timeout=300)
+            except FileNotFoundError as exc:
+                raise OSError("未找到 git 命令，无法从地址安装插件") from exc
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+                raise OSError(f"git clone 失败: {detail or exc}") from exc
+            try:
+                subprocess.run(["git", "-C", tmp, "remote", "remove", "origin"],
+                               check=False, capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            root = Path(tmp)
+            if not self._looks_like_plugin(root):
+                children = sorted(p for p in root.iterdir()
+                                  if p.is_dir() and p.name != ".git" and self._looks_like_plugin(p))
+                if len(children) != 1:
+                    raise OSError(
+                        f"仓库里没有找到插件（需要 plugin.json 或 register.py）：{url}")
+                root = children[0]
+            name = root.name if root != Path(tmp) else Path(url.rstrip("/")).stem
+            if name.endswith(".git"):
+                name = name[:-4]
+            dest = self._unique_dest(name)
+            shutil.copytree(root, dest, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        return dest
+
+    @staticmethod
+    def _looks_like_plugin(path: Path) -> bool:
+        return (path / "plugin.json").is_file() or (path / "register.py").is_file()
 
     def remove_plugin(self, name_or_path: str | Path) -> bool:
         """删除 profile 内的插件目录。

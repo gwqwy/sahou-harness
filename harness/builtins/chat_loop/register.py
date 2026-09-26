@@ -24,24 +24,27 @@ class _EventTracer:
     def end_run(self, *args, **kwargs):
         return self._inner.end_run(*args, **kwargs)
 
-    def log(self, kind, **kwargs):
-        self._inner.log(kind, **kwargs)
+    def log(self, event_type, **data):
+        # 首个参数必须叫 event_type（不是 kind）：nanoagent 的 Tracer.log 签名是
+        # log(event_type, **data)，而 agent.py 会传 kind="input"/"output" 作为数据，
+        # 若此处命名成 kind 就会 "got multiple values for argument 'kind'"。
+        self._inner.log(event_type, **data)
         emit = getattr(self._host, "emit_agent_event", None)
         if not callable(emit):
             return
         try:
-            if kind == "llm_call":
+            if event_type == "llm_call":
                 emit({
                     "kind": "llm",
-                    "reasoning": str(kwargs.get("reasoning") or "")[:4000],
-                    "tools": [name for name, _ in (kwargs.get("tool_calls") or [])],
+                    "reasoning": str(data.get("reasoning") or "")[:4000],
+                    "tools": [name for name, _ in (data.get("tool_calls") or [])],
                 })
-            elif kind == "tool_call":
+            elif event_type == "tool_call":
                 emit({
                     "kind": "tool",
-                    "tool": str(kwargs.get("tool") or ""),
-                    "elapsed_ms": kwargs.get("elapsed_ms") or 0,
-                    "result": str(kwargs.get("result") or "")[:300],
+                    "tool": str(data.get("tool") or ""),
+                    "elapsed_ms": data.get("elapsed_ms") or 0,
+                    "result": str(data.get("result") or "")[:300],
                 })
         except Exception:  # noqa: BLE001 —— 事件推送失败不影响对话
             pass
@@ -97,13 +100,78 @@ def register(ctx) -> None:
                 if item.get("role") in ("user", "assistant"):
                     memory.add(session_id, item["role"], item.get("content", ""))
 
+            # 护栏与 tracer 都由插件提供，缺席即不启用（软依赖，不写进 inject）
+            rules = host.service("guardrails") or {}
+            make_tracer = (host.service("tracing") or {}).get("new_tracer")
+
             agent = Agent(name="卅助手", instructions=instructions, llm=llm,
-                          tools=host.collect_tools(), memory=memory)
+                          tools=host.collect_tools(), memory=memory,
+                          input_guardrails=rules.get("input") or None,
+                          output_guardrails=rules.get("output") or None,
+                          tracer=make_tracer() if callable(make_tracer) else None)
             agent.tracer = _EventTracer(agent.tracer, host)
             if len(registry):
                 agent.enable_skills(registry)
             state["agent"] = agent
         return state["agent"]
+
+    def can_stream() -> bool:
+        """当前模型是否支持流式（自建/自定义 LLM 可能只有 chat）。
+
+        界面据此选择走流式还是一次性，**不做「先试再回退」** ——
+        一旦流式跑到一半才失败，工具副作用可能已经发生了，重跑一遍是危险的。
+        """
+        try:
+            llm = getattr(get_agent(), "llm", None)
+        except Exception:  # noqa: BLE001 —— 模型未配置等
+            return False
+        return callable(getattr(llm, "chat_stream", None))
+
+    def _stream_events(agent, message: str, session_id: str, has_async: bool):
+        """把同步/异步两条流式接口统一成一个同步生成器。
+
+        ``arun_stream`` 是异步生成器，同步语境下没法「边产出边消费」地 asyncio.run，
+        所以用后台线程 + queue 桥接；异常与结束标记都通过队列回传再抛出。
+        """
+        if not has_async:
+            yield from agent.run_stream(message, session_id=session_id)
+            return
+        import asyncio
+        import queue
+        import threading
+
+        channel: queue.Queue = queue.Queue()
+        finished = object()
+
+        def worker() -> None:
+            async def consume() -> None:
+                async for event in agent.arun_stream(message, session_id=session_id):
+                    channel.put(event)
+
+            try:
+                asyncio.run(consume())
+            except BaseException as exc:  # noqa: BLE001 —— 交给消费者在同步侧抛出
+                channel.put(exc)
+            finally:
+                channel.put(finished)
+
+        threading.Thread(target=worker, name="harness-stream", daemon=True).start()
+        while True:
+            item = channel.get()
+            if item is finished:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def _bind_session(session_id: str | None) -> str:
+        """确定本轮会话；跨会话时必须丢掉 agent，否则记忆里仍是上一个会话的历史。"""
+        if session_id is None:
+            return state["session_id"]
+        if session_id != state["session_id"]:
+            state["agent"] = None
+            state["session_id"] = session_id
+        return session_id
 
     def ask(message: str, session_id: str | None = None) -> dict:
         """执行一轮对话（自动适配同步/异步工具），并持久化会话。
@@ -113,11 +181,7 @@ def register(ctx) -> None:
             session_id: 目标会话；省略则沿用当前会话（由 new_session 维护）
         """
         # 会话切换必须重建 agent：否则记忆里仍是上一个会话的历史（跨会话串味）
-        if session_id is None:
-            session_id = state["session_id"]
-        elif session_id != state["session_id"]:
-            state["agent"] = None
-            state["session_id"] = session_id
+        session_id = _bind_session(session_id)
         agent = get_agent()
         has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async) for n in agent.tools.names())
         if has_async:
@@ -131,6 +195,28 @@ def register(ctx) -> None:
         return {"reply": result.content, "reasoning": getattr(result, "reasoning", ""),
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
+
+    def ask_stream(message: str, session_id: str | None = None):
+        """流式对话：依次产出 ``delta`` / ``tool_call`` / ``done`` 事件。
+
+        ``done`` 事件里的 ``result`` 与 :func:`ask` 同源（完整 AgentResult）。
+
+        会话落盘**由本函数在流结束时补上**：nanoagent 的 ``run_stream`` 只把回合
+        记进内存里的 agent.memory，并不写 profile 的会话文件（那是 harness 的职责，
+        ``ask`` 里显式调 ``save_session``）。此前这里漏了这步，于是流式跑完关掉
+        界面，这一轮对话就凭空消失了。
+
+        模型不支持 ``chat_stream`` 时会抛错 —— 调用方应先用 :func:`can_stream`
+        判断，不要「先试再回退」（跑到一半失败会有重复的工具副作用）。
+        """
+        session_id = _bind_session(session_id)
+        agent = get_agent()
+        has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async)
+                        for n in agent.tools.names())
+        for event in _stream_events(agent, message, session_id, has_async):
+            yield event
+        # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
+        host.profile.save_session(session_id, agent.memory.history(session_id))
 
     def new_session(session_id: str | None = None) -> str:
         """开始一个新会话，返回新的会话 id（旧会话历史仍保留在磁盘上）。
@@ -149,6 +235,8 @@ def register(ctx) -> None:
 
     ctx.provide("agent_factory", get_agent)
     ctx.provide("ask", ask)
+    ctx.provide("ask_stream", ask_stream)
+    ctx.provide("can_stream", can_stream)
     ctx.provide("new_session", new_session)
     # 同一实现、更贴调用点的名字：明确「切到某个已有会话」时用它
     ctx.provide("switch_session", new_session)

@@ -1,0 +1,5 @@
+{
+  "name": "subagent",
+  "description": "子 agent 插件：注册 spawn_subagent 工具，把独立子任务交给上下文隔离的子 agent 完成",
+  "inject": ["chat_loop"]
+}

@@ -1,0 +1,5 @@
+{
+  "name": "knowledge",
+  "description": "知识库插件：把本地文档向量化入库，注册 search_knowledge / index_knowledge 工具做 RAG 检索",
+  "inject": ["models"]
+}

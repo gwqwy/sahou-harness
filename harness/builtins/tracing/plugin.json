@@ -1,0 +1,4 @@
+{
+  "name": "tracing",
+  "description": "追踪插件：把每轮对话的 trace 落盘为 JSONL（默认开启），可离线复盘或导出 OTel"
+}

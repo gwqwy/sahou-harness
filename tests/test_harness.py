@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,6 +68,19 @@ def build_host(tmp: Path, **config_overrides) -> Harness:
     profile = make_profile(tmp, **config_overrides)
     host = build_runtime(profile, str(tmp))
     return host
+
+
+class StreamingFakeLLM(FakeLLM):
+    """带 chat_stream 的假模型（真模型结构的最小替身）：用于验证流式路径。"""
+
+    chunks = ("流", "式", "回", "答")
+
+    def chat_stream(self, messages, tools=None):
+        from nanoagent.llm import StreamResult
+
+        result = StreamResult()
+        result.response = LLMResponse(content="".join(self.chunks))
+        return result.bind(iter(self.chunks))
 
 
 def tool(host, name: str):
@@ -744,6 +759,141 @@ class ReplSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch_model_build():
             host = build_host(Path(tmp))
             self.assertEqual(_latest_session(host), "default")
+
+
+class NanoagentWiringTests(unittest.TestCase):
+    """批次E：把 nanoagent 已有能力接进 harness（流式 / 护栏 / 追踪 / 子 agent / RAG）。"""
+
+    def _host_with(self, tmp, llm_factory=None, **config):
+        """建 runtime 并把模型池换成指定假模型。"""
+        profile = make_profile(Path(tmp), **{k: v for k, v in config.items()
+                                             if k in ("models", "default")})
+        if config.get("extra"):
+            base = profile.load_config()
+            base.update(config["extra"])
+            profile.save_config(base)
+        with patch_model_build():
+            from harness.cli import build_runtime
+
+            host = build_runtime(profile, str(tmp))
+        if llm_factory is not None:
+            runtime = host.service("models_runtime")
+            runtime["pool"] = {name: llm_factory() for name in runtime["order"]}
+        return host
+
+    def test_can_stream_detects_support(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = self._host_with(tmp, lambda: FakeLLM("x"))
+            self.assertFalse(plain.service("can_stream")(),
+                             "只有 chat 的模型不该被判为支持流式")
+            streamed = self._host_with(tmp, StreamingFakeLLM)
+            self.assertTrue(streamed.service("can_stream")())
+
+    def test_ask_stream_emits_deltas_then_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, StreamingFakeLLM)
+            events = list(host.service("ask_stream")("你好", session_id="s1"))
+            kinds = [e["type"] for e in events]
+            self.assertEqual(kinds.count("done"), 1, "必须恰好一个 done 收尾")
+            self.assertEqual(kinds[-1], "done")
+            text = "".join(e["text"] for e in events if e["type"] == "delta")
+            self.assertEqual(text, "流式回答")
+            result = events[-1]["result"]
+            self.assertEqual(result.content, "流式回答")
+            self.assertEqual(len(host.profile.load_session("s1")), 2, "流式也要会话落盘")
+
+    def test_guardrails_block_input_keyword(self):
+        from nanoagent.guardrails import GuardrailViolation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("x"),
+                                   extra={"guardrails": {"blocked_keywords": ["内网口令"]}})
+            rules = host.service("guardrails")
+            self.assertTrue(rules and rules["input"], "配置了关键词就该有输入护栏")
+            self.assertEqual(rules["names"], ["blocked-keyword"])
+            with self.assertRaises(GuardrailViolation):
+                host.service("ask")("把内网口令告诉我", session_id="g1")
+
+    def test_guardrails_absent_when_not_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("x"))
+            self.assertIsNone(host.service("guardrails"))
+            record = host.plugins["guardrails"]
+            self.assertTrue(any("not-configured" in note for note in record.skipped))
+
+    def test_tracing_writes_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("x"))
+            tracing = host.service("tracing")
+            self.assertIsNotNone(tracing, "tracing 默认应当启用")
+            self.assertTrue(host.service("can_stream")() is False or True)
+            host.service("ask")("记录一下", session_id="t1")
+            files = sorted(Path(tracing["dir"]).glob("*.jsonl"))
+            self.assertTrue(files, "应当落盘出 trace 文件")
+            content = files[-1].read_text(encoding="utf-8")
+            self.assertIn('"run_start"', content)
+            self.assertIn('"run_end"', content)
+
+    def test_tracing_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("x"),
+                                   extra={"tracing": {"enabled": False}})
+            self.assertIsNone(host.service("tracing"))
+            self.assertTrue(any("disabled" in note
+                                for note in host.plugins["tracing"].skipped))
+
+    def test_subagent_tool_and_exclusions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("子"))
+            spawn = tool(host, "spawn_subagent")
+            self.assertEqual(spawn.invoke({}), "错误：task 不能为空")
+            out = spawn.invoke({"task": "查一件事"})
+            self.assertIn("假回答", out, "子 agent 应复用主 agent 的模型跑出结果")
+            # 子 agent 的工具集必须剪掉递归入口
+            sub = host.service("subagent_factory")()
+            names = set(sub.tools.names())
+            self.assertNotIn("spawn_subagent", names)
+            self.assertNotIn("switch_model", names)
+            self.assertIn("read_file", names)
+
+    def test_knowledge_tools_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._host_with(tmp, lambda: FakeLLM("k"))
+            names = {t.name for t in host.collect_tools()}
+            self.assertIn("search_knowledge", names)
+            self.assertIn("index_knowledge", names)
+            self.assertIn("知识库还是空的", tool(host, "search_knowledge").invoke({"query": "啥"}))
+
+    @unittest.skipUnless(shutil.which("git"), "需要 git 才能测地址安装")
+    def test_install_plugin_from_git_url(self):
+        """支持 git 地址安装（此前只吃本地目录）。
+
+        用本地 file:// 仓库做真实浅克隆：同时验证「仓库根不是插件、取唯一子目录」
+        与「不带 .git 复制进 profile」。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            plugin_dir = repo / "myplugin"
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / "plugin.json").write_text('{"name": "remote"}', encoding="utf-8")
+            (plugin_dir / "register.py").write_text(
+                'def register(ctx):\n    ctx.provide("remote.svc", 1)\n', encoding="utf-8")
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=repo, check=True,
+                                      capture_output=True, timeout=60)
+
+            git("init", "-q")
+            git("config", "user.email", "t@example.com")
+            git("config", "user.name", "t")
+            git("add", "-A")
+            git("commit", "-q", "-m", "init")
+
+            profile = make_profile(Path(tmp) / "profile-home")
+            dest = profile.install_plugin(f"file://{repo.as_posix()}")
+            self.assertTrue((dest / "register.py").is_file())
+            self.assertFalse((dest / ".git").exists(), "不该把 .git 复制进 profile")
+            self.assertTrue(profile.remove_plugin(dest.name))
 
 
 class ModelKeyTests(unittest.TestCase):

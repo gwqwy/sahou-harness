@@ -72,8 +72,34 @@ def register(ctx) -> None:
     def run_ui(once_message: str | None = None, session_id: str | None = None,
                force_new: bool = False) -> None:
         ask = host.service("ask")
+        ask_stream = host.service("ask_stream")
+        can_stream = host.service("can_stream")
         new_session = host.service("new_session")
         switch_session = host.service("switch_session")
+
+        def streaming_ready() -> bool:
+            """是否走流式：不支持就一次性，不做「先试再回退」（会重复工具副作用）。"""
+            return callable(ask_stream) and callable(can_stream) and can_stream()
+
+        def run_turn(text: str) -> None:
+            """执行一轮对话并打印（支持则逐字输出，工具调用插在中间）。"""
+            if not streaming_ready():
+                print(ask(text, session_id)["reply"])
+                return
+            printed = False
+            for event in ask_stream(text, session_id):
+                kind = event.get("type")
+                if kind == "delta":
+                    print(event["text"], end="", flush=True)
+                    printed = True
+                elif kind == "tool_call":
+                    if printed:
+                        print()
+                        printed = False
+                    result = str(event.get("result") or "").replace("\n", " ")[:160]
+                    print(f"  ⚙ {event.get('name')} → {result}")
+            if printed:
+                print()
 
         # 会话选择：显式 --session 优先；--new 强制新建；否则续用最近一次
         if force_new:
@@ -182,12 +208,12 @@ def register(ctx) -> None:
             print(f"未知命令 {name}。可用:\n{print_help()}")
 
         if once_message is not None:
-            result = ask(once_message, session_id)
-            print(result["reply"])
+            run_turn(once_message)
             return
 
         _install_readline(host, host.profile.root)
-        print(f"卅 harness | 会话 {session_id} | /help 帮助 | /exit 退出")
+        mode = "流式" if streaming_ready() else "整段"
+        print(f"卅 harness | 会话 {session_id} | {mode}输出 | /help 帮助 | /exit 退出")
         while True:
             try:
                 user_input = input("\n你 > ").strip()
@@ -206,8 +232,7 @@ def register(ctx) -> None:
                     print(f"[出错] {exc}")
                 continue
             try:
-                result = ask(user_input, session_id)
-                print(result["reply"])
+                run_turn(user_input)
             except Exception as exc:  # noqa: BLE001
                 print(f"[出错] {type(exc).__name__}: {exc}")
 

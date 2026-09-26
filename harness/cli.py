@@ -6,8 +6,9 @@
     sha chat -s <会话id> -m "..."  # 指定会话
     sha chat --new                 # 强制开新会话
     sha sessions                   # 列出历史会话
+    sha trace                      # 查看最近一次对话的 trace 摘要
     sha init                       # 初始化 profile（生成 config.json）
-    sha plugin add <目录>          # 安装外部插件（装完立即校验能否激活）
+    sha plugin add <目录|git地址>   # 安装外部插件（装完立即校验能否激活）
     sha plugin list | remove <名>  # 查看 / 移除插件
     sha plugin new <名>            # 生成一个插件模板
     sha plugin reload <名>         # 重载单个插件（改完插件代码不必重启）
@@ -88,10 +89,11 @@ def _make_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="初始化 profile")
     sub.add_parser("status", help="插件与能力总览")
     sub.add_parser("sessions", help="列出历史会话")
+    sub.add_parser("trace", help="查看最近一次对话的 trace 摘要（需 tracing 插件）")
 
     plugin = sub.add_parser("plugin", help="插件管理")
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
-    p_add = plugin_sub.add_parser("add", help="安装插件（本地目录）")
+    p_add = plugin_sub.add_parser("add", help="安装插件（本地目录或 git/http 地址）")
     p_add.add_argument("source")
     plugin_sub.add_parser("list", help="列出已安装插件")
     p_rm = plugin_sub.add_parser("remove", help="移除插件")
@@ -372,6 +374,28 @@ def main(argv: list | None = None) -> int:
             print(line)
         for service_name, providers in sorted(host.service_conflicts.items()):
             print(f"  冲突: 服务 {service_name} 由 {', '.join(providers)} 同时提供（后者覆盖）")
+        return 0
+
+    if command == "trace":
+        tracing = host.service("tracing")
+        if not tracing:
+            print("（tracing 插件未启用，或 tracing.enabled=false）")
+            return 0
+        files = sorted(Path(tracing["dir"]).glob("*.jsonl"))
+        if not files:
+            print(f"暂无 trace（目录: {tracing['dir']}）")
+            return 0
+        from nanoagent.observability import trace_summary
+
+        latest = files[-1]
+        try:
+            summary = trace_summary(latest)
+        except Exception as exc:  # noqa: BLE001
+            print(f"错误：无法读取 trace（{type(exc).__name__}: {exc}）", file=sys.stderr)
+            return 1
+        print(f"最新 trace: {latest.name}")
+        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str)
+              if isinstance(summary, (dict, list)) else summary)
         return 0
 
     if command == "desktop":
