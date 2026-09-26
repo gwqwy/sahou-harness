@@ -170,6 +170,12 @@ class DesktopApp:
             except Exception:  # noqa: BLE001 —— 窗口已关
                 return False
             if value is not None:
+                # 读后立即清空（H-08c）：终端命令与对话工具共用这一个结果变量，
+                # 不清空的话并发等待者会把同一次点击读走（结果串扰/误放行）。
+                try:
+                    self._window.evaluate_js("window.__dialogResult=null")
+                except Exception:  # noqa: BLE001 —— 窗口刚关不影响已取得的结果
+                    pass
                 return bool(value)
             time.sleep(interval)
             interval = min(interval * 1.5, 1.0)
@@ -1352,8 +1358,11 @@ let perms = { shell: 'ask', fs: 'allow' };
 const PERM_TEXT = { ask: '需确认', allow: '允许', deny: '禁止' };
 
 function esc(s) {
+  // 单引号也转义（审计 H-09）：虽然当前所有插值点都是双引号属性，
+  // 防未来新增单引号上下文时被模型名等内容注入
   return String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function md(text) {
   let html = esc(text);
@@ -1401,8 +1410,10 @@ function _closeDialog(value) {
   $('dlgOverlay').style.display = 'none';
   window.__dialogResult = value;
 }
+// 取消必须是可区分的 false 而非 null：null 在 Python 侧等于「未响应」，
+// 点取消会被当没点而空等超时（H-05）。false = 明确的拒绝。
 $('dlgOk').onclick = () => _closeDialog($('dlgInput').style.display !== 'none' ? $('dlgInput').value : true);
-$('dlgCancel').onclick = () => _closeDialog(null);
+$('dlgCancel').onclick = () => _closeDialog(false);
 $('dlgInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); $('dlgOk').click(); }
 });
@@ -1782,7 +1793,12 @@ function switchTab(name) {
   if (name === 'skills') loadSkills();
 }
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { closeSettings(); $('dlgOverlay').style.display = 'none'; }
+  // 权限确认框可见时 Esc = 明确拒绝（H-05：此前只隐藏不回结果，Python 侧空等超时）
+  if (e.key === 'Escape') {
+    if ($('dlgOverlay').style.display !== 'none') _closeDialog(false);
+    closeSettings();
+    $('dlgOverlay').style.display = 'none';
+  }
 });
 $('overlay').addEventListener('mousedown', (e) => { if (e.target === $('overlay')) closeSettings(); });
 
