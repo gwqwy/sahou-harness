@@ -1,0 +1,4 @@
+{
+  "name": "mcp_client",
+  "description": "MCP 客户端插件：连接 config.json 里 mcpServers 声明的远程/本地 MCP 服务器，工具自动接入 agent"
+}

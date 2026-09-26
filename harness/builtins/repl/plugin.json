@@ -1,0 +1,4 @@
+{
+  "name": "repl",
+  "description": "REPL 插件：终端交互界面（斜杠命令来自所有插件注册的 commands）"
+}

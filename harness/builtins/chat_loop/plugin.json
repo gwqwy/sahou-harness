@@ -1,0 +1,4 @@
+{
+  "name": "chat_loop",
+  "description": "对话循环插件：用 nanoagent Agent 组装执行引擎（工具/技能/模型全部来自其它插件）"
+}

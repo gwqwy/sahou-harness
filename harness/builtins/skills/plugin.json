@@ -1,0 +1,4 @@
+{
+  "name": "skills",
+  "description": "技能插件：把 profile 的 skills/ 目录（SKILL.md 格式）暴露给 agent（渐进式披露）"
+}

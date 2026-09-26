@@ -1,0 +1,4 @@
+{
+  "name": "tools_shell",
+  "description": "Shell 工具插件：在工作区执行命令，受权限门控制（ask/allow/deny，配置在 config.json 的 permissions）"
+}

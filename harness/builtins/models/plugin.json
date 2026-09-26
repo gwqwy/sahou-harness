@@ -1,0 +1,4 @@
+{
+  "name": "models",
+  "description": "模型提供者插件：从 profile 配置构建多模型池，支持自主切换（switch_model 工具）与手动切换（/model 命令）"
+}

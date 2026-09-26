@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 本地环境与密钥（禁止入库）
+.env
+.env.local
+
+# 构建产物
+build/
+build_pyi/
+dist/
+
+# 临时诊断工装
+_diag/
+
+# 运行时产物
+*.log
+*.db
+*.zip
