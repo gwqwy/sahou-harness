@@ -37,7 +37,7 @@ def _resolve_api_key(raw, provider: str, name: str) -> str:
 def _build_llm(entry: dict):
     provider = (entry.get("provider") or "openai").lower()
     model = entry.get("model")
-    api_key = _resolve_api_key(entry.get("api_key"), provider, entry.get("name"))
+    api_key = _resolve_api_key(entry.get("api_key"), provider, str(entry.get("name") or ""))
     if not model or not api_key:
         raise ValueError(f"模型 '{entry.get('name')}' 缺少 model 或 api_key 配置")
     if provider == "anthropic":

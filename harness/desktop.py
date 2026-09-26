@@ -226,7 +226,7 @@ class DesktopApp:
         if not resolved.is_dir():
             return {"ok": False, "error": f"目录不存在: {path}"}
         self.host.workspace = str(resolved)
-        entry = self._register_workspace(resolved)
+        entry = self._register_workspace(str(resolved))
         self.host.profile.update_config(
             workspace=str(resolved), current_workspace=entry["id"]
         )

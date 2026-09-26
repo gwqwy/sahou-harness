@@ -63,6 +63,9 @@ def run_register(record: Any, ctx: Any) -> None:
 
     module_name = f"harness_plugin_{record.name}_{uuid.uuid4().hex[:8]}"
     spec = importlib.util.spec_from_file_location(module_name, register_py)
+    if spec is None or spec.loader is None:
+        # 理论上只在文件被并发替换成非法形态时发生；fail-fast 让 mount_notes 可见
+        raise ImportError(f"无法从 {register_py} 创建模块 spec")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:

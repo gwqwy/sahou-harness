@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from typing import Any
 
 
 def register(ctx) -> None:
@@ -16,7 +17,7 @@ def register(ctx) -> None:
     if not servers:
         return
 
-    connections = []  # 已建立的 MCPServer 连接
+    connections: list[Any] = []  # 已建立的 MCPServer 连接
 
     # 整个连接/断开生命周期共用一个事件循环：MCP session 对象绑定在创建它的 loop 上，
     # 若每步都 asyncio.run（各自新建+关闭 loop），跨 loop 复用会触发

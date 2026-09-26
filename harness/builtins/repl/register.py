@@ -34,16 +34,18 @@ def _install_readline(host, profile_root) -> None:
         return
 
     history_path = Path(profile_root) / "history.txt"
+    # readline 的类型存根在 Windows 上是残缺的（pyreadline3 不带 .pyi），
+    # 以下属性调用全部有 try/except 兜底，mypy 误报直接压掉。
     try:
         if history_path.is_file():
-            readline.read_history_file(str(history_path))
-        readline.set_history_length(500)
+            readline.read_history_file(str(history_path))  # type: ignore[attr-defined]
+        readline.set_history_length(500)  # type: ignore[attr-defined]
     except OSError:
         pass
 
     def save_history() -> None:
         try:
-            readline.write_history_file(str(history_path))
+            readline.write_history_file(str(history_path))  # type: ignore[attr-defined]
         except OSError:
             pass
 
@@ -60,8 +62,8 @@ def _install_readline(host, profile_root) -> None:
         return options[state] if state < len(options) else None
 
     try:
-        readline.set_completer(completer)
-        readline.parse_and_bind("tab: complete")
+        readline.set_completer(completer)  # type: ignore[attr-defined]
+        readline.parse_and_bind("tab: complete")  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 —— 不同 readline 实现的怪癖不该让 REPL 起不来
         pass
 

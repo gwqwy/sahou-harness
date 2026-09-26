@@ -191,7 +191,9 @@ class Harness:
         self.plugins: dict[str, PluginRecord] = {}
         self.services: dict[str, Any] = {}
         self.service_conflicts: dict[str, list[str]] = {}  # 服务名 → 提供者列表
-        self.profile = None        # 由运行时（cli）注入
+        # profile: Any 而非 Profile —— config↔kernel 会循环导入，运行时由 cli 注入
+        self.profile: Any = None
+        self.workspace: str = ""   # 由 cli 注入的绝对路径，工具与 shell 都假定它存在
         self.confirm: Callable[[str], bool] | None = None  # 权限确认回调（REPL 注入）
 
     # -- 发现 ------------------------------------------------------------

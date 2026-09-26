@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 INSTRUCTIONS = (
     "你是卅 harness 的中文编程助手，简洁、诚实、善用工具。"
@@ -52,7 +53,7 @@ class _EventTracer:
 
 def register(ctx) -> None:
     host = ctx.host
-    state = {"agent": None, "session_id": "default"}
+    state: dict[str, Any] = {"agent": None, "session_id": "default"}
 
     def _new_session_id() -> str:
         """生成一个尚未被占用的会话 id（时间戳 + 递增序号兜底）。
