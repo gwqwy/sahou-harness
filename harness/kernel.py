@@ -360,6 +360,27 @@ class Harness:
         self.bus.emit("deactivate", name=record.name)
         return record
 
+    def shutdown(self) -> builtins.list[str]:
+        """停用全部 ACTIVE 插件（按激活的逆序），触发 effect LIFO 回滚。
+
+        此前 main() 退出（含 Ctrl+C）从不调用它，MCP 连接、追踪文件句柄、
+        审计日志等 disposer 资源全靠进程退出由 OS 兜底——与「生命周期闭环」
+        的架构声明不符（H-06）。单个插件停用失败不阻断其余插件。
+        """
+        order = [r.name for r in self.plugins.values() if r.state == ACTIVE]
+        # activation_order 是依赖拓扑序（依赖先激活），逆序即「依赖者先卸」
+        order.reverse()
+        closed: builtins.list[str] = []
+        for name in order:
+            try:
+                self.deactivate(name)
+                closed.append(name)
+            except Exception as exc:  # noqa: BLE001 —— 退出路径尽量多回收
+                record = self.plugins.get(name)
+                if record is not None:
+                    record.error = f"{type(exc).__name__}: {exc}"
+        return closed
+
     def reload(self, name: str) -> PluginRecord:
         """卸载并重新装载 + 激活单个插件（改完插件代码无需重启整个 harness）。
 

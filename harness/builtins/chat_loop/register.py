@@ -128,42 +128,14 @@ def register(ctx) -> None:
             return False
         return callable(getattr(llm, "chat_stream", None))
 
-    def _stream_events(agent, message: str, session_id: str, has_async: bool):
-        """把同步/异步两条流式接口统一成一个同步生成器。
+    def _stream_events(agent, message: str, session_id: str):
+        """同步流式：直接透传 ``run_stream`` 的事件（delta / tool_call / done）。
 
-        ``arun_stream`` 是异步生成器，同步语境下没法「边产出边消费」地 asyncio.run，
-        所以用后台线程 + queue 桥接；异常与结束标记都通过队列回传再抛出。
+        工具是同步执行的（MCP 已包装为同步闭包，其余协程工具由 nanoagent
+        单独起循环跑完），因此不存在「异步工具要走 arun_stream」的分支——
+        那条路径需要 AsyncLLM，而 models 只构建同步 LLM（H-02 的流式面）。
         """
-        if not has_async:
-            yield from agent.run_stream(message, session_id=session_id)
-            return
-        import asyncio
-        import queue
-        import threading
-
-        channel: queue.Queue = queue.Queue()
-        finished = object()
-
-        def worker() -> None:
-            async def consume() -> None:
-                async for event in agent.arun_stream(message, session_id=session_id):
-                    channel.put(event)
-
-            try:
-                asyncio.run(consume())
-            except BaseException as exc:  # noqa: BLE001 —— 交给消费者在同步侧抛出
-                channel.put(exc)
-            finally:
-                channel.put(finished)
-
-        threading.Thread(target=worker, name="harness-stream", daemon=True).start()
-        while True:
-            item = channel.get()
-            if item is finished:
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
+        yield from agent.run_stream(message, session_id=session_id)
 
     def _bind_session(session_id: str | None) -> str:
         """确定本轮会话；跨会话时必须丢掉 agent，否则记忆里仍是上一个会话的历史。"""
@@ -175,7 +147,13 @@ def register(ctx) -> None:
         return session_id
 
     def ask(message: str, session_id: str | None = None) -> dict:
-        """执行一轮对话（自动适配同步/异步工具），并持久化会话。
+        """执行一轮对话，并持久化会话。
+
+        统一走同步 :meth:`agent.run`：MCP 工具已由 mcp_client 包装成同步闭包
+        （内部投递回专用 loop），其余协程工具由 nanoagent 的同步执行路径
+        单独起事件循环跑完 —— 都不需要 AsyncLLM。此前这里检测到异步工具就
+        切 ``arun``，而 models 只构建同步 LLM，导致配了 MCP 对话必抛
+        TypeError（H-02）。
 
         Args:
             message: 用户输入
@@ -184,13 +162,7 @@ def register(ctx) -> None:
         # 会话切换必须重建 agent：否则记忆里仍是上一个会话的历史（跨会话串味）
         session_id = _bind_session(session_id)
         agent = get_agent()
-        has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async) for n in agent.tools.names())
-        if has_async:
-            import asyncio
-
-            result = asyncio.run(agent.arun(message, session_id=session_id))
-        else:
-            result = agent.run(message, session_id=session_id)
+        result = agent.run(message, session_id=session_id)
         host.profile.save_session(session_id, agent.memory.history(session_id))
         runtime = host.service("models_runtime") or {}
         return {"reply": result.content, "reasoning": getattr(result, "reasoning", ""),
@@ -212,9 +184,7 @@ def register(ctx) -> None:
         """
         session_id = _bind_session(session_id)
         agent = get_agent()
-        has_async = any((agent.tools.get(n) and agent.tools.get(n).is_async)
-                        for n in agent.tools.names())
-        yield from _stream_events(agent, message, session_id, has_async)
+        yield from _stream_events(agent, message, session_id)
         # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
         host.profile.save_session(session_id, agent.memory.history(session_id))
 

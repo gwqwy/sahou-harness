@@ -13,6 +13,9 @@ _ENV_REF = re.compile(
     r"|env:(?P<c>[A-Za-z_][A-Za-z0-9_]*))\s*$"
 )
 
+# 首次启动写进 config.json 的示例占位符（config.CONFIG_EXAMPLE）——视为未配置
+_PLACEHOLDER_KEYS = {"sk-...", "sk-xxx", "sk-your-key", "YOUR_API_KEY"}
+
 
 def _resolve_api_key(raw, provider: str, name: str) -> str:
     """把 api_key 解析成真实值：支持环境变量引用与 provider 约定变量的兜底。"""
@@ -40,6 +43,12 @@ def _build_llm(entry: dict):
     api_key = _resolve_api_key(entry.get("api_key"), provider, str(entry.get("name") or ""))
     if not model or not api_key:
         raise ValueError(f"模型 '{entry.get('name')}' 缺少 model 或 api_key 配置")
+    # 首次启动写入的示例占位符（H-11）：放它进可用池的话，首次对话报的是上游
+    # 401 鉴权错误，用户根本想不到是「还没填 key」。这里当作未配置处理。
+    if api_key.strip() in _PLACEHOLDER_KEYS:
+        raise ValueError(
+            f"模型 '{entry.get('name')}' 的 api_key 还是示例占位符（{api_key.strip()}），"
+            "请在 config.json 或桌面端模型设置里填入真实 Key")
     if provider == "anthropic":
         from nanoagent import AnthropicLLM
 

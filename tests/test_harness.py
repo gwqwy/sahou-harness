@@ -235,6 +235,36 @@ def register(ctx):
 
 
 class PluginGraphTests(KernelTests):
+
+    def test_shutdown_disposes_active_plugins_lifo_and_is_idempotent(self):
+        """审计 H-06：退出回收——shutdown 停用全部 ACTIVE 插件（disposer 执行）且幂等。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "disposed.log"
+
+            host = Harness()
+            # p2 依赖 p1：激活序 p1→p2，shutdown 应先卸 p2（依赖者先卸）
+            p1 = self._plugin(tmp, "p1", f"""
+def register(ctx):
+    ctx.effect(lambda: (lambda: open(r"{marker}", "a", encoding="utf-8").write("p1 ")))
+""", inject=[])
+            p2 = self._plugin(tmp, "p2", f"""
+def register(ctx):
+    ctx.effect(lambda: (lambda: open(r"{marker}", "a", encoding="utf-8").write("p2 ")))
+""", inject=["p1"])
+            host.mount(p1, name="p1")
+            host.mount(p2, name="p2")
+            host.activate_all()
+            self.assertEqual([r.state for r in host.plugins.values()],
+                             [ACTIVE, ACTIVE])
+
+            closed = host.shutdown()
+            self.assertEqual(sorted(closed), ["p1", "p2"])
+            self.assertTrue(all(r.state == DISPOSED
+                                for r in host.plugins.values()))
+            self.assertEqual(marker.read_text(encoding="utf-8"), "p2 p1 ")
+            # 幂等：二次 shutdown 无事发生、不抛错
+            self.assertEqual(host.shutdown(), [])
     """批次D：依赖声明 / 拓扑激活 / 冲突可见 / 单插件热重载。"""
 
     def test_inject_orders_activation(self):
@@ -566,6 +596,29 @@ class EndToEndTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
+
+    def test_session_path_traversal_rejected(self):
+        """审计 H-04：save/load_session 不得用 ..\\.. 逃出 profile 的 sessions 目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = make_profile(root)
+            outside = root / "victim.json"
+            outside.write_text('[{"role": "assistant", "content": "外泄"}]', encoding="utf-8")
+
+            # 各种穿越/绝对路径/空名一律拒绝（返回 None / []）
+            self.assertIsNone(profile.save_session(r"..\..\victim", [{"role": "u"}]))
+            self.assertIsNone(profile.save_session("../victim", [{"role": "u"}]))
+            self.assertIsNone(profile.save_session(str(outside), [{"role": "u"}]))
+            self.assertIsNone(profile.save_session("", [{"role": "u"}]))
+            self.assertIsNone(profile.save_session("a/b", [{"role": "u"}]))
+            self.assertEqual(profile.load_session(r"..\..\victim"), [])
+            self.assertEqual(profile.load_session("../victim"), [])
+            self.assertFalse(outside.read_text(encoding="utf-8").startswith('[{"role": "u"}'))
+
+            # 正常 id 不受影响
+            self.assertIsNotNone(profile.save_session("s-20260926-120000", [{"role": "u"}]))
+            self.assertEqual(profile.load_session("s-20260926-120000"), [{"role": "u"}])
+            self.assertIn("s-20260926-120000", profile.session_ids())
     """缺陷修复：/new 必须真正开新会话（换 id + 清 agent），旧会话仍保留在磁盘。"""
 
     def test_new_session_does_not_replay_old_history(self):
@@ -666,6 +719,33 @@ class CliTests(unittest.TestCase):
 
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(main([*base, "model", "remove", "mine"]), 1)
+
+    def test_model_use_rejects_bad_name_even_when_pool_empty(self):
+        """审计 H-08b：models 全不可用（order 为空）时，坏名也不能持久化为默认模型。"""
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp]
+            # 占位 key 让 models 插件构建失败 → order 为空
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main([*base, "model", "add", "demo", "--model", "gpt-x",
+                           "--api-key", "sk-..."])
+            self.assertEqual(rc, 0)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = main([*base, "model", "use", "bogus"])
+            self.assertEqual(rc, 1)
+            self.assertIn("模型不存在", err.getvalue())
+
+            config = json.loads((Path(tmp) / "profiles" / "default" / "config.json")
+                                .read_text(encoding="utf-8"))
+            self.assertNotEqual(config["default_model"], "bogus",
+                                "坏模型名不能被持久化成默认模型")
 
     def test_bad_model_entry_only_skips_itself(self):
         """一个模型写错（如 ${ENV} 未设置）不能连累其它模型全部消失。"""
@@ -1082,8 +1162,88 @@ class AllowlistConfigTests(unittest.TestCase):
             self.assertIs(perms["audit"], False, "兄弟键必须还在")
 
 
+class AsyncToolChatTests(unittest.TestCase):
+    """审计 H-02：协程工具 + 同步 LLM 的对话链路。
+
+    此前 ask() 检测到异步工具就切 arun，而 models 只构建同步 LLM，
+    配了 MCP（工具 is_async）对话必抛 TypeError。现在统一走同步 run，
+    协程工具由 nanoagent 的同步执行路径单独起循环跑完。
+    """
+
+    def test_ask_with_coroutine_tool_and_sync_llm(self):
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            agent = host.service("agent_factory")()
+
+            async def echo(word: str) -> str:
+                """回显单词。"""
+                return f"echo:{word}"
+
+            agent.tools.register(echo)
+            self.assertTrue(agent.tools.get("echo").is_async)
+
+            llm = agent.llm
+            self.assertFalse(hasattr(llm, "achat"))  # 同步 LLM
+            from nanoagent.llm import ToolCall
+
+            llm.script = [LLMResponse(
+                content="", tool_calls=[ToolCall(
+                    id="t1", name="echo", arguments={"word": "hi"})])]
+            llm.script.append(LLMResponse(content="工具已调用"))
+
+            ask = host.service("ask")
+            result = ask("调用 echo")
+            self.assertEqual(result["reply"], "工具已调用")
+            self.assertTrue(asyncio.iscoroutinefunction(echo))
+
+    def test_mcp_style_tools_are_wrapped_sync(self):
+        """mcp_client 把异步 Tool 包装成同步闭包（同 schema），is_async 恒 False。"""
+        import asyncio
+
+        from nanoagent.tools import Tool, make_tool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = build_host(Path(tmp))
+            agent = host.service("agent_factory")()
+
+            async def remote(query: str) -> str:
+                """模拟 MCP 工具。"""
+                return f"remote:{query}"
+
+            async_tool = make_tool(remote)
+            self.assertTrue(async_tool.is_async)
+
+            # 与 mcp_client.wrap_sync 相同的包装方式
+            def call(**arguments):
+                return asyncio.run(async_tool.arun(arguments))
+
+            call.__name__ = async_tool.name
+            call.__doc__ = async_tool.description
+            sync_tool = Tool(name=async_tool.name, description=async_tool.description,
+                             parameters=async_tool.parameters, func=call, thread_safe=False)
+            agent.tools.register(sync_tool)
+
+            self.assertFalse(agent.tools.get("remote").is_async)
+            result = agent.tools.get("remote").invoke({"query": "x"})
+            self.assertEqual(result, "remote:x")
+
+
 class ModelKeyTests(unittest.TestCase):
     """第三批 #15：API Key 支持环境变量注入，避免明文落盘。"""
+
+    def test_placeholder_key_is_treated_as_unconfigured(self):
+        """审计 H-11：占位 "sk-..." 不能进可用池，否则首话报上游 401 而非「没配 key」。"""
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(
+                Path(tmp),
+                models=[{"name": "demo", "provider": "openai",
+                         "model": "x", "api_key": "sk-..."}],
+                default="demo")
+            runtime = host.service("models_runtime") or {}
+            self.assertEqual(runtime.get("order"), [])
+            self.assertIn("占位符", (runtime.get("errors") or {}).get("demo", ""))
 
     def test_env_ref_forms(self):
         import os

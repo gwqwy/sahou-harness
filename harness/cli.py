@@ -335,6 +335,13 @@ def main(argv: list | None = None) -> int:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
+    # 退出时回收插件资源（H-06）：MCP 连接、追踪/审计文件句柄等都挂在插件的
+    # effect disposer 上。此前进程退出从不调 deactivate，全靠 OS 兜底。
+    # atexit 覆盖全部 return 路径（含 Ctrl+C 与异常）；shutdown 幂等，重复调用无害。
+    import atexit
+
+    atexit.register(host.shutdown)
+
     if command == "model":
         runtime = host.service("models_runtime") or {"order": [], "current": ""}
         if args.model_command == "list":
@@ -344,8 +351,11 @@ def main(argv: list | None = None) -> int:
                 print(f"  [不可用] {name}: {reason}")
         elif args.model_command == "use":
             order = list(runtime.get("order") or [])
-            if order and args.name not in order:
-                print(f"错误：模型不存在: {args.name}（可用: {', '.join(order)}）", file=sys.stderr)
+            # 无条件校验（H-08b）：旧写法 `if order and ...` 在 models 全部不可用
+            # （order 为空）时短路旁路，坏模型名仍会被持久化成 default_model。
+            if args.name not in order:
+                hint = f"（可用: {', '.join(order)}）" if order else "（当前没有可用模型，请先在 config.json 修正模型配置）"
+                print(f"错误：模型不存在: {args.name}{hint}", file=sys.stderr)
                 return 1
             print(runtime["set"](args.name) if "set" in runtime else
                   f"已写入配置: default_model={args.name}（重启后生效）")

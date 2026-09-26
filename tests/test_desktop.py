@@ -527,6 +527,33 @@ class DesktopApiTests(unittest.TestCase):
             outside = app.remove_skill("../../escape")
             self.assertFalse(outside["ok"])  # 不能越出 profile skills 目录
 
+    def test_skills_install_rejects_degenerate_source(self):
+        """审计 H-10a：source='.' 时 src.name 为空，旧实现会 rmtree 删光整个 skills 目录。"""
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as skill_src:
+            _host, app = self._app(Path(tmp))
+            src = Path(skill_src) / "my-skill"
+            src.mkdir()
+            (src / "SKILL.md").write_text(
+                "---\nname: my-skill\ndescription: 测试技能\n---\n正文", encoding="utf-8")
+            # 先装一个正常技能，作为「不能被删光」的对照物
+            self.assertTrue(app.install_skill(str(src))["ok"])
+
+            # 场景 A：在含 SKILL.md 的目录里调 install_skill('.') —— Path('.').name == ''
+            # （旧行为：dest 退化成 skills 目录本身，rmtree 同名覆盖删光技能库）
+            (Path(skill_src) / "SKILL.md").write_text(
+                "---\nname: parent\ndescription: 父目录也是技能\n---\n正文", encoding="utf-8")
+            cwd = os.getcwd()
+            try:
+                os.chdir(skill_src)
+                bad = app.install_skill(".")
+            finally:
+                os.chdir(cwd)
+            self.assertFalse(bad["ok"], bad)
+            self.assertIn("技能文件夹", bad.get("error", ""))
+            # 既有技能必须完好
+            skills = {s["name"] for s in app.skills()["skills"]}
+            self.assertIn("my-skill", skills)
+
     def test_chat_emits_step_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             from nanoagent.llm import LLMResponse, ToolCall

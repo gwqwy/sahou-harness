@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -30,6 +31,9 @@ from typing import Any
 # 权限门合法取值；其余任何取值都归一到 DEFAULT_PERMISSION_MODE
 PERMISSION_MODES = ("ask", "allow", "deny")
 DEFAULT_PERMISSION_MODE = "ask"
+
+# 会话 id 白名单（H-04）：拒绝路径分隔符与穿越，见 Profile._safe_session_file
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "default_model": "",
@@ -368,14 +372,36 @@ class Profile:
         return True
 
     # -- 会话 ------------------------------------------------------------
+    @staticmethod
+    def _safe_session_file(session_id: str, sessions_dir: Path) -> Path | None:
+        """把会话 id 限定为单段文件名；拒绝路径分隔符与穿越（审计 H-04）。
+
+        白名单 ``_SESSION_ID_RE`` 的真实格式为 "s-YYYYMMDD-HHMMSS" / "default" /
+        测试自定名；首字符限字母数字下划线，天然拒绝 ".."、绝对路径与隐藏文件。
+
+        此前 ``save_session("..\\..\\victim")`` 可写 profile 外任意 .json、
+        ``load_session`` 同理可读——桌面端的会话参数来自界面输入，必须设防。
+        """
+        if not isinstance(session_id, str):
+            return None
+        name = session_id.strip()
+        if not name or not _SESSION_ID_RE.fullmatch(name):
+            return None
+        path = (sessions_dir / f"{name}.json").resolve()
+        if path.parent != sessions_dir.resolve():
+            return None
+        return path
+
     def save_session(self, session_id: str, history: list[dict]) -> Path | None:
-        path = self.sessions_dir / f"{session_id}.json"
+        path = self._safe_session_file(session_id, self.sessions_dir)
+        if path is None:
+            return None
         atomic_write_text(path, json.dumps(history, ensure_ascii=False, indent=2))
         return path
 
     def load_session(self, session_id: str) -> list[dict]:
-        path = self.sessions_dir / f"{session_id}.json"
-        if not path.is_file():
+        path = self._safe_session_file(session_id, self.sessions_dir)
+        if path is None or not path.is_file():
             return []
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

@@ -690,10 +690,17 @@ class DesktopApp:
             src = src.parent
         if not src.is_dir() or not (src / "SKILL.md").is_file():
             return {"ok": False, "error": "目录需包含 SKILL.md"}
-        dest = self._profile_skills_dir() / src.name
+        # src.name 可能是 ''（source='.'、'./'）或 '..'：dest 退化成 skills 目录本身
+        # 或其父目录，下面的 rmtree 同名覆盖就会删光整个技能库（审计 H-10a 实证）。
+        if not src.name or src.name in (".", ".."):
+            return {"ok": False, "error": "源目录不能是 '.'、'..' 或根路径，请选择具体的技能文件夹"}
+        skills_root = self._profile_skills_dir().resolve()
+        dest = (skills_root / src.name).resolve()
+        if dest == skills_root or not dest.is_relative_to(skills_root):
+            return {"ok": False, "error": "安装目标越出了 profile 技能目录"}
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            shutil.rmtree(dest)  # 同名覆盖
+            shutil.rmtree(dest)  # 同名覆盖（已确认仍在 skills_root 内）
         shutil.copytree(src, dest)
         return {"ok": True, "name": src.name}
 
