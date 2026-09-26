@@ -1,5 +1,7 @@
 # 卅 harness（sahou-harness）
 
+[![CI](https://github.com/gwqwy/sahou-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/gwqwy/sahou-harness/actions/workflows/ci.yml)
+
 **一个「一切皆插件」的 agent harness**——架构参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 （Cordis 微内核 / Everything is a Plugin），执行引擎复用 [nanoagent](https://github.com/gwqwy/nanoagent) 框架。
 配置全部走 JSON 文件，**不使用 .env**。
