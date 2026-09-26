@@ -1358,3 +1358,49 @@ class ProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MemoryWindowTests(unittest.TestCase):
+    """config 的 memory 段：summary=摘要压缩 / sliding=滑动窗口 / 缺省=全量。"""
+
+    def _build(self, tmp, memory_cfg):
+        from harness.cli import build_runtime
+
+        with patch_model_build():
+            profile = make_profile(Path(tmp), default="m1")
+            cfg = profile.load_config()
+            if memory_cfg is not None:
+                cfg["memory"] = memory_cfg
+            profile.save_config(cfg)
+            return build_runtime(profile, str(tmp))
+
+    def test_default_is_full_memory(self):
+        from nanoagent.memory import Memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._build(tmp, None)
+            agent = host.service("agent_factory")()
+            from nanoagent.memory import SummaryMemory
+
+            self.assertIsInstance(agent.memory, Memory)
+            self.assertNotIsInstance(agent.memory, SummaryMemory)
+
+    def test_summary_memory_wired(self):
+        from nanoagent.memory import SummaryMemory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._build(tmp, {"type": "summary", "max_tokens": 8000})
+            agent = host.service("agent_factory")()
+            self.assertIsInstance(agent.memory, SummaryMemory)
+            self.assertEqual(agent.memory.max_tokens, 8000)
+            self.assertIs(agent.memory.llm, agent.llm)
+
+    def test_sliding_memory_wired(self):
+        from nanoagent.memory import Memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = self._build(tmp, {"type": "sliding", "max_messages": 12})
+            agent = host.service("agent_factory")()
+            self.assertIsInstance(agent.memory, Memory)
+            self.assertEqual(agent.memory.max_messages, 12)
+

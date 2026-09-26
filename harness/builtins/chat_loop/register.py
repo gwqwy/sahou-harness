@@ -51,6 +51,29 @@ class _EventTracer:
             pass
 
 
+def _build_memory(cfg: dict, llm):
+    """按 config.json 的 ``memory`` 段构建记忆（缺省=全量 Memory，行为与既往一致）。
+
+    - ``{"type": "summary", "max_tokens": 24000}``：SummaryMemory——历史超窗时
+      自动把最旧消息压缩成摘要（用当前对话的 LLM），只保留摘要 + 最近几条。
+      长会话的 token 成本从线性增长变为近似封顶。
+    - ``{"type": "sliding", "max_messages": 40}``：滑动窗口，超限丢最旧。
+    - 缺省 / 其他取值：全量 Memory（不裁剪）。
+    """
+    from nanoagent.memory import Memory, SummaryMemory
+
+    mtype = str(cfg.get("type") or "full").lower()
+    if mtype == "summary":
+        return SummaryMemory(
+            max_tokens=int(cfg.get("max_tokens") or 24000),
+            keep_recent=int(cfg.get("keep_recent") or 6),
+            llm=llm,
+        )
+    if mtype == "sliding":
+        return Memory(max_messages=int(cfg.get("max_messages") or 40))
+    return Memory()
+
+
 def register(ctx) -> None:
     host = ctx.host
     state: dict[str, Any] = {"agent": None, "session_id": "default"}
@@ -78,7 +101,6 @@ def register(ctx) -> None:
             from pathlib import Path
 
             from nanoagent import Agent
-            from nanoagent.memory import Memory
             from nanoagent.skills import SkillRegistry
 
             runtime = host.service("models_runtime") or {}
@@ -95,7 +117,7 @@ def register(ctx) -> None:
                 registry.add_dir(profile_skills)
 
             instructions = INSTRUCTIONS
-            memory = Memory()
+            memory = _build_memory(host.profile.load_config().get("memory") or {}, llm)
             session_id = state["session_id"]
             for item in host.profile.load_session(session_id):
                 if item.get("role") in ("user", "assistant"):
