@@ -12,20 +12,30 @@
 sha CLI（cli.py）
    │  组装
    ▼
-Harness 微内核（kernel.py）──────── 一切皆插件：
-   │  ctx.provide / on / effect      ├─ chat_loop   对话循环（nanoagent Agent 引擎）
-   │  effect 必返回 disposer，        ├─ models      模型池 + 自主切换（switch_model 工具）
-   │  卸载时 LIFO 回滚、幂等          ├─ tools_fs    文件读写（工作区路径监狱）
-   │  状态机 PENDING→ACTIVE→         ├─ tools_shell Shell 执行（权限门 ask/allow/deny）
-   │  FAILED/DISPOSED                ├─ skills      SKILL.md 技能（渐进式披露）
-   │                                 ├─ mcp_client  MCP 服务器接入（stdio/SSE/HTTP）
-   │                                 └─ repl        终端界面（UI 本身也是插件，可整个换掉）
+Harness 微内核（kernel.py）──────── 一切皆插件（13 个内置）：
+   │  ctx.provide / on / effect      ├─ chat_loop    对话循环（流式 / 护栏 / 追踪接线）
+   │  effect 必返回 disposer，        ├─ models       模型池 + 自主切换（switch_model）
+   │  卸载时 LIFO 回滚、幂等          ├─ tools_fs     文件读写 / 局部编辑（路径监狱）
+   │  状态机 PENDING→ACTIVE→         ├─ tools_search 全工作区文本搜索
+   │  FAILED/DISPOSED                ├─ tools_shell  Shell 执行（三级权限门 + 审计）
+   │  插件依赖拓扑激活 / 热重载        ├─ tools_todo   多步任务待办
+   │                                 ├─ skills       SKILL.md 技能（渐进式披露）
+   │                                 ├─ mcp_client   MCP 服务器接入（stdio/SSE/HTTP）
+   │                                 ├─ guardrails   输入/输出护栏
+   │                                 ├─ tracing      按天 JSONL 追踪
+   │                                 ├─ subagent     spawn_subagent 子 agent
+   │                                 ├─ knowledge    RAG 知识库（索引 / 检索）
+   │                                 └─ repl         终端界面（UI 也是插件，可换掉）
    ▼
 profile 隔离目录（.harness/profiles/<名>/）
     config.json   模型列表 / 默认模型 / 权限（不使用 .env）
     plugins/      已安装的外部插件
     sessions/     会话历史
+    audit/        shell 审批审计日志（JSONL）
 ```
+
+架构细节（插件生命周期 / 依赖拓扑 / 服务冲突 / 权限模型）见 [docs/architecture.md](docs/architecture.md)，
+各版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 桌面端（desktop）
 
