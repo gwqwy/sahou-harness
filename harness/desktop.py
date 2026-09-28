@@ -19,11 +19,12 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from .config import PERMISSION_MODES, ConfigError, permission_mode
 from .kernel import ACTIVE
+from .procutil import CREATE_NO_WINDOW
 
 THINKING_LEVELS = ("off", "low", "medium", "high")
 THEME_MODES = ("dark", "light", "system")
@@ -108,6 +109,7 @@ class DesktopApp:
         self._window = None          # pywebview 窗口句柄，start 后才有
         self._lock = threading.RLock()  # js_api 每次调用一个线程，对话需串行
         self._current_session = "default"
+        self._busy_sessions: set = set()  # 正在回答的会话（允许多会话并行）
         self._market_cache = None       # (时间戳, items, categories)，10 分钟 TTL
         self._market_lock = threading.Lock()
         host.confirm = self._confirm  # shell/文件写入权限 ask → 窗口内确认对话框
@@ -142,7 +144,8 @@ class DesktopApp:
         config = self._config()
         meta = dict(config.get("sessions_meta") or {})
         info = dict(meta.get(session_id) or {})
-        info.setdefault("name", session_id)
+        # 默认名不用裸 id（s-2026...）：兜底成可读的「会话 月-日 时:分」
+        info.setdefault("name", "会话 " + time.strftime("%m-%d %H:%M"))
         info["ws"] = info.get("ws") or self._current_ws(config)
         info["updated"] = time.time()
         meta[session_id] = info
@@ -203,17 +206,20 @@ class DesktopApp:
             "workspace": str(getattr(self.host, "workspace", "")),
             "workspace_name": ws_entry.get("name", ""),
             "session": self._current_session,
-            "session_name": meta.get("name", self._current_session),
+            "session_name": self._display_name(
+                self._current_session, meta),
             "shell_permission": permission_mode(config, "shell"),
             "fs_permission": permission_mode(config, "fs"),
+            "git_permission": permission_mode(config, "git"),
             "thinking_level": config.get("thinking_level") or "off",
+            "plan_mode": bool(config.get("plan_mode")),
             "theme": config.get("theme") if config.get("theme") in THEME_MODES else "light",
             "context_window": int(getattr(llm, "context_window", 0) or 0),
             "usage": usage,
         }
 
     def set_permission(self, kind: str, mode: str) -> dict[str, Any]:
-        if kind not in ("shell", "fs"):
+        if kind not in ("shell", "fs", "git"):
             return {"ok": False, "error": f"未知权限类别: {kind}"}
         if mode not in PERMISSION_MODES:
             return {"ok": False, "error": f"未知权限模式: {mode}"}
@@ -278,6 +284,24 @@ class DesktopApp:
         except (ValueError, OSError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    def image_preview(self, path: str) -> dict[str, Any]:
+        """把工作区内图片读成 data URL 供界面点击预览（路径监狱内，≤15MB）。"""
+        import base64
+
+        from harness.workspace import safe_image
+
+        try:
+            p = Path(safe_image(self.host, path))
+            if p.stat().st_size > 15 * 1024 * 1024:
+                return {"ok": False, "error": "图片超过 15MB，无法预览"}
+            data = base64.b64encode(p.read_bytes()).decode("ascii")
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp"}.get(p.suffix.lower(),
+                                                                "image/png")
+        return {"ok": True, "data": f"data:{mime};base64,{data}"}
+
     def rename_workspace(self, name: str) -> dict[str, Any]:
         name = str(name or "").strip()
         if not name:
@@ -305,10 +329,18 @@ class DesktopApp:
             return {"ok": False, "error": f"未知思考级别: {level}"}
         self.host.profile.update_config(thinking_level=level)
         runtime = self.host.service("models_runtime") or {}
-        effort = None if level == "off" else level
+        # off 也显式下发（llm 端转为 enable_thinking=false），不留给服务端默认
         for llm in (runtime.get("pool") or {}).values():
-            llm.reasoning_effort = effort
+            llm.reasoning_effort = level
         return {"ok": True, "thinking_level": level}
+
+    def set_plan_mode(self, on: bool) -> dict[str, Any]:
+        """切换计划模式（📋 按钮）：写配置并重建 agent（记忆按会话回放不丢）。"""
+        fn = self.host.service("set_plan_mode")
+        if not callable(fn):
+            return {"ok": False, "error": "对话插件未激活"}
+        message = str(fn(bool(on)))
+        return {"ok": True, "plan_mode": bool(on), "message": message}
 
     # -- 主题 -----------------------------------------------------------------
     def set_theme(self, mode: str) -> dict[str, Any]:
@@ -316,6 +348,24 @@ class DesktopApp:
             return {"ok": False, "error": f"未知主题: {mode}"}
         self.host.profile.update_config(theme=mode)
         return {"ok": True, "theme": mode}
+
+    # -- 界面偏好（右侧面板宽度 / 工作区选择条显隐等） -------------------------
+    def get_ui_prefs(self) -> dict[str, Any]:
+        try:
+            config = self.host.profile.load_config()
+        except ConfigError:
+            return {"ok": True, "prefs": {}}
+        prefs = config.get("ui_prefs")
+        return {"ok": True, "prefs": dict(prefs) if isinstance(prefs, dict) else {}}
+
+    def set_ui_prefs(self, prefs: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(prefs, dict):
+            return {"ok": False, "error": "prefs 必须是对象"}
+        try:
+            self.host.profile.update_config(ui_prefs=dict(prefs))
+        except ConfigError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
 
     def open_url(self, url: str) -> dict[str, Any]:
         """在系统默认浏览器打开链接（市场条目 → 插件仓库）。"""
@@ -367,6 +417,7 @@ class DesktopApp:
                 ["git", "clone", "--depth", "1", url, str(tmp / repo)],
                 capture_output=True, text=True, timeout=180,
                 check=False,  # 失败原因在 stderr 里，下面自己判断并转成可读提示
+                creationflags=CREATE_NO_WINDOW,
             )
             if proc.returncode != 0:
                 return {"ok": False, "error": "git clone 失败: " + (proc.stderr or "").strip()[:300]}
@@ -380,6 +431,17 @@ class DesktopApp:
             shutil.rmtree(tmp, ignore_errors=True)
 
     # -- 会话 ---------------------------------------------------------------
+    @staticmethod
+    def _display_name(session_id: str, info: dict[str, Any]) -> str:
+        """会话显示名：历史遗留的裸 id（s-2026...）兜底为可读名。"""
+        name = str(info.get("name") or "").strip()
+        if name and name != session_id:
+            return name
+        updated = info.get("updated") or 0
+        if updated:
+            return "会话 " + time.strftime("%m-%d %H:%M", time.localtime(updated))
+        return "未命名会话"
+
     def sessions(self) -> dict[str, Any]:
         config = self._config()
         meta = config.get("sessions_meta") or {}
@@ -389,12 +451,59 @@ class DesktopApp:
             info = meta.get(session_id) or {}
             items.append({
                 "id": session_id,
-                "name": info.get("name") or session_id,
+                "name": self._display_name(session_id, info),
                 "ws": info.get("ws") or "",
                 "updated": info.get("updated") or 0,
+                "pinned": bool(info.get("pinned")),
+                "done": bool(info.get("done")),
+                "order": info.get("order", 10 ** 9),
             })
-        items.sort(key=lambda item: item["updated"], reverse=True)
+        # 置顶优先，已完成的排最后；拖拽排序（order 小在前），同序按最近更新
+        items.sort(key=lambda item: (item["done"], not item["pinned"],
+                                     item["order"], -item["updated"]))
         return {"ok": True, "sessions": items, "current": self._current_session}
+
+    def mark_session_done(self, session_id: str, done: bool) -> dict[str, Any]:
+        """标记会话完成 / 取消完成（F8：验收后销毁会话的纪律配套）。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"ok": False, "error": "缺少会话 id"}
+        config = self._config()
+        meta = dict(config.get("sessions_meta") or {})
+        info = dict(meta.get(sid) or {})
+        info["done"] = bool(done)
+        meta[sid] = info
+        self.host.profile.update_config(sessions_meta=meta)
+        return {"ok": True, "session": sid, "done": bool(done)}
+
+    def set_session_pin(self, session_id: str, pinned: bool) -> dict[str, Any]:
+        """置顶 / 取消置顶会话（sessions_meta.pinned；界面排在分组最前）。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"ok": False, "error": "缺少会话 id"}
+        config = self._config()
+        meta = dict(config.get("sessions_meta") or {})
+        info = dict(meta.get(sid) or {})
+        info["pinned"] = bool(pinned)
+        meta[sid] = info
+        self.host.profile.update_config(sessions_meta=meta)
+        return {"ok": True, "session": sid, "pinned": bool(pinned)}
+
+    def set_session_order(self, ids: list) -> dict[str, Any]:
+        """保存会话手动排序（侧栏拖拽）：按传入顺序写 sessions_meta.order。
+
+        只更新列出的会话，未列出的保持原 order（同 order 按最近更新排序）。
+        """
+        meta = dict(self._config().get("sessions_meta") or {})
+        for idx, raw in enumerate(ids or []):
+            sid = str(raw or "").strip()
+            if not sid or sid not in meta:
+                continue
+            info = dict(meta.get(sid) or {})
+            info["order"] = idx
+            meta[sid] = info
+        self.host.profile.update_config(sessions_meta=meta)
+        return {"ok": True, "count": len(ids or [])}
 
     def session_history(self, session_id: str) -> dict[str, Any]:
         history = [m for m in self.host.profile.load_session(session_id)
@@ -423,8 +532,166 @@ class DesktopApp:
         self.host.profile.update_config(sessions_meta=meta)
         return {"ok": True, "session": session_id, "name": name}
 
+    def delete_session(self, session_id: str) -> dict[str, Any]:
+        """删除会话（文件 + 命名元数据）；删的是当前会话时自动切到最近的一个。
+
+        只有名字（sessions_meta）、还没有消息的会话也允许删除——
+        「新会话」正是这种状态，否则界面上会出现删不掉的空会话。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"ok": False, "error": "缺少会话 id"}
+        file_removed = self.host.profile.delete_session(sid)
+        config = self._config()
+        meta = dict(config.get("sessions_meta") or {})
+        had_meta = sid in meta
+        if had_meta:
+            del meta[sid]
+            self.host.profile.update_config(sessions_meta=meta)
+        if not file_removed and not had_meta:
+            return {"ok": False, "error": f"会话不存在: {sid}"}
+        next_id = ""
+        if sid == self._current_session:
+            sessions_dir = self.host.profile.sessions_dir
+            ids = self.host.profile.session_ids()
+            if ids:
+                next_id = max(ids, key=lambda i: (
+                    sessions_dir / f"{i}.json").stat().st_mtime)
+                self._current_session = next_id
+            else:
+                created = self.new_session()
+                next_id = str(created.get("session") or "")
+        return {"ok": True, "deleted": sid, "next": next_id}
+
+    # -- 会话搜索 / 重新生成 / 编辑重发 ----------------------------------------
+    @staticmethod
+    def _visible_history(history: list[dict]) -> list[tuple[int, dict]]:
+        """[(真实下标, 消息)]：只含 user/assistant，与界面渲染顺序一致。"""
+        return [(i, m) for i, m in enumerate(history)
+                if m.get("role") in ("user", "assistant")]
+
+    def search_sessions(self, query: str, scope: str = "current") -> dict[str, Any]:
+        """按关键词搜会话消息。scope="current" 只搜当前会话，"all" 搜全部历史。
+
+        返回命中项 [{session, role, index, snippet}]：index 是**过滤后**
+        （只数 user/assistant）的消息序号，与界面上 .msg 的 data-hi 对应，
+        前端可直接滚动定位。
+        """
+        q = str(query or "").strip().lower()
+        if not q:
+            return {"ok": False, "error": "关键词为空"}
+        if scope == "current":
+            ids = [self._current_session]
+        elif scope == "all":
+            ids = self.host.profile.session_ids()
+        else:
+            return {"ok": False, "error": f"未知搜索范围: {scope}"}
+        meta = self._config().get("sessions_meta") or {}
+        hits: list[dict[str, Any]] = []
+        for sid in ids:
+            visible = self._visible_history(self.host.profile.load_session(sid))
+            for index, (_, msg) in enumerate(visible):
+                content = str(msg.get("content") or "")
+                pos = content.lower().find(q)
+                if pos == -1:
+                    continue
+                start = max(0, pos - 40)
+                snippet = ("…" if start else "") + content[start:pos + len(q) + 60] + "…"
+                hits.append({
+                    "session": sid,
+                    "session_name": self._display_name(sid, meta.get(sid) or {}),
+                    "role": str(msg.get("role")),
+                    "index": index,
+                    "snippet": snippet.replace("\n", " ")[:160],
+                })
+                if len(hits) >= 60:  # 上限防爆量；界面提示缩小关键词
+                    return {"ok": True, "hits": hits, "truncated": True}
+        return {"ok": True, "hits": hits, "truncated": False}
+
+    def _truncate_and_rebind(self, session_id: str, keep_upto: int) -> bool:
+        """把会话历史截断到 ``history[:keep_upto]``，并让 agent 按磁盘历史重建。
+
+        重新生成 / 编辑重发的公共底座：截断必须同步丢掉内存里 agent 的旧历史
+        （new_session 会把 chat_loop 的 agent 置空，下轮按截断后的文件回放），
+        否则文件改了、上下文还是旧的。
+        """
+        history = self.host.profile.load_session(session_id)
+        if keep_upto < 0 or keep_upto > len(history):
+            return False
+        self.host.profile.save_session(session_id, history[:keep_upto])
+        reset = self.host.service("new_session")
+        if callable(reset):
+            reset(session_id)
+        return True
+
+    def regenerate_last(self) -> dict[str, Any]:
+        """重新生成当前会话的最后一条回复。
+
+        做法是截掉「最后一条用户消息及其后的全部内容」再原样重发 ——
+        这样 ask 会把这条用户消息重新写回历史，语义与用户手动重发一致。
+        原消息附带的图片不会保留（历史里只存文本），属已知限制。
+        """
+        sid = self._current_session
+        history = self.host.profile.load_session(sid)
+        visible = self._visible_history(history)
+        last_user_real = next(
+            (real for real, msg in reversed(visible) if msg.get("role") == "user"),
+            None)
+        if last_user_real is None:
+            return {"ok": False, "error": "没有可重新生成的用户消息"}
+        text = str(history[last_user_real].get("content") or "").strip()
+        if not text:
+            return {"ok": False, "error": "最后一条用户消息为空，无法重新生成"}
+        if not self._truncate_and_rebind(sid, last_user_real):
+            return {"ok": False, "error": "截断历史失败"}
+        result = self.chat(text)
+        result["regenerated"] = bool(result.get("ok"))
+        return result
+
+    def edit_message_resend(self, index: int, new_text: str) -> dict[str, Any]:
+        """编辑某条**用户**消息并重新发送：截掉它及其后的内容，用新文本重跑。
+
+        ``index`` 是过滤后（只数 user/assistant）的序号，与界面 data-hi 一致。
+        """
+        sid = self._current_session
+        visible = self._visible_history(self.host.profile.load_session(sid))
+        idx = int(index)
+        if idx < 0 or idx >= len(visible):
+            return {"ok": False, "error": f"消息序号越界: {idx}"}
+        real, msg = visible[idx]
+        if msg.get("role") != "user":
+            return {"ok": False, "error": "只能编辑用户消息"}
+        new_text = str(new_text or "").strip()
+        if not new_text:
+            return {"ok": False, "error": "新内容为空"}
+        if not self._truncate_and_rebind(sid, real):
+            return {"ok": False, "error": "截断历史失败"}
+        result = self.chat(new_text)
+        result["edited"] = bool(result.get("ok"))
+        return result
+
+    def _ensure_session_workspace(self, session_id: str) -> None:
+        """会话 ↔ 工作区联动：继续某个会话时切回它首次使用的工作区。
+
+        修复「打开旧会话后 agent 描述的是另一个工作区的文件」——会话历史
+        属于某个工程，继续对话时工具与上下文必须指回那个工程；否则模型
+        要么答错目录，要么凭回放历史里的旧清单作答。目录已不存在则不动。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        config = self._config()
+        ws_id = ((config.get("sessions_meta") or {}).get(sid) or {}).get("ws")
+        if not ws_id or ws_id == self._current_ws(config):
+            return
+        entries = {e.get("id"): e for e in (config.get("workspaces") or [])}
+        path = str((entries.get(ws_id) or {}).get("path") or "")
+        if path and Path(path).is_dir():
+            self.set_workspace(path)
+
     def chat(self, message: str, session_id: str = "", images: list | None = None) -> dict[str, Any]:
         session_id = session_id or self._current_session
+        self._ensure_session_workspace(session_id)
         with self._lock:
             if session_id != self._current_session:
                 reset = self.host.service("new_session")
@@ -448,12 +715,97 @@ class DesktopApp:
             self._touch_session(session_id)
             return result
 
+    def can_stream(self) -> dict[str, Any]:
+        """当前模型是否支持流式（前端据此选择流式或整段路径）。"""
+        fn = self.host.service("can_stream")
+        try:
+            stream = bool(callable(fn) and fn())
+        except Exception:  # noqa: BLE001 —— 模型未配置等
+            stream = False
+        return {"ok": True, "stream": stream}
+
+    def chat_stream(self, message: str, session_id: str = "",
+                    images: list | None = None) -> dict[str, Any]:
+        """流式对话（功能：桌面端流式输出）。
+
+        立即返回（{"ok": True, "stream": True}），真正的对话在后台线程执行；
+        delta / tool / done 事件经 evaluate_js 推给 ``window.onStreamEvent``：
+        - {"kind": "delta", "text"}          —— 模型文本增量
+        - {"kind": "done", ok, reply, ...}   —— 结束（载荷与整段 chat 的返回一致）
+        - 出错时 {"kind": "done", ok: False, "error"}
+        模型运作过程（思考/工具）仍走既有 ``onAgentEvent`` 通道，复用 live block UI。
+        """
+        ask_stream = self.host.service("ask_stream")
+        if not callable(ask_stream):
+            return {"ok": False, "error": "对话插件未激活或模型不支持流式"}
+        self._ensure_session_workspace(session_id or self._current_session)
+        if session_id in self._busy_sessions:
+            return {"ok": False, "error": "该会话已有对话在进行中"}
+        session_id = session_id or self._current_session
+        with self._lock:
+            if session_id != self._current_session:
+                reset = self.host.service("new_session")
+                if callable(reset):
+                    reset(session_id)
+                self._current_session = session_id
+
+        def worker() -> None:
+            self._busy_sessions.add(session_id)
+            # 思考/工具步骤 → 界面（带会话 id：多会话并行时前端按会话过滤）
+            self.host.emit_agent_event = (
+                lambda payload, _sid=session_id:
+                self._push_event({**payload, "session": _sid}))
+            try:
+                final_payload = None
+                for event in ask_stream(message, session_id=session_id,
+                                        images=images or None):
+                    if event.get("type") == "delta":
+                        self._push_stream_event({"kind": "delta", "text": event.get("text") or "",
+                                                 "session": session_id})
+                    elif event.get("type") == "done":
+                        result = event.get("result")
+                        runtime = self.host.service("models_runtime") or {}
+                        # 暂存 done，等生成器收尾（会话落盘 + 用量补记）后再推——
+                        # 保证前端收到 done 时切回该会话一定能加载到完整消息
+                        final_payload = {
+                            "kind": "done", "ok": True,
+                            "reply": getattr(result, "content", ""),
+                            "reasoning": getattr(result, "reasoning", ""),
+                            "tool_calls": getattr(result, "tool_calls", []) or [],
+                            "model": runtime.get("current", ""),
+                            "usage": getattr(result, "usage", {}),
+                            "session": session_id,
+                        }
+                if final_payload is not None:
+                    self._push_stream_event(final_payload)
+            except Exception as exc:  # noqa: BLE001 —— 错误回到界面而不是崩窗口
+                self._push_stream_event({"kind": "done", "ok": False,
+                                         "error": str(exc), "session": session_id})
+            finally:
+                self.host.emit_agent_event = None
+                self._busy_sessions.discard(session_id)
+
+        threading.Thread(target=worker, daemon=True, name="sha-chat-stream").start()
+        self._touch_session(session_id)
+        return {"ok": True, "stream": True, "session": session_id}
+
     def _push_event(self, payload: dict[str, Any]) -> None:
         if self._window is None:
             return
         try:
             self._window.evaluate_js(
                 "window.onAgentEvent && window.onAgentEvent(" + json.dumps(payload) + ")"
+            )
+        except Exception:  # noqa: BLE001 —— 推送失败不影响对话
+            pass
+
+    def _push_stream_event(self, payload: dict[str, Any]) -> None:
+        """流式 delta/done 事件 → 前端 ``window.onStreamEvent``（独立于步骤事件通道）。"""
+        if self._window is None:
+            return
+        try:
+            self._window.evaluate_js(
+                "window.onStreamEvent && window.onStreamEvent(" + json.dumps(payload) + ")"
             )
         except Exception:  # noqa: BLE001 —— 推送失败不影响对话
             pass
@@ -533,7 +885,7 @@ class DesktopApp:
             order: list = []
             errors: list = []
             level = (config.get("thinking_level") or "").strip()
-            effort = level if level and level != "off" else None
+            effort = level or None  # off 也透传（llm 端转为 enable_thinking=false）
             for entry in config.get("models") or []:
                 name = str(entry.get("name") or "").strip()
                 if not name:
@@ -570,7 +922,272 @@ class DesktopApp:
         except Exception:  # noqa: BLE001
             llm = None
         total = dict(getattr(llm, "total_usage", {}) or {})
-        return {"ok": True, "usage": total}
+        source = "llm"
+        if not (int(total.get("prompt_tokens") or 0)
+                or int(total.get("completion_tokens") or 0)):
+            # 服务商流式响应不带 usage 帧时 total_usage 恒为零——
+            # 兜底用 usage.jsonl 的今日汇总（含估算轮），输入框下方才有数据可显示
+            import datetime as _dt
+
+            from .exporter import usage_records
+
+            today = _dt.date.today().isoformat()
+            agg = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+            for rec in usage_records(self.host.profile):
+                if rec.get("ts") and _dt.date.fromtimestamp(float(rec["ts"])).isoformat() != today:
+                    continue
+                agg["prompt_tokens"] += int(rec.get("prompt_tokens") or 0)
+                agg["completion_tokens"] += int(rec.get("completion_tokens") or 0)
+                agg["cached_tokens"] += int(rec.get("cached_tokens") or 0)
+            total = agg
+            source = "usage.jsonl(今日)"
+        return {"ok": True, "usage": total, "source": source}
+
+    def export_session(self, session_id: str | None = None) -> dict[str, Any]:
+        """把当前（或指定）会话导出为 Markdown → ``<工作区>/exports/<会话>.md``。
+
+        与 CLI ``sha export`` 共用 exporter 模块；返回目标路径供界面提示。
+        """
+        from .exporter import export_session_markdown
+
+        sid = str(session_id or self._current_session or "").strip()
+        if not sid:
+            return {"ok": False, "error": "没有可导出的会话"}
+        try:
+            dest = export_session_markdown(
+                self.host.profile, sid, Path(self.host.workspace) / "exports")
+        except FileNotFoundError:
+            return {"ok": False, "error": f"会话为空或不存在: {sid}"}
+        except OSError as exc:
+            return {"ok": False, "error": f"写入失败: {exc}"}
+        return {"ok": True, "path": str(dest)}
+
+    def export_all_sessions(self) -> dict[str, Any]:
+        """全部会话打包导出为 zip（每会话一个 Markdown + 目录）→ ``<工作区>/exports``。"""
+        from .exporter import export_all_sessions_zip
+
+        dest = (Path(self.host.workspace) / "exports"
+                / f"sessions-{time.strftime('%Y%m%d-%H%M%S')}.zip")
+        try:
+            export_all_sessions_zip(self.host.profile, dest)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except OSError as exc:
+            return {"ok": False, "error": f"写入失败: {exc}"}
+        return {"ok": True, "path": str(dest)}
+
+    def usage_daily(self, days: int = 30) -> dict[str, Any]:
+        """按天聚合 token 用量（usage.jsonl → 折线图数据）。"""
+        from .exporter import usage_daily as _daily
+
+        try:
+            points = _daily(self.host.profile, days)
+        except Exception as exc:  # noqa: BLE001 —— 统计失败不影响界面
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "days": points}
+
+    # -- 工作区 TODO.md 任务索引（F1）-------------------------------------------
+    def todo_content(self) -> dict[str, Any]:
+        """读工作区根 TODO.md 原文（任务面板渲染用；agent 经 todo_write 维护）。"""
+        ws = str(getattr(self.host, "workspace", "") or "").strip()
+        if not ws:
+            return {"ok": False, "error": "未选择工作区"}
+        path = Path(ws) / "TODO.md"
+        if not path.is_file():
+            return {"ok": True, "exists": False, "content": ""}
+        try:
+            return {"ok": True, "exists": True, "path": str(path),
+                    "content": path.read_text(encoding="utf-8")}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def stateless_reset(self) -> dict[str, Any]:
+        """无状态重置（F6）：旧会话总结进展写回 TODO.md → 自动开全新会话。
+
+        旧会话保留在磁盘上（可 /resume 回看）；新会话靠 F3 自动恢复机制
+        读 TODO.md 未完成项与 git log 接续执行。
+        """
+        old = self._current_session
+        result = self.chat(
+            "请立即调用 todo_write 工具，把本次会话已完成的进展与剩余工作整理为"
+            "待办清单（已完成项 status=done，剩余项 status=pending，"
+            "含简短 detail），然后只回复：已写入 TODO.md")
+        created = self.new_session()
+        note = str(result.get("reply") or "").strip()[:120] if result.get("ok") else ""
+        return {"ok": bool(result.get("ok")), "old": old,
+                "session": str(created.get("session") or ""),
+                "note": note, "error": str(result.get("error") or "")}
+
+    def bootstrap_project(self, goal: str = "") -> dict[str, Any]:
+        """初始化工程（F5）：目录规范 + .gitignore + git 基线提交。
+
+        给了工程目标时，再用一轮对话让 agent 把目标拆解为原子任务写入 TODO.md。
+        """
+        from .bootstrap import run_bootstrap
+
+        ws = str(getattr(self.host, "workspace", "") or "").strip()
+        if not ws:
+            return {"ok": False, "error": "未选择工作区"}
+        goal = str(goal or "").strip()
+        res = run_bootstrap(ws, goal)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "脚手架失败",
+                    "created": res.get("created") or []}
+        todo_note = ""
+        if goal:
+            result = self.chat(
+                f"工程目标：{goal}\n"
+                "请立即调用 todo_write 工具，把该目标拆解为 3~8 个原子任务写入"
+                " TODO.md（status=pending，每项带简短 detail），然后只回复："
+                "已生成 TODO.md")
+            if result.get("ok"):
+                todo_note = str(result.get("reply") or "").strip()[:120]
+            else:
+                todo_note = "（TODO.md 生成失败: " + str(result.get("error") or "") + "）"
+        return {"ok": True, "created": res["created"],
+                "committed": res["committed"],
+                "commit_error": res.get("error") or "",
+                "todo_note": todo_note}
+
+    # -- 知识库（knowledge 插件以 host.service("knowledge") 暴露能力） ----------
+    def _knowledge_service(self) -> dict[str, Any] | None:
+        service = self.host.service("knowledge")
+        return service if isinstance(service, dict) else None
+
+    def knowledge_status(self) -> dict[str, Any]:
+        svc = self._knowledge_service()
+        if svc is None:
+            return {"ok": False,
+                    "error": "知识库插件未激活（检查 config.knowledge.enabled 与 nanoagent 安装）"}
+        info = dict(svc["status"]())
+        info["ok"] = True
+        return info
+
+    def knowledge_pick_index(self) -> dict[str, Any]:
+        """弹原生文件夹选择框，把所选目录索引进知识库（用户亲自选择，允许工作区外）。"""
+        if self._window is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        svc = self._knowledge_service()
+        if svc is None:
+            return {"ok": False,
+                    "error": "知识库插件未激活（检查 config.knowledge.enabled 与 nanoagent 安装）"}
+        try:
+            import webview
+
+            picked = self._window.create_file_dialog(webview.FOLDER_DIALOG)
+        except Exception as exc:  # noqa: BLE001 —— 用户取消或对话框失败
+            return {"ok": False, "error": str(exc)}
+        if not picked:
+            return {"ok": False, "error": "已取消"}
+        path = picked[0] if isinstance(picked, (list, tuple)) else picked
+        summary = str(svc["index_absolute"](str(path)))
+        return {"ok": not summary.startswith("错误"), "summary": summary}
+
+    def knowledge_clear(self) -> dict[str, Any]:
+        svc = self._knowledge_service()
+        if svc is None:
+            return {"ok": False,
+                    "error": "知识库插件未激活（检查 config.knowledge.enabled 与 nanoagent 安装）"}
+        summary = str(svc["clear"]())
+        return {"ok": True, "summary": summary}
+
+    def knowledge_sources(self) -> dict[str, Any]:
+        """列出知识库已索引的来源文件（细粒度管理）。"""
+        svc = self._knowledge_service()
+        if svc is None:
+            return {"ok": False,
+                    "error": "知识库插件未激活（检查 config.knowledge.enabled 与 nanoagent 安装）"}
+        try:
+            return {"ok": True, "sources": list(svc["sources"]())}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def knowledge_remove_source(self, name: str) -> dict[str, Any]:
+        """删除知识库里某个来源文件的全部片段。"""
+        svc = self._knowledge_service()
+        if svc is None:
+            return {"ok": False,
+                    "error": "知识库插件未激活（检查 config.knowledge.enabled 与 nanoagent 安装）"}
+        summary = str(svc["remove_source"](name))
+        return {"ok": not summary.startswith("错误"), "summary": summary}
+
+    # -- 快捷指令（提示词片段库，桌面端与 REPL /snip 共用） ----------------------
+    def snippets_list(self) -> dict[str, Any]:
+        from .snippets import snippets_list
+
+        return {"ok": True, "snippets": snippets_list(self.host.profile)}
+
+    def snippets_save(self, name: str, text: str) -> dict[str, Any]:
+        from .snippets import snippets_save
+
+        return snippets_save(self.host.profile, name, text)
+
+    def snippets_delete(self, name: str) -> dict[str, Any]:
+        from .snippets import snippets_delete
+
+        return snippets_delete(self.host.profile, name)
+
+    # -- 工作区 git 远程配置（用户手动操作入口；agent 无 push 能力） -------------
+    def _git_run(self, *args: str, timeout: int = 60) -> tuple[int, str]:
+        """在工作区跑 git，返回 (退出码, 输出)（utf8→gbk 兜底解码）。"""
+        ws = str(getattr(self.host, "workspace", "") or "").strip()
+        if not ws:
+            return 1, "未选择工作区"
+        import subprocess as _sp
+
+        try:
+            proc = _sp.run(["git", "-c", "core.quotepath=false", *args],
+                           cwd=ws, capture_output=True, timeout=timeout, check=False,
+                           creationflags=CREATE_NO_WINDOW)
+        except FileNotFoundError:
+            return 1, "本机没有 git 命令"
+        except _sp.TimeoutExpired:
+            return 1, f"git 操作超时（{timeout}s）"
+        out = proc.stdout.decode("utf-8", "replace")
+        if "\ufffd" in out:
+            try:
+                out = proc.stdout.decode("gbk", "replace")
+            except LookupError:
+                pass
+        err = proc.stderr.decode("utf-8", "replace")
+        if proc.returncode != 0:
+            out = (out.strip() + ("\n" if out.strip() and err.strip() else "")
+                   + err.strip()).strip()
+        return proc.returncode, out or "（无输出）"
+
+    def git_remote_get(self) -> dict[str, Any]:
+        """读取工作区 origin 远程地址（审查面板回显用）。"""
+        code, out = self._git_run("remote", "get-url", "origin")
+        return {"ok": True, "configured": code == 0,
+                "url": out.strip() if code == 0 else ""}
+
+    def git_remote_set(self, url: str) -> dict[str, Any]:
+        """配置工作区 origin 远程地址（提交/推送的目标仓库；用户手动触发）。"""
+        url = str(url or "").strip()
+        import re as _re
+
+        if not _re.match(r"^(https?://|ssh://|git@)\S+$", url):
+            return {"ok": False,
+                    "error": "远程地址格式不对（支持 https:// / ssh:// / git@ 开头）"}
+        code, _ = self._git_run("remote", "get-url", "origin")
+        if code == 0:
+            code2, err = self._git_run("remote", "set-url", "origin", url)
+            action = "已更新"
+        else:
+            code2, err = self._git_run("remote", "add", "origin", url)
+            action = "已添加"
+        if code2 != 0:
+            return {"ok": False, "error": err}
+        return {"ok": True, "url": url, "action": action}
+
+    def git_push(self) -> dict[str, Any]:
+        """推送当前分支到 origin（用户在审查面板手动点击；agent 无 push 能力）。"""
+        code, out = self._git_run("remote", "get-url", "origin")
+        if code != 0:
+            return {"ok": False, "output": "尚未配置远程仓库（origin）——"
+                    "先在上方填写远程地址并保存"}
+        code, out = self._git_run("push", "-u", "origin", "HEAD", timeout=300)
+        return {"ok": code == 0, "output": out}
 
     def context_usage(self) -> dict[str, Any]:
         """当前会话的上下文占用：消息/系统提示词/工具/技能分项估算。"""
@@ -615,6 +1232,337 @@ class DesktopApp:
                 "breakdown": breakdown}
 
     # -- 右侧面板：工作区浏览 / 终端 / 审查 --------------------------------------
+    # 文件预览：扩展名分组（未列出的按内容嗅探：可解码即按文本，否则二进制）
+    IMG_EXT: ClassVar[set[str]] = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
+               ".svg", ".avif", ".tif", ".tiff"}
+    MD_EXT: ClassVar[set[str]] = {".md", ".markdown", ".mdown", ".mkd", ".rst"}
+    DATA_EXT: ClassVar[set[str]] = {".json", ".jsonl", ".jsonc", ".yml", ".yaml", ".toml", ".ini",
+                ".cfg", ".conf", ".xml", ".properties", ".env"}
+    TABLE_EXT: ClassVar[set[str]] = {".csv", ".tsv"}
+    OFFICE_EXT: ClassVar[set[str]] = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                  ".wps", ".odt", ".ods", ".odp", ".pages", ".numbers"}
+    ARCHIVE_EXT: ClassVar[set[str]] = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".jar",
+                   ".whl", ".iso", ".apk"}
+    MEDIA_EXT: ClassVar[set[str]] = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".mp4", ".mov",
+                 ".avi", ".mkv", ".webm", ".flv"}
+    AUDIO_EXT: ClassVar[set[str]] = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+    VIDEO_EXT: ClassVar[set[str]] = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".m4v"}
+    HTML_EXT: ClassVar[set[str]] = {".html", ".htm", ".xhtml"}
+    # 可在应用内解析出内容的 Office 子集（OOXML：zip + xml）
+    OOXML_TEXT_EXT: ClassVar[dict[str, str]] = {".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx"}
+    CODE_EXT: ClassVar[set[str]] = {".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+                ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".java",
+                ".kt", ".swift", ".rb", ".php", ".saho", ".sh", ".bash", ".zsh",
+                ".ps1", ".bat", ".sql", ".lua", ".r", ".m", ".scala", ".dart",
+                ".vue", ".svelte", ".html", ".htm", ".css", ".scss", ".less",
+                ".txt", ".log", ".gitignore", ".dockerfile", ".editorconfig"}
+
+    def _safe_ws_path(self, rel_path: str) -> tuple[Path | None, str]:
+        """把相对路径解析为工作区内的绝对路径（越界返回错误）。"""
+        ws = str(getattr(self.host, "workspace", "") or "").strip()
+        if not ws:
+            return None, "未选择工作区"
+        root = Path(ws).resolve()  # 必须 resolve，否则相对工作区下无法 relative_to
+        target = (root / str(rel_path or "")).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return None, "路径越出工作区"
+        return target, ""
+
+    # ---- 预览辅助：无第三方依赖地解析常见二进制容器 ----
+
+    @staticmethod
+    def _docx_text(raw: bytes) -> str:
+        """docx → 纯文本（zip 里取 word/document.xml，段落转行）。"""
+        import io
+        import re as _re
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            xml = zf.read("word/document.xml").decode("utf-8", "replace")
+        xml = xml.replace("</w:p>", "\n").replace("<w:br/>", "\n")
+        return _re.sub(r"<[^>]+>", "", xml).strip()
+
+    @staticmethod
+    def _xlsx_text(raw: bytes, max_rows: int = 300) -> str:
+        """xlsx → TSV 文本（共享字符串表 + 首个工作表，最多取前 max_rows 行）。"""
+        import io
+        import re as _re
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                sx = zf.read("xl/sharedStrings.xml").decode("utf-8", "replace")
+                shared = [_re.sub(r"<[^>]+>", "", m)
+                          for m in _re.findall(r"<si>(.*?)</si>", sx, _re.S)]
+            sheet = "xl/worksheets/sheet1.xml"
+            if sheet not in names:
+                sheets = sorted(n for n in names
+                                if n.startswith("xl/worksheets/") and n.endswith(".xml"))
+                if not sheets:
+                    return ""
+                sheet = sheets[0]
+            sx = zf.read(sheet).decode("utf-8", "replace")
+        lines = []
+        for row in _re.findall(r"<row[^>]*>(.*?)</row>", sx, _re.S)[:max_rows]:
+            cells = []
+            for m in _re.finditer(r"<c([^>]*)>(.*?)</c>", row, _re.S):
+                attrs, inner = m.group(1), m.group(2)
+                v = _re.search(r"<v>(.*?)</v>", inner, _re.S)
+                val = (v.group(1) if v else "").strip()
+                if 't="s"' in attrs and val.isdigit():
+                    idx = int(val)
+                    val = shared[idx] if 0 <= idx < len(shared) else val
+                cells.append(val)
+            lines.append("\t".join(cells))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pptx_text(raw: bytes, max_slides: int = 60) -> str:
+        """pptx → 每页一段文本（取 ppt/slides 的 a:t 节点）。"""
+        import io
+        import re as _re
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            slides = sorted(n for n in zf.namelist()
+                            if _re.match(r"ppt/slides/slide\d+\.xml$", n))
+            out = []
+            for i, name in enumerate(slides[:max_slides], 1):
+                xml = zf.read(name).decode("utf-8", "replace")
+                texts = [_re.sub(r"<[^>]+>", "", t)
+                         for t in _re.findall(r"<a:t>(.*?)</a:t>", xml, _re.S)]
+                out.append(f"── 第 {i} 页 ──\n" + "\n".join(t for t in texts if t.strip()))
+        return "\n\n".join(out)
+
+    @staticmethod
+    def _zip_listing(raw: bytes, max_entries: int = 500) -> str:
+        """压缩包 → 条目清单（名称 / 大小）。"""
+        import io
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                infos = zf.infolist()
+                lines = [f"{'目录' if i.is_dir() else '文件':<4} {i.file_size:>12,}  {i.filename}"
+                         for i in infos[:max_entries]]
+                if len(infos) > max_entries:
+                    lines.append(f"... 共 {len(infos)} 个条目，仅显示前 {max_entries} 个")
+                return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001 —— 非 zip 容器（rar/7z 等）
+            return f"（无法列出该压缩包内容：{exc}）"
+
+    @staticmethod
+    def _hexdump(raw: bytes, limit: int = 2048) -> str:
+        """二进制 → 十六进制摘要（偏移 / hex / ASCII，前 limit 字节）。"""
+        out = []
+        for off in range(0, min(len(raw), limit), 16):
+            chunk = raw[off:off + 16]
+            hexs = " ".join(f"{b:02x}" for b in chunk)
+            asci = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            out.append(f"{off:08x}  {hexs:<47}  {asci}")
+        if len(raw) > limit:
+            out.append(f"… 共 {len(raw):,} 字节，仅显示前 {limit} 字节")
+        return "\n".join(out)
+
+    @staticmethod
+    def _media_mime(ext: str, kind: str) -> str:
+        table = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+                 ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+                 ".opus": "audio/opus", ".mp4": "video/mp4", ".mov": "video/quicktime",
+                 ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
+                 ".webm": "video/webm", ".flv": "video/x-flv", ".m4v": "video/mp4",
+                 ".pdf": "application/pdf"}
+        return table.get(ext, "video/mp4" if kind == "video" else "application/octet-stream")
+
+    def file_preview(self, rel_path: str = "") -> dict[str, Any]:
+        """读取工作区内文件用于预览：文本/代码/图片/Markdown/CSV/二进制元信息。
+
+        - 路径锁定在工作区内部（与 ws_tree 同款越界校验）
+        - 文本类限 256KB（超出截断并置 truncated 标记），图片转 data URL（≤2MB）
+        - 无法呈现的类型（Office / 压缩包 / 音视频 / PDF）只返回元信息 + 建议外部打开
+        """
+        target, err = self._safe_ws_path(rel_path)
+        if target is None:
+            return {"ok": False, "error": err}
+        if not target.is_file():
+            return {"ok": False, "error": "文件不存在"}
+        stat = target.stat()
+        ext = target.suffix.lower()
+        base = {"ok": True, "name": target.name, "rel": str(rel_path or target.name),
+                "size": stat.st_size, "mtime": stat.st_mtime, "ext": ext}
+
+        def kind_of() -> str:
+            if ext in self.IMG_EXT:
+                return "image"
+            if ext in self.MD_EXT:
+                return "markdown"
+            if ext in self.TABLE_EXT:
+                return "table"
+            if ext in self.HTML_EXT:
+                return "html"
+            if ext in self.DATA_EXT:
+                return "code"
+            if ext == ".pdf":
+                return "pdf"
+            if ext in self.OFFICE_EXT:
+                return "office"
+            if ext in self.ARCHIVE_EXT:
+                return "archive"
+            if ext in self.AUDIO_EXT:
+                return "audio"
+            if ext in self.VIDEO_EXT:
+                return "video"
+            if ext in self.CODE_EXT or target.name.lower() in {
+                    "dockerfile", "makefile", "cmakelists.txt", "license", "readme"}:
+                return "code"
+            return "unknown"
+
+        kind = kind_of()
+
+        if kind == "image" and stat.st_size <= 2 * 1024 * 1024:
+            try:
+                import base64
+
+                mime = {".png": "image/png", ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg", ".gif": "image/gif",
+                        ".webp": "image/webp", ".bmp": "image/bmp",
+                        ".ico": "image/x-icon", ".svg": "image/svg+xml"}.get(
+                            ext, "application/octet-stream")
+                raw = target.read_bytes()
+                return {**base, "kind": "image", "mime": mime,
+                        "data_url": "data:" + mime + ";base64," +
+                        base64.b64encode(raw).decode("ascii")}
+            except Exception as exc:  # noqa: BLE001 —— 读失败退回元信息
+                return {**base, "kind": kind, "error": str(exc)}
+
+        if kind in {"pdf", "audio", "video"}:
+            # 可内嵌渲染：转 data URL（按类型设上限，防超大文件把内存打爆）
+            cap_mb = {"pdf": 12, "audio": 16, "video": 48}[kind]
+            if stat.st_size > cap_mb * 1024 * 1024:
+                return {**base, "kind": kind, "too_large": True,
+                        "note": f"文件超过 {cap_mb}MB 内嵌上限，请用系统程序打开"}
+            try:
+                import base64
+
+                mime = self._media_mime(ext, kind)
+                raw = target.read_bytes()
+                return {**base, "kind": kind, "mime": mime,
+                        "data_url": "data:" + mime + ";base64," +
+                        base64.b64encode(raw).decode("ascii")}
+            except Exception as exc:  # noqa: BLE001 —— 读失败退回元信息
+                return {**base, "kind": kind, "error": str(exc)}
+
+        if kind == "office":
+            # OOXML（docx/xlsx/pptx）在应用内解析出文本/表格；老格式只给元信息
+            parser = self.OOXML_TEXT_EXT.get(ext)
+            if not parser or stat.st_size > 8 * 1024 * 1024:
+                return {**base, "kind": "office"}
+            try:
+                raw = target.read_bytes()
+                if parser == "docx":
+                    doc = self._docx_text(raw)
+                    return {**base, "kind": "office", "text": doc,
+                            "lines": doc.count("\n") + 1,
+                            "note": "Word 文档正文（无排版）"}
+                if parser == "xlsx":
+                    doc = self._xlsx_text(raw)
+                    return {**base, "kind": "table", "text": doc,
+                            "ext": ".tsv", "note": "Excel 首个工作表（最多 300 行）"}
+                doc = self._pptx_text(raw)
+                return {**base, "kind": "office", "text": doc,
+                        "note": "PowerPoint 各页文本"}
+            except Exception as exc:  # noqa: BLE001 —— 损坏/加密文档退回元信息
+                return {**base, "kind": "office", "error": str(exc)}
+
+        if kind == "archive":
+            if stat.st_size <= 8 * 1024 * 1024:
+                try:
+                    raw = target.read_bytes()
+                    listing = self._zip_listing(raw)
+                    return {**base, "kind": "archive", "text": listing,
+                            "note": "压缩包条目清单"}
+                except Exception as exc:  # noqa: BLE001
+                    return {**base, "kind": "archive", "error": str(exc)}
+            return {**base, "kind": "archive"}
+
+        # 其余按内容嗅探：不可解码的当二进制（给十六进制摘要）
+        max_bytes = 256 * 1024
+        try:
+            raw = target.read_bytes()
+        except Exception as exc:  # noqa: BLE001
+            return {**base, "kind": kind, "error": str(exc)}
+        head = raw[:max_bytes + 1]
+        truncated = len(raw) > max_bytes
+        if b"\0" in head:
+            return {**base, "kind": "binary", "text": self._hexdump(raw),
+                    "note": "二进制十六进制摘要"}
+        text = None
+        for enc in ("utf-8", "gbk", "latin-1"):
+            try:
+                text = head.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            return {**base, "kind": "binary"}
+        if truncated:
+            text = text[:max_bytes]
+        return {**base, "kind": kind, "text": text, "truncated": truncated,
+                "lines": text.count("\n") + 1}
+
+    def open_external(self, rel_path: str = "") -> dict[str, Any]:
+        """用系统默认程序打开工作区内的文件（预览不了的类型用它兜底）。"""
+        import os
+        import subprocess
+
+        target, err = self._safe_ws_path(rel_path)
+        if target is None:
+            return {"ok": False, "error": err}
+        if not target.is_file():
+            return {"ok": False, "error": "文件不存在"}
+        try:
+            if os.name == "nt":
+                os.startfile(str(target))  # 就是要用默认程序打开
+            elif sys.platform == "darwin":
+                from .procutil import CREATE_NO_WINDOW
+
+                subprocess.Popen(["open", str(target)],
+                                 creationflags=CREATE_NO_WINDOW)
+            else:
+                from .procutil import CREATE_NO_WINDOW
+
+                subprocess.Popen(["xdg-open", str(target)],
+                                 creationflags=CREATE_NO_WINDOW)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": str(target)}
+
+    def subagents(self, limit: int = 50) -> dict[str, Any]:
+        """列出子 agent 调用记录（profile/subagents.jsonl，最新在前）。"""
+        import json
+
+        path = self.host.profile.root / "subagents.jsonl"
+        if not path.is_file():
+            return {"ok": True, "items": []}
+        items: list[dict[str, Any]] = []
+        try:
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        items.reverse()
+        return {"ok": True, "items": items[: max(1, int(limit or 50))]}
+
     def ws_tree(self, subpath: str = "") -> dict[str, Any]:
         """列出工作区目录内容（锁定在工作区内部，隐藏点开头条目）。"""
         ws = str(getattr(self.host, "workspace", "") or "")
@@ -682,6 +1630,7 @@ class DesktopApp:
                 ["git", "-c", "core.quotepath=false", *args],
                 cwd=ws, capture_output=True, timeout=30,
                 check=False,  # 非零退出（如「不是 git 仓库」）由调用方按语义处理
+                creationflags=CREATE_NO_WINDOW,
             )
 
         status = git("status", "--short")
@@ -819,28 +1768,43 @@ class DesktopApp:
 UI_HTML = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>卅 harness</title><style>
 :root {
-  --bg: #0f0f0f; --panel: #161616; --elev: #1d1d1d; --hover: #242424;
-  --line: #2a2a2a; --line-soft: #222222;
-  --fg: #ececec; --dim: #8f8f8f; --faint: #5c5c5c;
-  --accent: #4d6bfe; --accent-soft: rgba(77,107,254,.14);
-  --ok: #58a66b; --err: #e07a6c;
-  --bubble: #262626; --scroll: #333; --shadow: rgba(0,0,0,.5);
-  --radius: 12px;
+  --bg: #0c0d12; --panel: #12141c; --elev: #191c26; --hover: #232634;
+  --line: #2b2e3d; --line-soft: #20222e;
+  --fg: #eaebf3; --dim: #9497ab; --faint: #63667c;
+  --accent: #5b7cfa; --accent-2: #8b5cf6;
+  --accent-grad: linear-gradient(135deg, #5b7cfa 0%, #8b5cf6 100%);
+  --accent-soft: rgba(91,124,250,.15);
+  --ok: #5cc689; --err: #ef7b6d;
+  --bubble: #20232f; --scroll: #353950; --shadow: rgba(4,6,16,.55);
+  --radius: 14px;
+  --ring: 0 0 0 3px rgba(91,124,250,.22);
+  --shadow-lg: 0 16px 48px rgba(4,6,16,.55);
+  --accent-glow: 0 4px 16px rgba(91,124,250,.35);
 }
 html[data-theme="light"] {
-  --bg: #f7f7f8; --panel: #ffffff; --elev: #f2f2f4; --hover: #e9e9ec;
-  --line: #e1e1e5; --line-soft: #ececee;
-  --fg: #1c1c1e; --dim: #6b6b72; --faint: #a0a0a8;
+  --bg: #f3f4f9; --panel: #ffffff; --elev: #eef0f7; --hover: #e4e7f1;
+  --line: #dbdeea; --line-soft: #e8eaf2;
+  --fg: #181a24; --dim: #5d6176; --faint: #9195ab;
+  --accent: #4d6bfe; --accent-2: #7c4dff;
+  --accent-grad: linear-gradient(135deg, #4d6bfe 0%, #7c4dff 100%);
   --accent-soft: rgba(77,107,254,.10);
-  --bubble: #e8e8ee; --scroll: #d2d2d8; --shadow: rgba(0,0,0,.12);
+  --bubble: #e9ebf6; --scroll: #c8ccdc; --shadow: rgba(24,28,60,.12);
+  --ring: 0 0 0 3px rgba(77,107,254,.16);
+  --shadow-lg: 0 16px 44px rgba(24,28,60,.16);
+  --accent-glow: 0 4px 16px rgba(77,107,254,.30);
 }
 @media (prefers-color-scheme: light) {
   html[data-theme="system"] {
-    --bg: #f7f7f8; --panel: #ffffff; --elev: #f2f2f4; --hover: #e9e9ec;
-    --line: #e1e1e5; --line-soft: #ececee;
-    --fg: #1c1c1e; --dim: #6b6b72; --faint: #a0a0a8;
+    --bg: #f3f4f9; --panel: #ffffff; --elev: #eef0f7; --hover: #e4e7f1;
+    --line: #dbdeea; --line-soft: #e8eaf2;
+    --fg: #181a24; --dim: #5d6176; --faint: #9195ab;
+    --accent: #4d6bfe; --accent-2: #7c4dff;
+    --accent-grad: linear-gradient(135deg, #4d6bfe 0%, #7c4dff 100%);
     --accent-soft: rgba(77,107,254,.10);
-    --bubble: #e8e8ee; --scroll: #d2d2d8; --shadow: rgba(0,0,0,.12);
+    --bubble: #e9ebf6; --scroll: #c8ccdc; --shadow: rgba(24,28,60,.12);
+    --ring: 0 0 0 3px rgba(77,107,254,.16);
+    --shadow-lg: 0 16px 44px rgba(24,28,60,.16);
+    --accent-glow: 0 4px 16px rgba(77,107,254,.30);
   }
 }
 * { box-sizing: border-box; }
@@ -848,8 +1812,9 @@ html, body { height: 100%; }
 body { margin:0; font-family:'Segoe UI','Microsoft YaHei',system-ui,sans-serif;
        background:var(--bg); color:var(--fg); overflow:hidden;
        -webkit-font-smoothing: antialiased; }
-::-webkit-scrollbar { width:8px; height:8px; }
-::-webkit-scrollbar-thumb { background:var(--scroll); border-radius:4px; }
+::selection { background:var(--accent-soft); }
+::-webkit-scrollbar { width:6px; height:6px; }
+::-webkit-scrollbar-thumb { background:var(--scroll); border-radius:3px; }
 ::-webkit-scrollbar-thumb:hover { background:var(--dim); }
 ::-webkit-scrollbar-track { background:transparent; }
 .app { display:flex; height:100vh; }
@@ -859,24 +1824,38 @@ aside { width:260px; min-width:260px; background:var(--panel);
         border-right:1px solid var(--line-soft); display:flex; flex-direction:column;
         padding:14px 12px; }
 .brand { display:flex; align-items:center; gap:10px; padding:2px 6px 14px; }
-.logo { width:32px; height:32px; border-radius:9px; background:var(--fg); color:var(--bg);
+.logo { width:34px; height:34px; border-radius:10px; background:var(--accent-grad); color:#fff;
         display:flex; align-items:center; justify-content:center;
-        font-weight:800; font-size:17px; font-family:Georgia,'Times New Roman',serif; }
+        font-weight:800; font-size:17px; font-family:Georgia,'Times New Roman',serif;
+        box-shadow:var(--accent-glow); }
 .brand b { font-size:13.5px; letter-spacing:.06em; display:block; }
 .brand small { color:var(--faint); font-size:11px; letter-spacing:.04em; }
 .new-btn { display:flex; align-items:center; justify-content:center; gap:8px;
            width:100%; padding:10px 0; border-radius:var(--radius); cursor:pointer;
-           background:var(--elev); border:1px solid var(--line); color:var(--fg);
-           font-size:13.5px; transition:background .15s, border-color .15s; }
-.new-btn:hover { background:var(--hover); border-color:#3a3a3a; }
+           background:var(--accent-grad); border:none; color:#fff;
+           font-size:13.5px; font-weight:600; box-shadow:var(--accent-glow);
+           transition:filter .15s, transform .1s; }
+.new-btn:hover { filter:brightness(1.1); }
+.new-btn:active { transform:scale(.98); }
 .side-label { color:var(--faint); font-size:11px; letter-spacing:.1em; margin:16px 8px 6px; }
+.side-filter { padding:0 2px 6px; }
+.side-filter input { width:100%; background:var(--bg); border:1px solid var(--line-soft);
+                     border-radius:8px; color:var(--fg); padding:6px 10px; font-size:12px;
+                     outline:none; transition:border-color .15s, box-shadow .15s; }
+.side-filter input:focus { border-color:var(--accent); box-shadow:var(--ring); }
+.side-filter input::placeholder { color:var(--faint); }
 .side-list { flex:1; overflow-y:auto; margin:0 -4px; }
 .ws-group { margin-bottom:2px; }
 .ws-head { display:flex; align-items:center; gap:7px; padding:6px 10px; border-radius:8px;
            color:var(--dim); font-size:12.5px; cursor:pointer; user-select:none; }
 .ws-head:hover { background:var(--hover); }
 .ws-caret { flex:none; font-size:9px; color:var(--faint); transition:transform .15s;
-            width:10px; text-align:center; }
+            width:10px; text-align:center; border:none; background:transparent;
+            padding:0; cursor:pointer; }
+.ws-head.cur .ws-name { font-weight:600; color:var(--fg); }
+/* 焦点唯一性：只让当前会话行带强调色（s-row.active），
+   工作区头部只用加粗区分——避免「两个聚焦」的视觉歧义 */
+.ws-head { position:relative; transition:background .12s; }
 .ws-group.collapsed .ws-caret { transform:rotate(-90deg); }
 .ws-group.collapsed .s-row { display:none; }
 .ws-head .ws-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -884,16 +1863,24 @@ aside { width:260px; min-width:260px; background:var(--panel);
             cursor:pointer; border-radius:6px; padding:0 6px; visibility:hidden; }
 .ws-head:hover .row-menu, .s-row:hover .row-menu { visibility:visible; }
 .row-menu:hover { color:var(--fg); background:#333; }
+.s-row .row-del:hover { color:#ff6b6b; }
 .s-row { display:flex; align-items:center; gap:8px; padding:6px 10px 6px 26px;
-         border-radius:8px; cursor:pointer; font-size:13px; color:var(--dim); }
+         border-radius:8px; cursor:pointer; font-size:13px; color:var(--dim);
+         user-select:none;
+         transition:background .12s, color .12s; }
+.s-row.dragging { opacity:.45; }
+.s-row.dragover { outline:2px dashed var(--accent); outline-offset:-2px; }
+/* 会话拖拽激活中：全局 grabbing 光标，明确「已进入拖拽」 */
+body.sess-dragging, body.sess-dragging * { cursor:grabbing !important; }
 .s-row:hover { background:var(--hover); color:var(--fg); }
-.s-row.active { background:var(--accent-soft); color:var(--fg); }
+.s-row.active { background:var(--accent-soft); color:var(--fg);
+                box-shadow:inset 2.5px 0 0 var(--accent); }
 .s-row .s-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .s-row .s-time { color:var(--faint); font-size:11px; flex:none; }
 .side-bottom { border-top:1px solid var(--line-soft); padding-top:10px; margin-top:8px; }
 .side-action { display:flex; align-items:center; gap:8px; width:100%; padding:8px 10px;
                border:none; background:transparent; color:var(--dim); font-size:13px;
-               border-radius:8px; cursor:pointer; }
+               border-radius:8px; cursor:pointer; transition:background .12s, color .12s; }
 .side-action:hover { background:var(--hover); color:var(--fg); }
 .side-hint { color:var(--faint); font-size:11px; padding:6px 10px 0; line-height:1.5; }
 
@@ -902,41 +1889,123 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 #hero { display:none; flex:1; flex-direction:column; align-items:center;
         justify-content:center; text-align:center; padding-bottom:8px; min-height:0; }
 #hero .glyph { font-family:Georgia,'Times New Roman',serif; font-size:52px; font-weight:800;
-               width:84px; height:84px; border-radius:22px; background:var(--elev);
-               border:1px solid var(--line); display:flex; align-items:center;
-               justify-content:center; margin-bottom:22px; }
+               width:88px; height:88px; border-radius:24px; background:var(--accent-grad);
+               color:#fff; border:none; display:flex; align-items:center;
+               justify-content:center; margin-bottom:24px;
+               box-shadow:0 14px 40px rgba(91,124,250,.35); }
 #hero h1 { font-family:Georgia,'Times New Roman',serif; font-weight:700;
-           font-size:34px; margin:0 0 10px; letter-spacing:.01em; }
+           font-size:36px; margin:0 0 12px; letter-spacing:.01em;
+           background:linear-gradient(120deg, var(--fg) 40%, var(--dim));
+           -webkit-background-clip:text; background-clip:text;
+           -webkit-text-fill-color:transparent; }
 #hero p { color:var(--dim); font-size:13.5px; margin:0; max-width:420px; line-height:1.7; }
 #log { flex:1; overflow-y:auto; padding:26px 24px 10px; }
 .thread { max-width:760px; margin:0 auto; }
-.msg { position:relative; margin:0 0 18px; font-size:14px; line-height:1.75;
-       word-break:break-word; user-select:text; -webkit-user-select:text; cursor:text; }
+.msg { position:relative; margin:0 0 14px; font-size:14px; line-height:1.65;
+       word-break:break-word; user-select:text; -webkit-user-select:text; cursor:text;
+       animation:msgIn .22s ease; }
+@keyframes msgIn { from { opacity:0; transform:translateY(6px); }
+                   to { opacity:1; transform:none; } }
 .msg ::selection, .msg::selection { background:var(--accent-soft); }
-.msg.user { background:var(--bubble); border-radius:14px; padding:10px 16px;
+.msg.user { background:var(--bubble); border:1px solid rgba(91,124,250,.22);
+            border-radius:16px 16px 4px 16px; padding:10px 16px;
             max-width:78%; margin-left:auto; width:fit-content; white-space:pre-wrap; }
+html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
 .msg.bot { white-space:pre-wrap; }
 .msg.bot code { background:var(--elev); border:1px solid var(--line); border-radius:5px;
                 padding:1px 6px; font-family:Consolas,monospace; font-size:12.5px; }
 .msg.bot .bold { font-weight:700; }
+.msg.bot .md-h { font-weight:700; line-height:1.4; margin:8px 0 3px; }
+.msg.bot .md-h:first-child { margin-top:0; }
+.msg.bot .md-h1 { font-size:16px; }
+.msg.bot .md-h2 { font-size:15px; }
+.msg.bot .md-h3, .msg.bot .md-h4 { font-size:14px; }
+/* 子 agent 调用记录（右侧「🤖 子agent」面板） */
+.sub-row { border:1px solid var(--line-soft); border-radius:10px; margin:6px 0;
+           overflow:hidden; background:var(--elev); }
+.sub-head { display:flex; align-items:center; gap:7px; padding:7px 10px;
+            cursor:pointer; }
+.sub-head:hover { background:var(--hover); }
+.sub-badge { flex:none; width:16px; height:16px; border-radius:50%;
+             display:flex; align-items:center; justify-content:center;
+             font-size:10px; color:#fff; background:var(--ok); }
+.sub-badge.bad { background:var(--err); }
+.sub-task { flex:1; min-width:0; font-size:12px; color:var(--fg);
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sub-time { flex:none; color:var(--faint); font-size:11px; }
+.sub-body { display:none; padding:2px 10px 10px; font-size:11.5px;
+            color:var(--dim); line-height:1.6; }
+.sub-row.open .sub-body { display:block; }
+.sub-err { color:var(--err); margin-bottom:4px; }
+.sub-steps { color:var(--accent); font-family:Consolas,monospace;
+             margin-bottom:4px; word-break:break-all; }
+.sub-step { padding:1px 0; }
+.sub-step.bad { color:var(--err); }
+.sub-step .sub-res { color:var(--faint); font-family:inherit; }
+.sub-out { white-space:pre-wrap; word-break:break-word; }
+.sub-meta { color:var(--faint); font-size:10.5px; margin-top:6px; }
+/* 排队徽标：本轮回答中还允许输入，点发送即排队 */
+.q-badge { flex:none; font-size:11px; color:var(--accent); background:var(--accent-soft);
+           border-radius:10px; padding:3px 8px; white-space:nowrap; }
+/* 工具调用区块：显示在正式回复正文里（写文件等操作直接可见） */
+.tool-log { background:var(--elev); border:1px solid var(--line-soft);
+            border-radius:10px; padding:6px 10px; margin:0 0 8px; }
+.tool-row { display:flex; align-items:baseline; gap:8px; padding:3px 0;
+            font-size:11.5px; line-height:1.5; }
+.tool-row + .tool-row { border-top:1px dashed var(--line-soft); }
+.tl-name { color:var(--accent); font-family:Consolas,monospace; flex:none; }
+.tl-detail { color:var(--dim); overflow:hidden; text-overflow:ellipsis;
+             white-space:nowrap; }
+/* Markdown 正文容器：关闭 pre-wrap——md() 输出的 HTML 源码里带换行，
+   pre-wrap 会把它们显示成空行，与段落 margin 叠加成「间距过长」。
+   代码块 .fence 自己是 white-space:pre，不受影响 */
+.msg.bot .md-body { white-space:normal; }
+/* 紧凑排版：浏览器给 <p> 的默认 1em 上下边距在 1.65 行高下会放大成大空隙，
+   统一收成单向 margin-bottom（段落间 6px，末段不留尾空隙） */
+.msg.bot p { margin:0 0 6px; }
+.msg.bot p:last-child { margin-bottom:0; }
+.msg.bot ul, .msg.bot ol { margin:3px 0 6px; padding-left:22px; }
+.msg.bot li { margin:2px 0; }
+.msg.bot li:last-child { margin-bottom:0; }
+.msg.bot blockquote { margin:6px 0; padding:4px 12px; border-left:3px solid var(--accent);
+                      background:var(--accent-soft); border-radius:0 8px 8px 0;
+                      color:var(--dim); }
+.msg.bot hr { border:none; border-top:1px solid var(--line-soft); margin:10px 0; }
+.msg.bot em { font-style:italic; }
+.msg.bot a { color:var(--accent); text-decoration:none; }
+.msg.bot a:hover { text-decoration:underline; }
+.msg.bot .fence { background:var(--bg); border:1px solid var(--line-soft);
+                  border-radius:10px; padding:10px 12px; margin:6px 0;
+                  font-family:Consolas,monospace; font-size:12.5px; line-height:1.6;
+                  overflow-x:auto; white-space:pre; color:var(--fg);
+                  user-select:text; -webkit-user-select:text; }
 .msg.error { color:var(--err); }
 .meta { color:var(--faint); font-size:11.5px; margin-top:6px; }
-.meta .toolchip { background:var(--elev); border:1px solid var(--line); border-radius:6px;
-                  padding:1px 8px; margin-right:5px; display:inline-block; font-size:11px; }
-.reasoning { border:1px solid var(--line-soft); border-radius:10px; margin-bottom:10px;
-             background:var(--panel); overflow:hidden; }
-.r-head { padding:6px 12px; color:var(--faint); font-size:12px; cursor:pointer;
-          user-select:none; }
-.r-head:hover { color:var(--dim); }
-.r-body { display:none; padding:2px 12px 10px; color:var(--dim); font-size:12.5px;
-          line-height:1.7; white-space:pre-wrap; border-top:1px dashed var(--line-soft); }
-.reasoning.open .r-body { display:block; }
-.thinking { display:inline-flex; gap:5px; padding:6px 0; }
-.thinking i { width:6px; height:6px; border-radius:50%; background:var(--dim);
-              animation:blink 1.2s infinite; }
-.thinking i:nth-child(2) { animation-delay:.2s; }
-.thinking i:nth-child(3) { animation-delay:.4s; }
-@keyframes blink { 0%,70%,100% { opacity:.25; } 35% { opacity:1; } }
+.meta .toolchip { background:var(--elev); border:1px solid var(--line); border-radius:999px;
+                  padding:2px 9px; margin-right:5px; display:inline-block; font-size:11px; }
+.reasoning { border:1px solid var(--line-soft); border-radius:12px; margin-bottom:10px;
+             background:var(--elev); overflow:hidden; transition:border-color .15s; }
+.reasoning:hover, .reasoning.open { border-color:var(--line); }
+.r-head { display:flex; align-items:center; gap:8px; padding:7px 12px; color:var(--dim);
+          font-size:12px; cursor:pointer; user-select:none;
+          transition:color .12s, background .12s; }
+.r-head:hover { color:var(--accent); background:var(--accent-soft); }
+.r-caret { font-size:9px; color:var(--faint); transition:transform .18s; flex:none; }
+.reasoning.open .r-caret { transform:rotate(90deg); }
+.r-title { flex:1; }
+.r-body { display:none; padding:8px 14px 10px; color:var(--dim); font-size:12.5px;
+          line-height:1.7; white-space:pre-wrap; background:var(--panel);
+          border-top:1px dashed var(--line-soft); }
+.reasoning.open .r-body { display:block; animation:rIn .18s ease; }
+@keyframes rIn { from { opacity:0; transform:translateY(-3px); }
+                 to { opacity:1; transform:none; } }
+.thinking { display:inline-flex; align-items:center; gap:6px; padding:6px 0; }
+.thinking i { width:6px; height:6px; border-radius:50%; background:var(--accent);
+              animation:bounce 1.15s infinite ease-in-out; }
+.thinking i:nth-child(2) { animation-delay:.15s; }
+.thinking i:nth-child(3) { animation-delay:.3s; }
+@keyframes bounce { 0%, 60%, 100% { transform:translateY(0); opacity:.3; }
+                    30% { transform:translateY(-4px); opacity:1; } }
 
 /* ---------- 输入卡片 ---------- */
 .composer-wrap { padding:10px 24px 6px; }
@@ -946,9 +2015,14 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
          padding:5px 14px; font-size:12.5px; cursor:pointer; max-width:340px; }
 #wsBtn:hover { color:var(--fg); border-color:#3d3d3d; }
 #wsBtn .ws-cur { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ws-bar .ws-close { border:none; background:var(--elev); color:var(--faint);
+                    border-radius:999px; cursor:pointer; font-size:11px;
+                    padding:6px 10px; margin-left:6px; }
+.ws-bar .ws-close:hover { color:var(--fg); background:var(--hover); }
 #wsMenu { display:none; position:absolute; top:36px; left:0; z-index:6; min-width:260px;
           max-width:360px; background:var(--panel); border:1px solid var(--line);
-          border-radius:12px; padding:6px; box-shadow:0 8px 28px var(--shadow); }
+          border-radius:12px; padding:6px; box-shadow:0 8px 28px var(--shadow);
+          animation:pop .15s ease; }
 #wsMenu.open { display:block; }
 #wsMenu .ws-menu-label { color:var(--faint); font-size:10.5px; letter-spacing:.08em;
                          padding:4px 10px; }
@@ -959,48 +2033,84 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 #wsMenu button.sel { color:var(--accent); }
 #wsMenu .ws-path { color:var(--faint); font-size:11px; overflow:hidden;
                    text-overflow:ellipsis; white-space:nowrap; flex:1; }
-.composer { max-width:760px; margin:0 auto; background:var(--elev);
-            border:1px solid var(--line); border-radius:16px; padding:12px 14px 10px;
-            transition:border-color .15s; position:relative; }
-.composer:focus-within { border-color:#3d3d3d; }
+.composer { max-width:760px; margin:0 auto; background:var(--panel);
+            border:1px solid var(--line-soft); border-radius:18px; padding:12px 14px 10px;
+            transition:border-color .15s, box-shadow .2s; position:relative;
+            box-shadow:0 8px 30px var(--shadow); }
+.composer:focus-within { border-color:var(--accent); box-shadow:var(--ring), 0 8px 30px var(--shadow); }
 #input { width:100%; background:transparent; border:none; outline:none; resize:none;
          color:var(--fg); font-size:14px; line-height:1.6; font-family:inherit;
          min-height:24px; max-height:180px; }
 #input::placeholder { color:var(--faint); }
-.composer-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
-.badge { border:1px solid var(--line); background:transparent; color:var(--dim);
-         border-radius:999px; padding:3px 11px; font-size:11.5px; cursor:pointer; }
-.badge:hover { color:var(--fg); border-color:#3d3d3d; }
-.badge.allow { color:var(--ok); border-color:rgba(88,166,107,.4); }
-.badge.deny  { color:var(--err); border-color:rgba(224,122,108,.4); }
-#ctxBtn { border:1px solid var(--line); background:transparent; color:var(--dim);
-          border-radius:999px; padding:3px 11px; font-size:11.5px; cursor:pointer; }
-#ctxBtn:hover { color:var(--fg); border-color:#3d3d3d; }
-.flex1 { flex:1; }
-#modelSel, #thinkSel { background:transparent; border:1px solid var(--line); color:var(--dim);
-            border-radius:8px; padding:4px 8px; font-size:12px; max-width:170px;
-            outline:none; cursor:pointer; }
-#modelSel:focus, #thinkSel:focus { color:var(--fg); }
+/* 窄宽度保护：拖窄侧栏/面板时输入行禁止换行挤压——按钮永不折行，
+   只有权限徽标与模型选择允许收缩（省略号），避免「竖排文字」 */
+.composer-row { display:flex; align-items:center; gap:7px; margin-top:10px;
+                flex-wrap:nowrap; }
+.composer-row > * { flex:none; }
+/* 统一控件外观：等高胶囊、elev 底、悬停上浮—— badges / 图标按钮 / 下拉 */
+.badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #planBtn {
+  background:var(--elev); border:1px solid var(--line-soft); color:var(--dim);
+  border-radius:999px; padding:5px 12px; height:28px; font-size:11.5px;
+  cursor:pointer; white-space:nowrap;
+  transition:color .15s, border-color .15s, background .15s, transform .12s; }
+.badge:hover, #ctxBtn:hover, #imgBtn:hover, #sideBtn:hover, #snipBtn:hover,
+#planBtn:hover { color:var(--fg); border-color:var(--line); transform:translateY(-1px); }
+/* 权限徽标与模型选择允许收缩（收缩时省略号），其余按钮永不压缩 */
+#permBadge { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.badge.allow { color:var(--ok); border-color:rgba(92,198,137,.45); }
+.badge.deny  { color:var(--err); border-color:rgba(239,123,109,.45); }
+#ctxBtn:hover, #imgBtn:hover, #snipBtn:hover { color:var(--accent); }
+#planBtn.on { color:var(--accent); border-color:var(--accent);
+              background:var(--accent-soft); }
+#sideBtn.off { color:var(--faint); }
+/* 下拉：自定义箭头 + 胶囊外观（与按钮统一） */
+#modelSel, #thinkSel { flex:0 1 auto; min-width:70px; max-width:170px;
+            appearance:none; -webkit-appearance:none;
+            background:var(--elev)
+              url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5'><path d='M1 1l3 3 3-3' stroke='%23888780' fill='none' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>")
+              no-repeat right 10px center;
+            border:1px solid var(--line-soft); color:var(--dim);
+            border-radius:999px; padding:5px 24px 5px 12px; height:28px;
+            font-size:11.5px; outline:none; cursor:pointer;
+            transition:color .15s, border-color .15s; }
+#modelSel:hover, #thinkSel:hover { color:var(--fg); border-color:var(--line); }
+#modelSel:focus, #thinkSel:focus { color:var(--fg); border-color:var(--accent);
+                                   box-shadow:var(--ring); }
 #modelSel option, #thinkSel option { background:var(--elev); color:var(--fg); }
+/* 左侧栏隐藏：只藏左侧 aside（右面板是 aside.right，不受影响），拖拽手柄一并隐藏 */
+body.side-hidden .app > aside:not(.right) { display:none; }
+body.side-hidden .side-resize { display:none; }
+.img-chip { display:inline-flex; align-items:center; gap:6px; max-width:250px;
+            background:var(--accent-soft); border:1px solid rgba(91,124,250,.28);
+            color:var(--fg); border-radius:999px; padding:3px 10px; font-size:11.5px;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+html[data-theme="light"] .img-chip { border-color:rgba(77,107,254,.24); }
+.flex1 { flex:1; }
 .send { width:34px; height:34px; border-radius:50%; border:none; cursor:pointer;
-        background:var(--accent); color:#fff; font-size:15px; line-height:1;
+        background:var(--accent-grad); color:#fff; font-size:15px; line-height:1;
         display:flex; align-items:center; justify-content:center;
-        transition:opacity .15s, transform .1s; }
-.send:hover { opacity:.88; }
+        box-shadow:var(--accent-glow);
+        transition:filter .15s, transform .1s; }
+.send:hover { filter:brightness(1.12); }
 .send:active { transform:scale(.94); }
-.send:disabled { opacity:.4; cursor:default; }
+.send:disabled { opacity:.4; cursor:default; filter:none; box-shadow:none; }
 .send.busy { background:transparent; border:2px solid var(--line);
              border-top-color:var(--accent); animation:spin .8s linear infinite;
-             color:transparent; }
+             color:transparent; box-shadow:none; }
 @keyframes spin { to { transform:rotate(360deg); } }
-#usageLine { max-width:760px; margin:4px auto 0; color:var(--faint); font-size:11px;
-             text-align:right; padding-right:4px; }
+#usageLine { display:table; margin:7px auto 0; background:var(--elev);
+             border:1px solid var(--line-soft); border-radius:999px;
+             padding:4px 16px; color:var(--faint); font-size:11px;
+             letter-spacing:.02em; max-width:90%; overflow:hidden;
+             text-overflow:ellipsis; white-space:nowrap; }
+#usageLine:empty { display:none; }
 .composer-foot { padding:2px 24px 12px; }
 
 /* ---------- 弹出菜单 / 卡片 ---------- */
 .perm-menu { display:none; position:absolute; left:14px; bottom:52px; z-index:5;
              background:var(--panel); border:1px solid var(--line); border-radius:12px;
-             padding:6px; min-width:210px; box-shadow:0 8px 28px rgba(0,0,0,.5); }
+             padding:6px; min-width:210px; box-shadow:0 8px 28px rgba(0,0,0,.5);
+             animation:pop .15s ease; }
 .perm-menu.open { display:block; }
 .perm-menu h5 { margin:4px 8px; color:var(--faint); font-size:10.5px; letter-spacing:.08em; }
 .perm-menu button { display:flex; align-items:center; gap:8px; width:100%; padding:7px 12px;
@@ -1015,7 +2125,7 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 #ctxCard h4 { margin:0 0 10px; font-size:13px; display:flex; align-items:baseline; gap:8px; }
 #ctxCard h4 small { color:var(--faint); font-size:11px; margin-left:auto; }
 .ctx-bar { height:6px; border-radius:3px; background:var(--hover); overflow:hidden; }
-.ctx-bar i { display:block; height:100%; background:var(--accent); border-radius:3px; }
+.ctx-bar i { display:block; height:100%; background:var(--accent-grad); border-radius:3px; }
 .ctx-rows { margin-top:10px; }
 .ctx-row { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:12px;
            color:var(--dim); }
@@ -1032,27 +2142,68 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 .step .s-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
                 white-space:nowrap; }
 .step.pending .s-icon { animation:spin 1s linear infinite; display:inline-block; }
+.step.pending .s-text { color:var(--accent); }
 .step.result { color:var(--faint); font-size:11.5px; padding-left:22px; }
+.stream-body { white-space:pre-wrap; word-break:break-word; min-height:1.2em; }
+/* 流式生成中的光标：跟随 Markdown 内容末尾闪烁 */
+.stream-body.live::after { content:'▍'; color:var(--accent);
+                           animation:cursorBlink 1s steps(2, start) infinite; }
+@keyframes cursorBlink { to { visibility:hidden; } }
+/* 流式期间实时渲染的 Markdown 与最终版共用 .msg.bot 的排版规则 */
+.stream-body p { margin:0 0 8px; }
+.stream-body p:last-child { margin-bottom:0; }
+.stream-body ul, .stream-body ol { margin:4px 0; }
 
 /* ---------- 右侧面板 ---------- */
 aside.right { width:360px; min-width:360px; background:var(--panel);
               border-left:1px solid var(--line-soft); display:flex;
-              flex-direction:column; }
+              flex-direction:column; position:relative; }
+#tabMenu { display:none; position:fixed; z-index:60;
+           min-width:150px; background:var(--panel); border:1px solid var(--line);
+           border-radius:12px; padding:5px; box-shadow:0 8px 28px var(--shadow);
+           animation:pop .16s ease; }
+#tabMenu.open { display:block; }
+#tabMenu button { display:flex; align-items:center; gap:7px; width:100%; padding:7px 12px;
+                  border:none; background:transparent; color:var(--dim); font-size:12.5px;
+                  border-radius:8px; cursor:pointer; text-align:left; }
+#tabMenu button:hover { background:var(--accent-soft); color:var(--accent); }
+@keyframes pop { from { opacity:0; transform:translateY(-4px) scale(.98); }
+                 to { opacity:1; transform:none; } }
+.rp-resize { flex:none; width:5px; cursor:col-resize; background:transparent;
+             transition:background .15s; }
+.rp-resize:hover, .rp-resize.dragging { background:var(--accent-soft); }
+.side-resize { flex:none; width:5px; cursor:col-resize; background:transparent;
+               transition:background .15s; }
+.side-resize:hover, .side-resize.dragging { background:var(--accent-soft); }
+body.panel-hidden .rp-resize { display:none; }
 body.panel-hidden aside.right { display:none; }
 .rp-tabs { display:flex; align-items:center; gap:2px; padding:8px 8px;
-           border-bottom:1px solid var(--line-soft); }
+           border-bottom:1px solid var(--line-soft);
+           overflow-x:auto; scrollbar-width:none; }
+.rp-tabs::-webkit-scrollbar { display:none; }
 .rp-tab { border:none; background:transparent; color:var(--dim); font-size:12px;
-          padding:5px 10px; border-radius:8px; cursor:pointer; }
+          padding:5px 9px; border-radius:8px; cursor:pointer; user-select:none;
+          transition:color .12s, background .12s;
+          flex:none; white-space:nowrap; }
 .rp-tab:hover { color:var(--fg); background:var(--hover); }
-.rp-tab.active { background:var(--elev); color:var(--fg); }
-.rp-tabs .rp-close { margin-left:auto; background:transparent; border:none;
+.rp-tab.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+.rp-tabs .rp-close { margin-left:0; background:transparent; border:none;
                      color:var(--faint); font-size:13px; cursor:pointer;
-                     padding:3px 8px; border-radius:8px; }
+                     padding:3px 8px; border-radius:8px; flex:none; }
 .rp-tabs .rp-close:hover { background:var(--hover); color:var(--fg); }
+.rp-tab { position:relative; }
+.rp-tab .tab-x { visibility:hidden; margin-left:5px; color:var(--faint);
+                 font-size:10px; padding:0 1px; }
+.rp-tab:hover .tab-x { visibility:visible; }
+.rp-tab .tab-x:hover { color:var(--err); }
+.rp-plus { margin-left:auto; color:var(--faint); font-size:14px; padding:5px 10px; }
+.rp-plus:hover { color:var(--accent); }
+.rp-plus.dim { opacity:.35; cursor:default; }
+.rp-plus.dim:hover { color:var(--faint); }
 .rp-body { flex:1; min-height:0; display:none; flex-direction:column; }
 .rp-body.active { display:flex; }
 .rp-pane { flex:1; overflow-y:auto; padding:12px; font-size:13px; }
-#panelToggle.side-action.off { color:var(--faint); }
+.side-action.off { color:var(--faint); }
 
 /* 工作区树 */
 .ws-nav { display:flex; align-items:center; gap:6px; padding:8px 12px;
@@ -1061,8 +2212,44 @@ body.panel-hidden aside.right { display:none; }
                  text-overflow:ellipsis; white-space:nowrap; direction:rtl;
                  text-align:left; }
 .mini-btn { border:1px solid var(--line); background:transparent; color:var(--dim);
-            border-radius:7px; font-size:11.5px; padding:3px 9px; cursor:pointer; }
+            border-radius:7px; font-size:11.5px; padding:3px 9px; cursor:pointer;
+            transition:color .12s, border-color .12s, background .12s; }
 .mini-btn:hover { color:var(--fg); border-color:#3d3d3d; }
+/* ---------- 文件预览（工作区面板内） ---------- */
+.fp { display:none; border-top:1px solid var(--line-soft); padding:10px 12px;
+      overflow:auto; max-height:52%; }
+.fp.open { display:block; }
+.fp-head { display:flex; align-items:center; gap:8px; margin-bottom:8px;
+           flex-wrap:wrap; }
+.fp-name { font-weight:600; font-size:12.5px; color:var(--fg); word-break:break-all; }
+.fp-meta { color:var(--faint); font-size:11px; }
+.fp-head .sp { flex:1; }
+.fp-img { max-width:100%; max-height:320px; border-radius:8px;
+          border:1px solid var(--line-soft); display:block; }
+/* 内嵌渲染：PDF / HTML 用 iframe，音视频用原生播放器 */
+.fp-frame { width:100%; height:360px; border:1px solid var(--line-soft);
+            border-radius:8px; background:#fff; }
+.fp-media { width:100%; max-height:300px; border-radius:8px;
+            border:1px solid var(--line-soft); background:var(--bg); display:block; }
+.fp-html-wrap { display:flex; flex-direction:column; gap:6px; }
+.fp-html-bar { display:flex; justify-content:flex-end; }
+.fp-html-view { min-height:0; }
+.fp-code { white-space:pre-wrap; word-break:break-word; font-size:11.5px;
+           line-height:1.6; max-height:320px; overflow:auto;
+           background:var(--bg); border:1px solid var(--line-soft);
+           border-radius:8px; padding:10px 12px; }
+.c-com { color:var(--faint); font-style:italic; }
+.c-str { color:var(--ok); }
+.c-num { color:var(--accent); }
+.c-kw { color:var(--accent); font-weight:600; }
+.fp-table { overflow:auto; max-height:300px; border:1px solid var(--line-soft);
+            border-radius:8px; }
+.fp-table table { border-collapse:collapse; font-size:11.5px; width:100%; }
+.fp-table td, .fp-table th { border-bottom:1px solid var(--line-soft);
+                             padding:4px 8px; white-space:nowrap; }
+.fp-table th { background:var(--elev); position:sticky; top:0; }
+.fp-info { color:var(--dim); font-size:12px; line-height:1.7; }
+
 .tree-row { display:flex; align-items:center; gap:8px; padding:5px 10px;
             border-radius:7px; cursor:pointer; color:var(--dim); font-size:12.5px; }
 .tree-row:hover { background:var(--hover); color:var(--fg); }
@@ -1085,7 +2272,15 @@ body.panel-hidden aside.right { display:none; }
 .br-bar input { flex:1; background:var(--bg); border:1px solid var(--line);
                 border-radius:8px; color:var(--fg); padding:7px 10px; font-size:12.5px;
                 outline:none; }
-#browserFrame { flex:1; border:none; background:#fff; width:100%; }
+#browserFrame { flex:1; border:none; background:var(--bg); width:100%; display:none; }
+#browserFrame.on { display:block; }
+.br-empty { position:absolute; inset:0; display:flex; flex-direction:column;
+             align-items:center; justify-content:center; gap:8px; color:var(--faint);
+             font-size:12.5px; text-align:center; padding:0 20px; }
+.br-empty .br-glyph { font-size:34px; opacity:.55; }
+
+/* 浏览器地址栏在标签条下方，去掉原顶边距 */
+#rp-browser .br-bar { border-top:1px solid var(--line-soft); }
 
 /* 审查 */
 .review-out { flex:1; overflow-y:auto; background:var(--bg); margin:0; padding:12px;
@@ -1094,6 +2289,13 @@ body.panel-hidden aside.right { display:none; }
               user-select:text; -webkit-user-select:text; }
 .diff-add { color:var(--ok); }
 .diff-del { color:var(--err); }
+/* 远程仓库配置行（审查面板，用户手动提交/推送的入口） */
+.git-remote { display:flex; gap:6px; padding:8px 12px;
+              border-bottom:1px solid var(--line-soft); }
+.git-remote input { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line);
+                    border-radius:8px; color:var(--fg); padding:6px 10px;
+                    font-size:11.5px; outline:none; }
+.git-remote input:focus { border-color:var(--accent); }
 
 /* 辅助对话 */
 #auxThread { flex:1; overflow-y:auto; padding:12px; }
@@ -1101,34 +2303,51 @@ body.panel-hidden aside.right { display:none; }
 #auxThread .msg.user { font-size:13px; padding:8px 13px; }
 .aux-row { display:flex; align-items:center; gap:8px; padding:8px 12px;
            border-top:1px solid var(--line-soft); }
-.aux-row input { flex:1; background:var(--bg); border:1px solid var(--line);
+.aux-row input { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line);
                  border-radius:10px; color:var(--fg); padding:8px 12px;
                  font-size:12.5px; outline:none; }
+.aux-row .send { flex:none; width:34px; height:34px; min-width:34px;
+                 min-height:34px; font-size:14px; }
 .aux-hint { color:var(--faint); font-size:10.5px; padding:0 12px 8px; }
 
 /* ---------- 对话框 ---------- */
-#dlgOverlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
-               align-items:center; justify-content:center; z-index:20; }
-#dlg { background:var(--panel); border:1px solid var(--line); border-radius:16px;
-       width:min(440px, 90vw); padding:20px; }
+#dlgOverlay { position:fixed; inset:0; background:rgba(6,8,18,.45); display:none;
+               align-items:center; justify-content:center; z-index:20;
+               backdrop-filter:blur(6px); }
+#dlg { background:var(--panel); border:1px solid var(--line-soft); border-radius:18px;
+       width:min(440px, 90vw); padding:20px; box-shadow:var(--shadow-lg);
+       animation:pop .18s ease; }
 #dlg h3 { margin:0 0 10px; font-size:15px; }
 #dlg .msg-text { color:var(--dim); font-size:13px; line-height:1.7; white-space:pre-wrap; }
 #dlg input { width:100%; margin-top:12px; background:var(--bg); border:1px solid var(--line);
-             border-radius:10px; color:var(--fg); padding:9px 12px; font-size:13px; outline:none; }
+             border-radius:10px; color:var(--fg); padding:9px 12px; font-size:13px; outline:none;
+             transition:border-color .15s, box-shadow .15s; }
+#dlg input:focus { border-color:var(--accent); box-shadow:var(--ring); }
+#dlgChoose { display:none; margin-top:10px; max-height:300px; overflow-y:auto; }
+#dlgChoose .choose-item { display:flex; align-items:baseline; gap:8px; width:100%;
+                          padding:9px 12px; margin:2px 0; border:1px solid transparent;
+                          background:transparent; color:var(--dim); font-size:13px;
+                          border-radius:10px; cursor:pointer; text-align:left; }
+#dlgChoose .choose-item:hover { background:var(--accent-soft); color:var(--accent); }
+#dlgChoose .choose-label { flex:none; }
+#dlgChoose .choose-sub { flex:1; overflow:hidden; text-overflow:ellipsis;
+                         white-space:nowrap; color:var(--faint); font-size:11px;
+                         direction:rtl; text-align:left; }
 #dlg .dlg-row { display:flex; justify-content:flex-end; gap:10px; margin-top:16px; }
 
 /* ---------- 设置弹窗 ---------- */
-#overlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none;
-           align-items:center; justify-content:center; z-index:10; }
-#modal { background:var(--panel); border:1px solid var(--line); border-radius:16px;
+#overlay { position:fixed; inset:0; background:rgba(6,8,18,.45); display:none;
+           align-items:center; justify-content:center; z-index:10;
+           backdrop-filter:blur(6px); }
+#modal { background:var(--panel); border:1px solid var(--line-soft); border-radius:18px;
          width:min(760px, 92vw); max-height:86vh; display:flex; flex-direction:column;
-         overflow:hidden; }
+         overflow:hidden; box-shadow:var(--shadow-lg); }
 .tabs { display:flex; align-items:center; gap:4px; padding:12px 16px;
         border-bottom:1px solid var(--line-soft); }
 .tab { border:none; background:transparent; color:var(--dim); font-size:13px;
-       padding:6px 14px; border-radius:8px; cursor:pointer; }
+       padding:6px 14px; border-radius:8px; cursor:pointer; transition:color .12s; }
 .tab:hover { color:var(--fg); }
-.tab.active { background:var(--elev); color:var(--fg); }
+.tab.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
 .tabs .close { margin-left:auto; background:transparent; border:none; color:var(--dim);
                font-size:15px; cursor:pointer; padding:4px 8px; border-radius:8px; }
 .tabs .close:hover { background:var(--hover); color:var(--fg); }
@@ -1137,13 +2356,22 @@ body.panel-hidden aside.right { display:none; }
 .note-ok { color:var(--ok); font-size:12px; }
 .note-err { color:var(--err); font-size:12px; }
 .model-card { background:var(--elev); border:1px solid var(--line-soft); border-radius:12px;
-              padding:12px; margin:10px 0; }
+              padding:12px; margin:10px 0; transition:border-color .15s, box-shadow .15s; }
+.model-card:hover { border-color:var(--line); box-shadow:0 4px 14px var(--shadow); }
+.model-presets { display:flex; align-items:center; gap:8px; margin-bottom:10px;
+                 padding-bottom:10px; border-bottom:1px dashed var(--line-soft); }
+.model-presets label { color:var(--faint); font-size:11.5px; flex:none; }
+.model-presets select { flex:1; max-width:420px; background:var(--bg);
+                        border:1px solid var(--line); border-radius:8px;
+                        color:var(--dim); padding:5px 8px; font-size:12px; outline:none; }
+.model-presets select:focus { border-color:var(--accent); color:var(--fg); }
 .model-grid { display:grid; grid-template-columns:1fr 120px 1fr; gap:8px; }
 .model-grid2 { display:grid; grid-template-columns:1fr 1fr auto auto; gap:8px; margin-top:8px;
                align-items:end; }
 .field input, .field select { width:100%; background:var(--bg); border:1px solid var(--line);
-         border-radius:8px; color:var(--fg); padding:7px 10px; font-size:12.5px; outline:none; }
-.field input:focus, .field select:focus { border-color:#3d3d3d; }
+         border-radius:8px; color:var(--fg); padding:7px 10px; font-size:12.5px; outline:none;
+         transition:border-color .15s, box-shadow .15s; }
+.field input:focus, .field select:focus { border-color:var(--accent); box-shadow:var(--ring); }
 .field label { display:block; color:var(--faint); font-size:10.5px; margin-bottom:4px;
                letter-spacing:.06em; }
 .radio-default { display:flex; align-items:center; gap:6px; color:var(--dim);
@@ -1151,14 +2379,15 @@ body.panel-hidden aside.right { display:none; }
 .radio-default input { accent-color: var(--accent); }
 .icon-btn { background:transparent; border:1px solid var(--line); color:var(--dim);
             border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer; }
-.icon-btn:hover { color:var(--err); border-color:rgba(224,122,108,.4); }
+.icon-btn:hover { color:var(--err); border-color:rgba(239,123,109,.4); }
 .modal-footer { display:flex; align-items:center; gap:10px; margin-top:14px; }
-.primary { background:var(--accent); border:none; color:#fff; border-radius:10px;
-           padding:8px 22px; font-size:13px; cursor:pointer; }
-.primary:hover { opacity:.88; }
+.primary { background:var(--accent-grad); border:none; color:#fff; border-radius:10px;
+           padding:8px 22px; font-size:13px; font-weight:600; cursor:pointer;
+           box-shadow:var(--accent-glow); transition:filter .15s; }
+.primary:hover { filter:brightness(1.1); }
 .ghost { background:transparent; border:1px solid var(--line); color:var(--dim);
          border-radius:10px; padding:8px 18px; font-size:13px; cursor:pointer; }
-.ghost:hover { color:var(--fg); border-color:#3d3d3d; }
+.ghost:hover { color:var(--fg); border-color:var(--accent); }
 .plugin-row { display:flex; align-items:center; gap:10px; padding:11px 12px;
               border:1px solid var(--line-soft); background:var(--elev);
               border-radius:12px; margin:8px 0; }
@@ -1193,10 +2422,157 @@ body.panel-hidden aside.right { display:none; }
                      border-radius:999px; padding:2px 10px; font-size:10.5px;
                      white-space:nowrap; margin-top:2px; }
 .market-row .m-install { flex:none; margin-top:2px; }
-.market-row .m-install button { background:var(--accent); border:none; color:#fff;
+.market-row .m-install button { background:var(--accent-grad); border:none; color:#fff;
                                 border-radius:8px; padding:5px 14px; font-size:12px;
-                                cursor:pointer; }
+                                cursor:pointer; font-weight:600;
+                                box-shadow:var(--accent-glow); transition:filter .15s; }
+.market-row .m-install button:hover { filter:brightness(1.1); }
 .market-row .m-install button:disabled { opacity:.45; cursor:default; }
+
+/* ---------- 设置弹窗：左导航 + 右内容（对齐 WorkBuddy 风格） ---------- */
+/* 固定高度：所有设置页统一尺寸，切换标签时弹窗不再跳变；内容区自行滚动 */
+#modal.settings { width:min(880px, 94vw); height:min(720px, 88vh); max-height:88vh;
+                  flex-direction:row; position:relative; padding:0; }
+.set-close { position:absolute; top:10px; right:12px; z-index:2; border:none;
+             background:transparent; color:var(--dim); font-size:15px; cursor:pointer;
+             padding:6px 9px; border-radius:8px; }
+.set-close:hover { background:var(--hover); color:var(--fg); }
+.set-nav { width:176px; flex:none; border-right:1px solid var(--line-soft);
+           padding:14px 10px; overflow-y:auto; }
+.set-group { color:var(--faint); font-size:10.5px; letter-spacing:.08em;
+             padding:14px 12px 5px; }
+.set-group:first-child { padding-top:2px; }
+.set-nav-item { display:flex; align-items:center; gap:9px; width:100%; height:34px;
+                padding:0 12px; border:none; background:transparent; color:var(--dim);
+                font-size:13px; border-radius:10px; cursor:pointer; text-align:left;
+                transition:color .12s, background .12s; }
+.set-nav-item .ic { width:19px; text-align:center; flex:none; font-size:13px; }
+.set-nav-item:hover { background:var(--hover); color:var(--fg); }
+.set-nav-item.active { background:var(--accent-soft); color:var(--accent); }
+.set-content { flex:1; min-width:0; overflow-y:auto; padding:20px 22px; }
+.set-title { font-size:15px; font-weight:500; color:var(--fg); margin:0 0 10px; }
+.set-card { background:var(--elev); border:1px solid var(--line-soft);
+            border-radius:12px; padding:4px 16px; }
+.set-main { flex:1; min-width:0; }
+.set-main .name { font-size:13px; color:var(--fg); }
+.set-main .desc { font-size:11.5px; color:var(--faint); margin-top:2px; line-height:1.5; }
+
+/* 分段按钮 / 色板 / 开关行 */
+.set-h { color:var(--faint); font-size:11px; letter-spacing:.08em; margin:18px 0 8px; }
+.seg { display:flex; gap:8px; flex-wrap:wrap; }
+.seg button { border:1px solid var(--line); background:transparent; color:var(--dim);
+              border-radius:10px; padding:7px 14px; font-size:12.5px; cursor:pointer;
+              transition:color .12s, border-color .12s, background .12s; }
+.seg button:hover { color:var(--fg); }
+.seg button.sel { color:var(--accent); border-color:var(--accent); background:var(--accent-soft); }
+.swatches { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:4px 0 10px; }
+.swatch { width:34px; height:34px; border-radius:10px; cursor:pointer;
+          border:2px solid transparent; padding:0; }
+.swatch.sel { border-color:var(--fg); }
+.swatch:hover { transform:translateY(-1px); }
+.set-row { display:flex; align-items:center; gap:10px; padding:10px 0;
+           border-bottom:1px solid var(--line-soft); }
+.set-row:last-child { border-bottom:none; }
+.data-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.stat-cards { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
+.stat { flex:1; min-width:150px; background:var(--elev); border:1px solid var(--line-soft);
+        border-radius:12px; padding:10px 14px; }
+.stat .v { font-size:18px; font-weight:500; color:var(--fg); }
+.stat .l { font-size:11.5px; color:var(--faint); margin-top:2px; }
+
+/* ---------- 消息操作（复制 / 编辑 / 重新生成） ---------- */
+.msg-acts { display:flex; gap:6px; margin-top:5px; opacity:0; transition:opacity .15s; }
+.msg:hover .msg-acts { opacity:1; }
+.msg-act { border:1px solid var(--line); background:var(--elev); color:var(--dim);
+           border-radius:999px; font-size:11px; padding:2px 10px; cursor:pointer;
+           transition:color .12s, border-color .12s; }
+.msg-act:hover { color:var(--accent); border-color:var(--accent); }
+/* 搜索命中跳转时的高亮 */
+.msg.flash { animation:msgFlash 1.6s ease; border-radius:10px; }
+@keyframes msgFlash { 0%,55% { background:var(--accent-soft); } 100% { background:transparent; } }
+
+/* ---------- 会话置顶星标 ---------- */
+.s-row .pin { border:none; background:transparent; color:var(--faint); cursor:pointer;
+              font-size:12px; padding:0 2px; visibility:hidden; flex:none; }
+.s-row:hover .pin, .s-row .pin.on { visibility:visible; }
+.s-row .pin.on { color:var(--accent); }
+.s-row .pin:hover { color:var(--accent); }
+/* 会话完成标记（F8） */
+.s-row .row-done { border:none; background:transparent; color:var(--faint); cursor:pointer;
+                   font-size:12px; padding:0 2px; visibility:hidden; flex:none; }
+.s-row:hover .row-done, .s-row .row-done.on { visibility:visible; }
+.s-row .row-done.on { color:var(--ok); }
+.s-row.done .s-name { color:var(--faint); text-decoration:line-through; }
+
+/* ---------- 任务面板（TODO.md 渲染） ---------- */
+.todo-row { display:flex; align-items:baseline; gap:8px; padding:6px 4px;
+            border-bottom:1px solid var(--line-soft); font-size:12.5px; }
+.t-box { flex:none; width:14px; height:14px; border:1.5px solid var(--dim);
+         border-radius:4px; display:inline-flex; align-items:center;
+         justify-content:center; font-size:10px; color:#fff; }
+.t-doing-box { border-color:var(--accent); color:var(--accent); }
+.t-done-box { background:var(--ok); border-color:var(--ok); }
+.t-done .t-name { color:var(--faint); text-decoration:line-through; }
+.t-doing .t-name { color:var(--accent); }
+.todo-hint { color:var(--faint); font-size:11px; padding:2px 4px; white-space:pre-wrap; }
+
+/* ---------- 用量图表 ---------- */
+.chart-box { padding:10px 4px; }
+.chart-box svg { width:100%; height:auto; display:block; }
+.chart-legend { display:flex; gap:14px; align-items:center; color:var(--dim);
+                font-size:11.5px; margin:6px 4px; }
+.chart-legend i { display:inline-block; width:10px; height:3px; border-radius:2px;
+                  margin-right:4px; vertical-align:middle; background:var(--accent); }
+
+/* ---------- 浏览器标签多开 ---------- */
+.br-tabs { display:flex; align-items:center; gap:4px; padding:6px 10px 0;
+           overflow-x:auto; scrollbar-width:none; }
+.br-tabs::-webkit-scrollbar { display:none; }
+.br-tab { display:flex; align-items:center; gap:6px; border:1px solid var(--line-soft);
+          background:var(--elev); color:var(--dim); font-size:11.5px; padding:4px 10px;
+          border-radius:8px 8px 0 0; cursor:pointer; max-width:150px; flex:none; }
+.br-tab.active { color:var(--fg); border-color:var(--line); background:var(--panel); }
+.br-tab .bt-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.br-tab .bt-x { color:var(--faint); padding:0 1px; }
+.br-tab .bt-x:hover { color:var(--err); }
+.br-add { border:none; background:transparent; color:var(--dim); font-size:13px;
+          cursor:pointer; flex:none; padding:2px 8px; }
+.br-add:hover { color:var(--accent); }
+.br-frames { flex:1; position:relative; min-height:0; }
+.br-frames iframe { position:absolute; inset:0; width:100%; height:100%; border:none;
+                    background:var(--bg); display:none; }
+.br-frames iframe.on { display:block; }
+
+/* ---------- 图片预览（点击 chips 放大） ---------- */
+#lightbox { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+            background:rgba(6,8,18,.72); z-index:40; cursor:zoom-out; }
+#lightbox.on { display:flex; }
+#lightbox img { max-width:92%; max-height:92%; border-radius:12px;
+                box-shadow:var(--shadow-lg); background:var(--panel); }
+/* 键盘按键样式（通用页快捷键说明） */
+.kbd { border:1px solid var(--line); background:var(--bg); color:var(--dim);
+       border-radius:6px; padding:2px 8px; font-size:11px;
+       font-family:Consolas,monospace; white-space:nowrap; }
+
+/* ---------- 轻提示（toast）：操作反馈不再写进消息会话 ---------- */
+#toast { position:fixed; top:14px; left:50%; transform:translateX(-50%) translateY(-8px);
+         z-index:50; display:flex; flex-direction:column; gap:6px; align-items:center;
+         pointer-events:none; opacity:0; transition:opacity .18s, transform .18s; }
+#toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+#toast .t-item { background:var(--panel); border:1px solid var(--line);
+                 border-left:3px solid var(--accent); color:var(--fg);
+                 border-radius:10px; padding:8px 16px; font-size:12.5px;
+                 box-shadow:var(--shadow-lg); max-width:70vw;
+                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#toast .t-item.err { border-left-color:var(--err); }
+
+/* ---------- 拖拽文件入窗 ---------- */
+#dropMask { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+            background:rgba(6,8,18,.5); z-index:30; pointer-events:none;
+            color:#fff; font-size:15px; letter-spacing:.04em; }
+#dropMask .dm-card { background:var(--panel); border:1px solid var(--accent);
+                     border-radius:14px; padding:18px 30px; box-shadow:var(--shadow-lg); }
+body.dragging #dropMask { display:flex; }
 </style></head><body>
 <div class="app">
   <aside>
@@ -1206,14 +2582,14 @@ body.panel-hidden aside.right { display:none; }
     </div>
     <button class="new-btn" onclick="newSessionFlow()">＋ 新会话</button>
     <div class="side-label">项目</div>
+    <div class="side-filter"><input id="sessionFilter" placeholder="🔍 过滤会话…" spellcheck="false"></div>
     <div id="wsTree" class="side-list"></div>
     <div class="side-bottom">
-      <button class="side-action" id="themeBtn" onclick="cycleTheme()" title="切换外观">🌙 外观: 深色</button>
-      <button class="side-action" id="panelToggle" onclick="togglePanel()" title="显示/隐藏右侧面板">◧ 面板</button>
-      <button class="side-action" onclick="openSettings()">⚙ 模型与插件</button>
+      <button class="side-action" onclick="openSettings()" title="外观 / 模型 / 插件 / 技能 / 用量">⚙ 设置</button>
       <div class="side-hint" id="statusHint"></div>
     </div>
   </aside>
+  <div class="side-resize" id="sideResize" title="拖动调整侧栏宽度"></div>
   <main>
     <div id="hero">
       <div class="glyph">卅</div>
@@ -1226,6 +2602,7 @@ body.panel-hidden aside.right { display:none; }
         <button id="wsBtn" onclick="toggleWsMenu(event)">
           📁 <span class="ws-cur" id="wsCur">选择工作区</span><span>▾</span>
         </button>
+        <button class="ws-close" onclick="dismissWsBar()" title="隐藏工作区选择（可在左侧「📁 工作区」找回）">✕</button>
         <div id="wsMenu"></div>
       </div>
       <div class="composer">
@@ -1233,12 +2610,16 @@ body.panel-hidden aside.right { display:none; }
           placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行，可粘贴图片路径附加）"></textarea>
         <div id="imgChips" style="display:none;flex-wrap:wrap;gap:6px;padding:0 10px;"></div>
         <div class="composer-row">
+          <button id="sideBtn" title="显示/隐藏左侧栏" onclick="toggleSide()">◧ 侧栏</button>
           <button id="permBadge" class="badge" title="执行权限" onclick="togglePermMenu()"></button>
           <span class="flex1"></span>
+          <button id="snipBtn" title="快捷指令（常用提示词片段，一键插入）" onclick="snipMenu()">⚡</button>
           <button id="imgBtn" title="附加图片（或直接粘贴图片路径）" onclick="attachImage()">📎</button>
           <button id="ctxBtn" title="上下文占用" onclick="toggleCtxCard()">…</button>
+          <button id="planBtn" title="计划模式：实现类任务先出计划，确认后再动手" onclick="togglePlanMode()">📋 计划</button>
           <select id="thinkSel" title="思考级别（映射 reasoning_effort）"></select>
           <select id="modelSel" title="当前模型"></select>
+          <span id="queueBadge" class="q-badge" style="display:none" title="本轮回答完成后将自动依次发送这些消息"></span>
           <button id="send" class="send" onclick="send()">↑</button>
         </div>
         <div id="permMenu" class="perm-menu">
@@ -1250,20 +2631,22 @@ body.panel-hidden aside.right { display:none; }
           <button data-kind="fs" data-mode="ask" onclick="pickPerm('fs','ask')">💬 每次询问</button>
           <button data-kind="fs" data-mode="allow" onclick="pickPerm('fs','allow')">✅ 允许写入</button>
           <button data-kind="fs" data-mode="deny" onclick="pickPerm('fs','deny')">🚫 禁止写入</button>
+          <h5>GIT 提交</h5>
+          <button data-kind="git" data-mode="ask" onclick="pickPerm('git','ask')">💬 每次询问</button>
+          <button data-kind="git" data-mode="allow" onclick="pickPerm('git','allow')">✅ 允许提交</button>
+          <button data-kind="git" data-mode="deny" onclick="pickPerm('git','deny')">🚫 禁止 git</button>
         </div>
         <div id="ctxCard"></div>
       </div>
     </div>
     <div class="composer-foot"><div id="usageLine"></div></div>
   </main>
+  <div class="rp-resize" id="rpResize" title="拖动调整右侧面板宽度"></div>
   <aside class="right" id="rightPanel">
     <div class="rp-tabs">
-      <button class="rp-tab active" data-rp="aux" onclick="switchPanel('aux')">💬 辅助</button>
-      <button class="rp-tab" data-rp="ws" onclick="switchPanel('ws')">📁 工作区</button>
-      <button class="rp-tab" data-rp="term" onclick="switchPanel('term')">⌨ 终端</button>
-      <button class="rp-tab" data-rp="browser" onclick="switchPanel('browser')">🌐 浏览器</button>
-      <button class="rp-tab" data-rp="review" onclick="switchPanel('review')">🔍 审查</button>
+      <span id="rpTabsBox" style="display:contents"></span>
       <button class="rp-close" onclick="togglePanel()" title="收起面板">✕</button>
+      <div id="tabMenu" title=""></div>
     </div>
 
     <div class="rp-body active" id="rp-aux">
@@ -1282,6 +2665,42 @@ body.panel-hidden aside.right { display:none; }
         <button class="mini-btn" onclick="loadWsTree()">⟳</button>
       </div>
       <div class="rp-pane" id="wsTreePane"></div>
+      <div class="fp" id="filePreview"></div>
+    </div>
+
+    <div class="rp-body" id="rp-kb">
+      <div class="rp-pane" id="kbPane"><div class="hint">加载中…</div></div>
+      <div class="term-row">
+        <button class="mini-btn" onclick="kbPickIndex()" title="选择一个文件夹，把其中的文本文件索引进知识库">📂 索引文件夹…</button>
+        <button class="mini-btn" onclick="kbClear()">🗑 清空</button>
+        <span class="flex1"></span>
+        <button class="mini-btn" onclick="loadKnowledge()">⟳</button>
+      </div>
+    </div>
+
+    <div class="rp-body" id="rp-todo">
+      <div class="ws-nav">
+        <span class="crumb">工作区 TODO.md（任务状态索引）</span>
+        <button class="mini-btn" onclick="loadTodoPanel()">⟳</button>
+      </div>
+      <div class="rp-pane" id="todoPane"><div class="hint">切换到此标签页时自动加载。</div></div>
+      <div class="term-row"><span class="hint" style="padding:0 12px">由 agent 的 todo_write 维护；你也可以直接编辑 TODO.md。</span></div>
+    </div>
+
+    <div class="rp-body" id="rp-sub">
+      <div class="ws-nav">
+        <span class="crumb">子 agent 调用记录（最新在前）</span>
+        <button class="mini-btn" onclick="loadSubagents()">⟳</button>
+      </div>
+      <div class="rp-pane" id="subPane"><div class="hint">切换到此标签页时自动加载。</div></div>
+    </div>
+
+    <div class="rp-body" id="rp-usage">
+      <div class="ws-nav">
+        <span class="crumb">Token 用量（近 30 天，按天聚合）</span>
+        <button class="mini-btn" onclick="loadUsageChart()">⟳</button>
+      </div>
+      <div class="rp-pane" id="usagePane"><div class="hint">切换到此标签页时自动加载。</div></div>
     </div>
 
     <div class="rp-body" id="rp-term">
@@ -1293,19 +2712,29 @@ body.panel-hidden aside.right { display:none; }
     </div>
 
     <div class="rp-body" id="rp-browser">
+      <div class="br-tabs" id="brTabs"></div>
       <div class="br-bar">
         <input id="brUrl" placeholder="输入网址，如 https://example.com">
         <button class="mini-btn" onclick="brGo()">打开</button>
         <button class="mini-btn" onclick="brExternal()">系统浏览器</button>
       </div>
-      <iframe id="browserFrame" src="about:blank"></iframe>
-      <div class="aux-hint" style="padding-top:6px">部分站点（如 GitHub）禁止内嵌，请用「系统浏览器」打开。</div>
+      <div class="br-frames" id="brFrames">
+        <div class="br-empty" id="brEmpty">
+          <span class="br-glyph">🌐</span>
+          <span>在上方输入网址后打开；部分站点（如 GitHub）禁止内嵌，请用「系统浏览器」。<br>支持多标签页：点「＋」新开一个。</span>
+        </div>
+      </div>
     </div>
 
     <div class="rp-body" id="rp-review">
       <div class="ws-nav">
         <span class="crumb">工作区改动（git status + diff）</span>
         <button class="mini-btn" onclick="loadReview()">⟳ 生成</button>
+      </div>
+      <div class="git-remote">
+        <input id="gitRemoteUrl" placeholder="远程仓库地址（origin），如 https://github.com/user/repo.git">
+        <button class="mini-btn" onclick="saveGitRemote()">保存</button>
+        <button class="mini-btn" onclick="pushNow()">⇅ 推送</button>
       </div>
       <pre class="review-out" id="reviewOut">点击右上角「生成」查看当前工作区的未提交改动。</pre>
     </div>
@@ -1316,8 +2745,9 @@ body.panel-hidden aside.right { display:none; }
   <div id="dlg">
     <h3 id="dlgTitle"></h3>
     <div class="msg-text" id="dlgMsg"></div>
+    <div id="dlgChoose" style="display:none"></div>
     <input id="dlgInput" style="display:none">
-    <div class="dlg-row">
+    <div class="dlg-row" id="dlgRow">
       <button class="ghost" id="dlgCancel">取消</button>
       <button class="primary" id="dlgOk">确定</button>
     </div>
@@ -1325,17 +2755,23 @@ body.panel-hidden aside.right { display:none; }
 </div>
 
 <div id="overlay">
-  <div id="modal">
-    <div class="tabs">
-      <button class="tab active" data-tab="models" onclick="switchTab('models')">模型</button>
-      <button class="tab" data-tab="plugins" onclick="switchTab('plugins')">插件</button>
-      <button class="tab" data-tab="skills" onclick="switchTab('skills')">技能</button>
-      <button class="tab" data-tab="market" onclick="switchTab('market')">市场</button>
-      <button class="close" onclick="closeSettings()">✕</button>
+  <div id="modal" class="settings">
+    <button class="set-close" onclick="closeSettings()" title="关闭设置">✕</button>
+    <div class="set-nav">
+      <div class="set-group">能力</div>
+      <button class="set-nav-item active" data-set="models" onclick="switchTab('models')"><span class="ic">🧩</span>模型</button>
+      <button class="set-nav-item" data-set="plugins" onclick="switchTab('plugins')"><span class="ic">🔌</span>插件</button>
+      <button class="set-nav-item" data-set="skills" onclick="switchTab('skills')"><span class="ic">📚</span>技能</button>
+      <button class="set-nav-item" data-set="market" onclick="switchTab('market')"><span class="ic">🛒</span>市场</button>
+      <div class="set-group">界面</div>
+      <button class="set-nav-item" data-set="appearance" onclick="switchTab('appearance')"><span class="ic">🎨</span>外观</button>
+      <button class="set-nav-item" data-set="general" onclick="switchTab('general')"><span class="ic">⚙</span>通用</button>
+      <button class="set-nav-item" data-set="usage" onclick="switchTab('usage')"><span class="ic">📈</span>用量</button>
     </div>
-    <div class="tab-body">
+    <div class="set-content">
       <div id="tab-models">
-        <div class="hint">至少填写 名称 / 模型 / API Key；provider 仅支持 openai / anthropic。保存后立即生效，无需重启。</div>
+        <div class="set-title">模型</div>
+        <div class="hint">至少填写 名称 / 模型 / API Key（或选「提供商预设」只填 Key）；provider 仅支持 openai / anthropic。保存后立即生效，无需重启。</div>
         <div id="cards"></div>
         <div class="modal-footer">
           <button class="ghost" onclick="addCard()">＋ 添加模型</button>
@@ -1345,6 +2781,7 @@ body.panel-hidden aside.right { display:none; }
         </div>
       </div>
       <div id="tab-plugins" style="display:none">
+        <div class="set-title">插件</div>
         <div class="hint">插件目录需含 plugin.json 与 register.py。输入本地路径即可安装；点击条目右侧移除。</div>
         <div id="pluginCards"></div>
         <div class="install-row">
@@ -1354,6 +2791,7 @@ body.panel-hidden aside.right { display:none; }
         <div class="modal-footer"><span id="pluginNote"></span></div>
       </div>
       <div id="tab-skills" style="display:none">
+        <div class="set-title">技能</div>
         <div class="hint">技能即 SKILL.md（Agent Skills 通用格式）：模型按需加载全文。
           插件自带的技能只读；安装到 profile 的技能可以移除。</div>
         <div id="skillCards"></div>
@@ -1364,6 +2802,7 @@ body.panel-hidden aside.right { display:none; }
         <div class="modal-footer"><span id="skillNote"></span></div>
       </div>
       <div id="tab-market" style="display:none">
+        <div class="set-title">市场</div>
         <div class="hint">插件市场来自 <b>awesome-dsh-plugin</b> 社区精选目录（DeepSeek Harness 生态）。
           安装即浅克隆仓库到当前 profile：原生格式（plugin.json + register.py）完整生效；
           dsh 的 npm/TS 插件只能识别其中的技能 / MCP / 配置等声明层，代码体无法执行，结果以插件列表为准。</div>
@@ -1375,16 +2814,102 @@ body.panel-hidden aside.right { display:none; }
         <div id="marketList" style="max-height:46vh; overflow-y:auto;"></div>
         <div class="modal-footer"><span id="marketNote"></span></div>
       </div>
+      <div id="tab-appearance" style="display:none">
+        <div class="set-title">外观</div>
+        <div class="hint">主题、强调色与字体，更改即时生效并自动保存到当前 profile。</div>
+        <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">外观主题</div>
+              <div class="desc">深色 / 浅色 / 跟随系统</div></div>
+            <div class="seg" id="themeSeg">
+              <button onclick="pickTheme('dark')">🌙 深色</button>
+              <button onclick="pickTheme('light')">☀️ 浅色</button>
+              <button onclick="pickTheme('system')">💻 跟随系统</button>
+            </div>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">强调色</div>
+              <div class="desc">预设色板或自定义 #RRGGBB</div></div>
+          </div>
+          <div class="swatches" id="swatches"></div>
+          <div class="install-row">
+            <input id="accentInput" placeholder="自定义强调色 #RRGGBB，如 #e5588a">
+            <button class="ghost" onclick="applyCustomAccent()">应用</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">界面字体</div>
+              <div class="desc">填系统已安装的字体名，留空恢复默认</div></div>
+          </div>
+          <div class="install-row">
+            <input id="fontInput" placeholder="如 微软雅黑 / Consolas">
+            <button class="ghost" onclick="applyCustomFont()">应用</button>
+          </div>
+        </div>
+        <div class="modal-footer"><span id="appearanceNote"></span></div>
+      </div>
+      <div id="tab-general" style="display:none">
+        <div class="set-title">通用</div>
+        <div class="hint">界面开关与数据管理；更改即时生效。</div>
+        <div class="set-card"><div id="generalToggles"></div></div>
+        <div class="set-h">快捷键</div>
+        <div class="set-card">
+          <div class="set-row"><div class="set-main"><div class="name">新会话</div></div><span class="kbd">Ctrl+N</span></div>
+          <div class="set-row"><div class="set-main"><div class="name">搜索会话</div></div><span class="kbd">Ctrl+F</span></div>
+          <div class="set-row"><div class="set-main"><div class="name">打开设置</div></div><span class="kbd">Ctrl+,</span></div>
+          <div class="set-row"><div class="set-main"><div class="name">显示 / 隐藏左侧栏</div></div><span class="kbd">Ctrl+B</span></div>
+          <div class="set-row"><div class="set-main"><div class="name">显示 / 隐藏右侧面板</div></div><span class="kbd">Ctrl+J</span></div>
+        </div>
+        <div class="set-h">数据</div>
+        <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">搜索会话</div>
+              <div class="desc">按关键词搜索全部历史并跳转高亮</div></div>
+            <button class="msg-act" onclick="settingsSearch()">🔍 搜索</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">导出当前会话</div>
+              <div class="desc">存为 Markdown 到 &lt;工作区&gt;/exports</div></div>
+            <button class="msg-act" onclick="settingsExport(false)">📤 导出</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">导出全部会话</div>
+              <div class="desc">每会话一个 Markdown + 目录，打包 zip</div></div>
+            <button class="msg-act" onclick="settingsExport(true)">🗂 打包</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">Git 远程仓库</div>
+              <div class="desc">配置 origin（提交/推送的目标仓库）；提交与推送由你手动执行</div></div>
+            <button class="msg-act" onclick="gotoReview()">🐙 配置</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">初始化工程（Bootstrap）</div>
+              <div class="desc">目录规范 + .gitignore + git 基线提交；带目标时让 agent 生成 TODO.md</div></div>
+            <button class="msg-act" onclick="bootstrapFlow()">🚀 开始</button>
+          </div>
+        </div>
+        <div class="modal-footer"><span id="generalNote"></span></div>
+      </div>
+      <div id="tab-usage" style="display:none">
+        <div class="set-title">用量</div>
+        <div class="hint">Token 用量统计（数据来自 profile 的 usage.jsonl，每轮对话一条记录）。</div>
+        <div class="stat-cards" id="usageStats"></div>
+        <div class="set-h">近 30 天 tokens 折线</div>
+        <div id="usageChartHolder"></div>
+      </div>
     </div>
   </div>
 </div>
+
+<div id="lightbox"><img id="lightboxImg" alt=""></div>
+<div id="toast"></div>
+<div id="dropMask"><div class="dm-card">松开以添加文件（图片 → 附加发送；文本 → 插入输入框）</div></div>
 
 <script>
 const api = () => window.pywebview.api;
 const $ = (id) => document.getElementById(id);
 let currentSession = 'default';
 let currentModel = '';
-let perms = { shell: 'ask', fs: 'allow' };
+let perms = { shell: 'ask', fs: 'allow', git: 'ask' };
 const PERM_TEXT = { ask: '需确认', allow: '允许', deny: '禁止' };
 
 function esc(s) {
@@ -1394,19 +2919,103 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+
+/* ---------- 轻提示 toast：操作反馈浮层，2.6s 自动消失，不进消息会话 ---------- */
+function toast(msg, err) {
+  const box = $('toast');
+  const item = document.createElement('div');
+  item.className = 't-item' + (err ? ' err' : '');
+  item.textContent = String(msg == null ? '' : msg);
+  box.appendChild(item);
+  box.classList.add('show');
+  setTimeout(() => {
+    item.remove();
+    if (!box.children.length) box.classList.remove('show');
+  }, 2600);
+}
+function mdInline(text) {
+  // 行内格式（输入已转义、行内代码已占位）：
+  // 先 ***x***，再 **x**，最后 *x*（斜体），避免互相错切
+  text = text.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<span class="bold">$1</span>');
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '<span class="bold">$1</span>');
+  text = text.replace(/(^|[^*\\])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  // 链接：仅 http(s)，防 javascript: 注入
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return text;
+}
 function md(text) {
-  let html = esc(text);
-  // 先把 code 段替换成占位符，避免其内容被后续粗体规则波及（P2 #6）
+  let src = String(text == null ? '' : text);
+  // 1. 围栏代码块（```lang ... ```）先摘出来，避免其内容被行级规则波及
+  const fences = [];
+  src = src.replace(/```([^\n]*)\n?([\s\S]*?)(?:```|$)/g, (m, lang, code) => {
+    fences.push('<pre class="fence">' + esc(code.replace(/\n$/, '')) + '</pre>');
+    return '\u0001' + (fences.length - 1) + '\u0001';
+  });
+  // 2. 行内代码占位（P2 #6）
   const codes = [];
-  html = html.replace(/`([^`\n]+)`/g, (m, c) => {
+  src = src.replace(/`([^`\n]+)`/g, (m, c) => {
     codes.push(c);
     return '\u0000' + (codes.length - 1) + '\u0000';
   });
-  // 先匹配 ***x***（三级星号），再匹配 **x**，避免 ***粗体*** 被错切
-  html = html.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<span class="bold">$1</span>');
-  html = html.replace(/\*\*([^*\n]+)\*\*/g, '<span class="bold">$1</span>');
-  html = html.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + codes[Number(i)] + '</code>');
+  // 3. 其余内容整体转义
+  src = esc(src);
+  // 4. 行级分块：标题 / 列表 / 引用 / 分隔线 / 段落
+  const out = [];
+  let list = null;             // 'ul' | 'ol' | null
+  let quote = false;
+  let para = [];
+  const closeList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+  const closeQuote = () => { if (quote) { out.push('</blockquote>'); quote = false; } };
+  const closePara = () => {
+    if (para.length) {
+      out.push('<p>' + para.map(mdInline).join('<br>') + '</p>');
+      para = [];
+    }
+  };
+  const closeAll = () => { closePara(); closeList(); closeQuote(); };
+  for (const raw of src.split('\n')) {
+    const line = raw;        // 已转义；&gt; 即原文的 >
+    const fence = line.trim().match(/^\u0001(\d+)\u0001$/);
+    if (fence) { closeAll(); out.push(fenceHtml(fences, fence[1])); continue; }
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { closeAll(); out.push('<hr>'); continue; }
+    const h = line.match(/^(#{1,4})\s+(.+?)\s*#*$/);
+    if (h) { closeAll(); out.push('<div class="md-h md-h' + h[1].length + '">' + mdInline(h[2]) + '</div>'); continue; }
+    const ul = line.match(/^\s*[-*•]\s+(.*)$/);
+    const ol = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
+    if (ul) {
+      closePara(); closeQuote();
+      if (list !== 'ul') { closeList(); out.push('<ul>'); list = 'ul'; }
+      out.push('<li>' + mdInline(ul[1]) + '</li>');
+      continue;
+    }
+    if (ol) {
+      closePara(); closeQuote();
+      if (list !== 'ol') { closeList(); out.push('<ol>'); list = 'ol'; }
+      out.push('<li>' + mdInline(ol[2]) + '</li>');
+      continue;
+    }
+    const q = line.match(/^\s*&gt;\s?(.*)$/);
+    if (q) {
+      closePara(); closeList();
+      if (!quote) { out.push('<blockquote>'); quote = true; }
+      out.push('<div>' + mdInline(q[1]) + '</div>');
+      continue;
+    }
+    if (!line.trim()) { closeAll(); continue; }
+    closeList(); closeQuote();
+    para.push(line);
+  }
+  closeAll();
+  let html = out.join('\n');
+  // 兜底：不在独立行上的围栏占位符也还原（避免控制字符露出）
+  html = html.replace(/\u0001(\d+)\u0001/g, (m, i) => fenceHtml(fences, i));
+  // 5. 还原行内代码（内容需再次转义）
+  html = html.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + esc(codes[Number(i)]) + '</code>');
   return html;
+}
+function fenceHtml(fences, idx) {
+  return fences[Number(idx)] || '';
 }
 function fmtTokens(n) {
   n = Number(n) || 0;
@@ -1428,6 +3037,8 @@ function showDialog(opts) {
   $('dlgTitle').textContent = opts.title || '';
   $('dlgMsg').textContent = opts.message || '';
   $('dlgMsg').style.display = opts.message ? '' : 'none';
+  $('dlgChoose').style.display = 'none';  // 列表对话框与输入/确认互斥，防叠层
+  $('dlgRow').style.display = '';
   const input = $('dlgInput');
   input.style.display = opts.input ? '' : 'none';
   input.value = opts.value || '';
@@ -1438,6 +3049,7 @@ function showDialog(opts) {
 }
 function _closeDialog(value) {
   $('dlgOverlay').style.display = 'none';
+  $('dlgChoose').style.display = 'none';
   window.__dialogResult = value;
 }
 // 取消必须是可区分的 false 而非 null：null 在 Python 侧等于「未响应」，
@@ -1455,7 +3067,53 @@ function dialogPrompt(title, value) {
         clearInterval(timer);
         const v = window.__dialogResult;
         window.__dialogResult = null;
-        resolve(v);
+        // 取消返回 null（与「确定但留空」的 "" 区分开）——
+        // 此前取消返回 false，newSessionFlow 的 `=== null` 判断挡不住，
+        // 导致每次点取消都新建出一个 s-... 裸名会话
+        resolve(v === false ? null : v);
+      }
+    }, 100);
+  });
+}
+function dialogConfirm(title, message, confirmText) {
+  showDialog({ title, message, confirmText: confirmText || '删除' });
+  return new Promise(resolve => {
+    const timer = setInterval(() => {
+      if (window.__dialogResult !== null) {
+        clearInterval(timer);
+        const v = window.__dialogResult;
+        window.__dialogResult = null;
+        resolve(v === true);
+      }
+    }, 100);
+  });
+}
+function dialogChoose(title, options) {
+  // 列表选择对话框：options = [{value, label, sub?}]；取消返回 null
+  const list = $('dlgChoose');
+  list.innerHTML = '';
+  for (const opt of options) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'choose-item';
+    btn.innerHTML = '<span class="choose-label">' + esc(opt.label) + '</span>' +
+      (opt.sub ? '<span class="choose-sub">' + esc(opt.sub) + '</span>' : '');
+    btn.onclick = () => _closeDialog(opt.value);
+    list.appendChild(btn);
+  }
+  $('dlgTitle').textContent = title || '';
+  $('dlgMsg').style.display = 'none';
+  $('dlgInput').style.display = 'none';
+  $('dlgRow').style.display = 'none';  // 列表用条目直接确认，不要「确定」按钮
+  list.style.display = 'block';
+  $('dlgOverlay').style.display = 'flex';
+  return new Promise(resolve => {
+    const timer = setInterval(() => {
+      if (window.__dialogResult !== null) {
+        clearInterval(timer);
+        const v = window.__dialogResult;
+        window.__dialogResult = null;
+        resolve(v === false || v === true ? null : v);
       }
     }, 100);
   });
@@ -1463,51 +3121,50 @@ function dialogPrompt(title, value) {
 
 /* ---------- 主题 ---------- */
 let theme = 'system';
-const THEME_ICON = { dark: '🌙', light: '☀️', system: '💻' };
 const THEME_TEXT = { dark: '深色', light: '浅色', system: '跟随系统' };
 function applyTheme(mode) {
   theme = mode;
   document.documentElement.dataset.theme = mode;
-  $('themeBtn').textContent = THEME_ICON[mode] + ' 外观: ' + THEME_TEXT[mode];
-}
-async function cycleTheme() {
-  const order = ['dark', 'light', 'system'];
-  const next = order[(order.indexOf(theme) + 1) % order.length];
-  applyTheme(next);
-  await api().set_theme(next);
 }
 
 /* ---------- 消息渲染 ---------- */
-function copyText(text, btn) {
-  const done = () => { btn.textContent = '已复制'; setTimeout(() => btn.textContent = '复制', 1200); };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
-  } else fallbackCopy(text, done);
-}
-function fallbackCopy(text, done) {
-  const ta = document.createElement('textarea');
-  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-  document.body.appendChild(ta); ta.select();
-  try { document.execCommand('copy'); done(); } catch (e) {}
-  ta.remove();
-}
 
-function add(text, cls, meta, reasoning) {
+function add(text, cls, meta, reasoning, hi, tools) {
   $('hero').style.display = 'none';
+  text = (text == null ? '' : String(text));
   const div = document.createElement('div');
   div.className = 'msg ' + cls;
+  if (typeof hi === 'number') div.dataset.hi = String(hi);  // 搜索跳转定位用
   if (cls === 'user') {
-    div.textContent = text;
+    div.textContent = text || '（空）';
   } else {
     if (reasoning) {
+      // 「思考关」只是请求不思考；服务商忽略开关返回的内容照常折叠展示
       const rd = document.createElement('div');
       rd.className = 'reasoning';
-      rd.innerHTML = '<div class="r-head">🧠 已深度思考 · 点击展开/折叠</div><div class="r-body"></div>';
+      const rounds = lastRounds > 1 ? '（' + lastRounds + ' 轮）' : '';
+      rd.innerHTML = '<div class="r-head"><span class="r-caret">▶</span><span>🧠</span>' +
+        '<span class="r-title">已深度思考' + rounds + ' · 展开查看</span></div>' +
+        '<div class="r-body"></div>';
       rd.querySelector('.r-body').textContent = reasoning;
       rd.querySelector('.r-head').onclick = () => rd.classList.toggle('open');
       div.appendChild(rd);
     }
+    // 工具调用区块：写在正式回复正文里（不再只藏在思考块中）
+    if (tools && tools.length) {
+      const log = document.createElement('div');
+      log.className = 'tool-log';
+      for (const t of tools) {
+        const row = document.createElement('div');
+        row.className = 'tool-row';
+        row.innerHTML = '<span class="tl-name">🔧 ' + esc(t.name || '?') + '</span>' +
+          (t.detail ? '<span class="tl-detail">' + esc(t.detail) + '</span>' : '');
+        log.appendChild(row);
+      }
+      div.appendChild(log);
+    }
     const body = document.createElement('div');
+    body.className = 'md-body';
     body.innerHTML = md(text);
     div.appendChild(body);
   }
@@ -1522,22 +3179,193 @@ function add(text, cls, meta, reasoning) {
     }
     div.appendChild(m);
   }
+  // 消息操作条：bot 消息可重新生成（仅最后一条可见）；用户消息无操作按钮
+  // （原「复制」「✎ 编辑」按钮已按用户要求先后移除——选中文本即可复制）
+  if (cls !== 'user') {
+    const acts = document.createElement('div');
+    acts.className = 'msg-acts';
+    const rg = document.createElement('button');
+    rg.className = 'msg-act msg-regen'; rg.textContent = '↻ 重新生成';
+    rg.onclick = regenerateLast;
+    acts.appendChild(rg);
+    div.appendChild(acts);
+  }
   $('thread').appendChild(div);
   $('log').scrollTop = $('log').scrollHeight;
+  updateRegenVisibility();
   return div;
+}
+
+function updateRegenVisibility() {
+  // 「重新生成」只对最后一条 bot 消息可见（它的语义是重跑最后一轮）
+  const bots = document.querySelectorAll('#thread .msg.bot');
+  const last = bots.length ? bots[bots.length - 1] : null;
+  document.querySelectorAll('#thread .msg-regen').forEach(b => {
+    b.style.display = (b.closest('.msg') === last) ? '' : 'none';
+  });
+}
+
+/* ---------- 重新生成 ---------- */
+async function regenerateLast() {
+  const ok = await dialogConfirm('重新生成',
+    '将丢弃最后一条回复及其后的内容并重新生成，继续？');
+  if (!ok) return;
+  showLiveBlock(); setBusy(true);
+  const r = await api().regenerate_last();
+  removeLiveBlock(); setBusy(false);
+  if (!r.ok) { add(r.error || '未知错误', 'bot error'); return; }
+  await selectSession(currentSession);
+  notifyDone();
 }
 
 function showHeroIfEmpty() {
   const empty = !$('thread').children.length;
   $('hero').style.display = empty ? 'flex' : 'none';
-  $('wsBar').style.display = empty ? 'flex' : 'none';  // 新会话时才显示工作区选择（对齐 dsh）
+  // 新会话时才显示工作区选择（对齐 dsh）；用户手动隐藏后不再自动弹出
+  $('wsBar').style.display = (empty && !wsBarDismissed) ? 'flex' : 'none';
 }
+
+/* ---------- 工作区选择条：隐藏 / 找回 ---------- */
+// pywebview 的 html= 模式下 localStorage 可能不可用，故用安全包装 + 后端 config 双通道
+let wsBarDismissed = false;
+
+function lsGet(key) {
+  try { return window.localStorage ? localStorage.getItem(key) : null; }
+  catch (err) { return null; }
+}
+function lsSet(key, val) {
+  try { if (window.localStorage) localStorage.setItem(key, val); } catch (err) { /* 忽略 */ }
+}
+let uiPrefs = {};   // 提示音 / 通知 / 强调色 / 字体（与面板宽度等一起持久化）
+
+function saveUiPrefs() {
+  const panel = $('rightPanel');
+  const side = document.querySelector('aside');
+  const prefs = {
+    wsbar_hidden: wsBarDismissed,
+    rp_width: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+    side_width: side && !sideHidden ? Math.round(side.getBoundingClientRect().width) : 0,
+    side_hidden: sideHidden,
+    rp_hidden: rpHidden,
+    rp_tab_order: rpTabOrder.slice(),
+    notify_sound: !!uiPrefs.notify_sound,
+    notify_desktop: !!uiPrefs.notify_desktop,
+    show_done: !!uiPrefs.show_done,
+    accent: uiPrefs.accent || '',
+    font: uiPrefs.font || '',
+  };
+  lsSet('sh_wsbar_hidden', wsBarDismissed ? '1' : '0');
+  lsSet('sh_rp_width', String(prefs.rp_width));
+  lsSet('sh_side_width', String(prefs.side_width));
+  lsSet('sh_accent', prefs.accent);
+  lsSet('sh_font', prefs.font);
+  if (window.pywebview && window.pywebview.api) {
+    window.pywebview.api.set_ui_prefs(prefs).catch(() => {});
+  }
+}
+function applyUiPrefs(prefs) {
+  if (!prefs) return;
+  if (typeof prefs.wsbar_hidden === 'boolean') wsBarDismissed = prefs.wsbar_hidden;
+  const apply = (el, w, lo, hi) => {
+    if (el && w >= lo && w <= hi) { el.style.width = w + 'px'; el.style.minWidth = w + 'px'; }
+  };
+  apply($('rightPanel'), parseInt(prefs.rp_width || '0', 10), 260, 900);
+  apply(document.querySelector('aside'), parseInt(prefs.side_width || '0', 10), 180, 460);
+  if (Array.isArray(prefs.rp_hidden)) rpHidden = prefs.rp_hidden.filter(n => typeof n === 'string');
+  if (Array.isArray(prefs.rp_tab_order) && prefs.rp_tab_order.length) {
+    // 标签页顺序持久化：只接受合法项，缺漏的按默认序补齐
+    const valid = prefs.rp_tab_order.filter(n => TAB_LABELS[n]);
+    for (const n of RP_TAB_ORDER_DEFAULT) {
+      if (!valid.includes(n)) valid.push(n);
+    }
+    rpTabOrder = valid;
+    renderTabs();
+  }
+  if (typeof prefs.side_hidden === 'boolean') toggleSide(prefs.side_hidden);
+  // 外观个性化：强调色 / 字体 / 完成提示音 / 窗口通知
+  uiPrefs = {
+    notify_sound: !!prefs.notify_sound,
+    notify_desktop: !!prefs.notify_desktop,
+    show_done: !!prefs.show_done,
+    accent: typeof prefs.accent === 'string' ? prefs.accent : '',
+    font: typeof prefs.font === 'string' ? prefs.font : '',
+  };
+  applyAccent(uiPrefs.accent);
+  applyFont(uiPrefs.font);
+  applyTabVisibility();
+  showHeroIfEmpty();
+}
+
+/* ---------- 左侧栏显隐 ---------- */
+let sideHidden = false;
+
+function toggleSide(force) {
+  sideHidden = typeof force === 'boolean' ? force : !sideHidden;
+  document.body.classList.toggle('side-hidden', sideHidden);
+  const b = $('sideBtn');
+  if (b) b.classList.toggle('off', sideHidden);
+  saveUiPrefs();
+}
+
+function dismissWsBar() {
+  wsBarDismissed = true;
+  $('wsBar').style.display = 'none';
+  saveUiPrefs();
+}
+function toggleWsBar() {
+  if (wsBarDismissed) {
+    wsBarDismissed = false;
+    showHeroIfEmpty();  // 空会话时重新显示
+    saveUiPrefs();
+  } else {
+    dismissWsBar();
+  }
+}
+
+/* ---------- 右侧面板宽度拖拽 ---------- */
+(function initPanelResize() {
+  const grip = $('rpResize');
+  const panel = $('rightPanel');
+  if (!grip || !panel) return;
+  let dragging = false, startX = 0, startW = 0;
+  grip.addEventListener('mousedown', (e) => {
+    dragging = true; startX = e.clientX;
+    startW = panel.getBoundingClientRect().width;
+    grip.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const max = Math.min(760, window.innerWidth - 380);
+    const w = Math.max(260, Math.min(max, startW + (startX - e.clientX)));
+    panel.style.width = w + 'px';
+    panel.style.minWidth = w + 'px';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    grip.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    saveUiPrefs();
+  });
+  // 先用 localStorage 快速恢复（避免等后端时闪一下）
+  const saved = parseInt(lsGet('sh_rp_width') || '0', 10);
+  if (saved >= 260 && saved <= 900) {
+    panel.style.width = saved + 'px';
+    panel.style.minWidth = saved + 'px';
+  }
+  if (lsGet('sh_wsbar_hidden') === '1') wsBarDismissed = true;
+})();
 
 /* ---------- 状态刷新 ---------- */
 async function refreshStatus() {
   const s = await api().status();
   currentModel = s.model || '';
-  perms = { shell: s.shell_permission || 'ask', fs: s.fs_permission || 'allow' };
+  perms = { shell: s.shell_permission || 'ask', fs: s.fs_permission || 'allow',
+            git: s.git_permission || 'ask' };
   renderPerm();
   const sel = $('modelSel');
   sel.innerHTML = '';
@@ -1556,6 +3384,7 @@ async function refreshStatus() {
     }
   }
   think.value = s.thinking_level || 'off';
+  $('planBtn').classList.toggle('on', !!s.plan_mode);
   if (s.theme) applyTheme(s.theme);
   $('statusHint').textContent = (s.models && s.models.length)
     ? '' : '尚未配置模型 —— 点「模型与插件」填入 API Key';
@@ -1609,17 +3438,82 @@ async function toggleCtxCard() {
       '<div class="ctx-rows">' + rows + '</div>' +
       '<div class="hint">按当前会话消息与工具定义估算，非精确值。</div>';
   }
+  // 完成提醒开关（提示音 / 窗口通知）常驻卡片底部
+  if ((s.percent || 0) >= 80) {
+    const warn = document.createElement('div');
+    warn.className = 'note-err';
+    warn.style.marginTop = '10px';
+    warn.textContent = '上下文水位已超过 80%，长任务建议无状态重置。';
+    card.appendChild(warn);
+  }
+  const notifyTitle = document.createElement('div');
+  notifyTitle.className = 'side-label';
+  notifyTitle.style.margin = '12px 0 2px';
+  notifyTitle.textContent = '完成提醒';
+  card.appendChild(notifyTitle);
+  const mkNotify = (label, key) => {
+    const row = document.createElement('div');
+    row.className = 'ctx-row';
+    const dot = document.createElement('span');
+    dot.className = 'dot' + (uiPrefs[key] ? '' : ' dim');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = label;
+    const btn = document.createElement('button');
+    btn.className = 'msg-act';
+    btn.textContent = uiPrefs[key] ? '已开启' : '已关闭';
+    btn.onclick = async () => {
+      await toggleNotify(key);
+      btn.textContent = uiPrefs[key] ? '已开启' : '已关闭';
+      dot.classList.toggle('dim', !uiPrefs[key]);
+    };
+    row.append(dot, name, btn);
+    return row;
+  };
+  card.appendChild(mkNotify('回复完成提示音', 'notify_sound'));
+  card.appendChild(mkNotify('窗口通知（最小化时）', 'notify_desktop'));
+  // 一键无状态重置（F6）：总结写回 TODO.md → 自动新会话
+  const resetRow = document.createElement('div');
+  resetRow.className = 'ctx-row';
+  const rname = document.createElement('span');
+  rname.className = 'name';
+  rname.textContent = '无状态重置（进展 → TODO.md → 新会话）';
+  const rbtn = document.createElement('button');
+  rbtn.className = 'msg-act';
+  rbtn.textContent = '⟳ 重置';
+  rbtn.onclick = () => { card.classList.remove('open'); statelessReset(); };
+  resetRow.append(rname, rbtn);
+  card.appendChild(resetRow);
   card.classList.add('open');
   $('permMenu').classList.remove('open');
 }
 
-/* ---------- Token 用量 ---------- */
+/* ---------- Token 用量（含缓存命中率） ---------- */
+function cachedOf(u) {
+  // 不同服务商的缓存命中字段位置不同，防御式提取
+  if (!u) return 0;
+  if (u.cached_tokens) return Number(u.cached_tokens) || 0;
+  if (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens)
+    return Number(u.prompt_tokens_details.cached_tokens) || 0;
+  return 0;
+}
+
 async function refreshUsage() {
   const res = await api().usage();
   const u = res.usage || {};
-  $('usageLine').textContent = (u.prompt_tokens || u.completion_tokens)
-    ? '累计输入 ' + fmtTokens(u.prompt_tokens) + ' · 输出 ' + fmtTokens(u.completion_tokens) + ' tokens'
-    : '';
+  const p = Number(u.prompt_tokens) || 0;
+  const c = Number(u.completion_tokens) || 0;
+  if (!p && !c) { $('usageLine').textContent = ''; return; }
+  let line = '输入 ' + fmtTokens(p) + ' · 输出 ' + fmtTokens(c) + ' tokens';
+  const cached = cachedOf(u);
+  if (cached && p) {
+    line += ' · 缓存命中 ' + Math.round(cached * 100 / p) + '%';
+  } else if (res.source === 'llm') {
+    // 真实用量帧（非估算）但服务商没报缓存命中：明确显示 0%，而不是藏起来
+    line += ' · 缓存命中 0%';
+  }
+  if (lastSpeed) line += ' · ' + lastSpeed + ' tok/s';
+  $('usageLine').textContent = line;
 }
 
 /* ---------- 侧栏（项目 → 会话，点击分组头收纳/展开） ---------- */
@@ -1633,17 +3527,32 @@ async function refreshSidebar() {
   const tree = $('wsTree');
   tree.innerHTML = '';
   const currentWs = wsRes.current || '';
+  // 侧栏会话过滤框：按名称/id 即时过滤，无匹配的工作区分组整组隐藏
+  const q = (($('sessionFilter') || {}).value || '').trim().toLowerCase();
+  let visible = q
+    ? sidebar.sessions.filter(s => (s.name + ' ' + s.id).toLowerCase().includes(q))
+    : sidebar.sessions;
+  if (!uiPrefs.show_done) {
+    // 已完成的会话默认隐藏（当前会话除外，避免切走后界面空掉）
+    visible = visible.filter(s => !s.done || s.id === currentSession);
+  }
+  let anyShown = false;
   for (const ws of sidebar.workspaces) {
+    const sessList = visible.filter(x => x.ws === ws.id);
+    if (q && !sessList.length) continue;
+    anyShown = true;
     const group = document.createElement('div');
     group.className = 'ws-group' + (collapsedWs.has(ws.id) ? ' collapsed' : '');
     const head = document.createElement('div');
-    head.className = 'ws-head';
-    head.title = '点击收纳/展开会话';
-    head.innerHTML = '<span class="ws-caret">▾</span><span>📁</span>' +
+    head.className = 'ws-head' + (ws.id === currentWs ? ' cur' : '');
+    head.title = '点击切换到此工作区（⌄ 折叠会话，⋯ 重命名）';
+    head.innerHTML = '<button class="ws-caret" title="折叠/展开会话">▾</button><span>📁</span>' +
       '<span class="ws-name">' + esc(ws.name) + '</span>' +
       '<button class="row-menu" title="重命名工作区">⋯</button>';
-    head.onclick = (e) => {
-      if (e.target.closest('.row-menu')) return;
+    // 点击工作区名 = 切换（同步 composer 显示与右侧文件树）
+    head.onclick = (e) => { if (!e.target.closest('.row-menu')) switchWorkspace(ws.path); };
+    head.querySelector('.ws-caret').onclick = (e) => {
+      e.stopPropagation();
       if (collapsedWs.has(ws.id)) collapsedWs.delete(ws.id);
       else collapsedWs.add(ws.id);
       group.classList.toggle('collapsed', collapsedWs.has(ws.id));
@@ -1657,14 +3566,80 @@ async function refreshSidebar() {
       }
     };
     group.appendChild(head);
-    for (const sess of sidebar.sessions.filter(x => x.ws === ws.id)) {
+    for (const sess of sessList) {
       const row = document.createElement('div');
-      row.className = 's-row' + (sess.id === currentSession ? ' active' : '');
+      row.className = 's-row' + (sess.id === currentSession ? ' active' : '') +
+        (sess.done ? ' done' : '');
       row.innerHTML = '<span class="s-name">' + esc(sess.name) + '</span>' +
         '<span class="s-time">' + relTime(sess.updated) + '</span>' +
-        '<button class="row-menu" title="重命名会话">⋯</button>';
+        '<button class="pin' + (sess.pinned ? ' on' : '') + '" title="置顶/取消置顶（置顶后排在本工作区最前）">★</button>' +
+        '<button class="row-done' + (sess.done ? ' on' : '') + '" title="标记完成/未完成（完成的排最后并划线）">✓</button>' +
+        '<button class="row-menu" title="重命名会话">⋯</button>' +
+        '<button class="row-menu row-del" title="删除会话">🗑</button>';
+      // 拖拽排序：仅同工作区分组内可拖（跨组意味着换工程，不开放）。
+      // 用鼠标事件自实现（而非 HTML5 原生拖拽）——原生拖拽在 WebView2 里
+      // 会渲染系统级拖影层（中间的大白框），鼠标方案完全无拖影，
+      // 位置反馈由目标行上的虚线框承担
+      row.__sess = sess;
+      row.title = '按住拖动可排序；点击打开会话';
+      row.onmousedown = (e) => {
+        if (e.button !== 0 || e.target.closest('button')) return;  // 按钮点击不进入拖拽
+        const startX = e.clientX;
+        const startY = e.clientY;
+        let active = false;
+        const move = (ev) => {
+          if (!active) {
+            // 位移超阈值才算拖拽（横竖任一方向）
+            if (Math.abs(ev.clientX - startX) < 5 &&
+                Math.abs(ev.clientY - startY) < 5) return;
+            active = true;
+            row.classList.add('dragging');
+            document.body.classList.add('sess-dragging');
+          }
+          ev.preventDefault();  // 拖拽中禁止选择文本
+          const t = document.elementFromPoint(ev.clientX, ev.clientY);
+          const target = t && t.closest ? t.closest('.s-row') : null;
+          const ok = target && target.__sess && target !== row &&
+                     target.__sess.ws === sess.ws && target.__sess.id !== sess.id;
+          document.querySelectorAll('.s-row.dragover').forEach(x => {
+            if (x !== (ok ? target : null)) x.classList.remove('dragover');
+          });
+          if (ok) target.classList.add('dragover');
+        };
+        const up = (ev) => {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+          document.body.classList.remove('sess-dragging');
+          row.classList.remove('dragging');
+          const target = document.querySelector('.s-row.dragover');
+          document.querySelectorAll('.s-row.dragover').forEach(x => x.classList.remove('dragover'));
+          if (!active) return;  // 位移不足 = 普通点击，交给 onclick
+          if (!target) return;
+          const ts = target.__sess;
+          if (!ts || ts.ws !== sess.ws || ts.id === sess.id) return;
+          const seq = sessList.map(x => x.id);
+          const from = seq.indexOf(sess.id);
+          const to = seq.indexOf(ts.id);
+          if (from < 0 || to < 0) return;
+          seq.splice(from, 1);
+          seq.splice(to, 0, sess.id);
+          api().set_session_order(seq).then(refreshSidebar);
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      };
       row.onclick = () => selectSession(sess.id);
-      row.querySelector('.row-menu').onclick = async (e) => {
+      row.querySelector('.pin').onclick = async (e) => {
+        e.stopPropagation();
+        await api().set_session_pin(sess.id, !sess.pinned);
+        refreshSidebar();
+      };
+      row.querySelector('.row-done').onclick = async (e) => {
+        e.stopPropagation();
+        await api().mark_session_done(sess.id, !sess.done);
+        refreshSidebar();
+      };
+      row.querySelector('.row-menu:not(.row-del)').onclick = async (e) => {
         e.stopPropagation();
         const name = await dialogPrompt('重命名会话', sess.name);
         if (name !== null && name.trim()) {
@@ -1672,9 +3647,13 @@ async function refreshSidebar() {
           refreshSidebar();
         }
       };
+      row.querySelector('.row-del').onclick = async (e) => {
+        e.stopPropagation();
+        await deleteSession(sess.id, sess.name);
+      };
       group.appendChild(row);
     }
-    if (!group.querySelector('.s-row')) {
+    if (!q && !group.querySelector('.s-row')) {
       const empty = document.createElement('div');
       empty.className = 's-row';
       empty.style.opacity = '.45';
@@ -1682,6 +3661,10 @@ async function refreshSidebar() {
       group.appendChild(empty);
     }
     tree.appendChild(group);
+  }
+  if (q && !anyShown) {
+    tree.innerHTML = '<div class="hint" style="padding:6px 10px">没有匹配「' +
+      esc(q) + '」的会话。</div>';
   }
   if (!sidebar.workspaces.length) {
     tree.innerHTML = '<div class="hint" style="padding:6px 10px">选择工作区后，会话会按项目分组显示。</div>';
@@ -1692,27 +3675,79 @@ async function selectSession(id) {
   const s = await api().session_history(id);
   currentSession = id;
   $('thread').innerHTML = '';
-  for (const m of (s.history || [])) add(m.content, m.role === 'user' ? 'user' : 'bot');
+  (s.history || []).filter(m => (m.content || '').trim()).forEach((m, i) =>
+    add(m.content, m.role === 'user' ? 'user' : 'bot', null, null, i));
   showHeroIfEmpty();
+  updateSendState();  // 发送按钮按新会话的忙状态恢复
   refreshSidebar();
 }
 
+async function deleteSession(id, name) {
+  const ok = await dialogConfirm('删除会话',
+    '确定删除会话「' + (name || id) + '」？历史记录将一并删除，此操作不可恢复。');
+  if (!ok) return;
+  const res = await api().delete_session(id);
+  if (!res.ok) {
+    toast('删除失败: ' + (res.error || '未知错误'), true);
+    return;
+  }
+  if (id === currentSession) {
+    await selectSession(res.next || id);  // 后端已切到最近会话（或新建了一个）
+  } else {
+    refreshSidebar();
+  }
+}
+
 async function newSessionFlow() {
+  // 第一步：选择会话归属的工作区（取消 → 不创建任何会话）
+  const wsRes = await api().workspaces();
+  const list = (wsRes.workspaces || []);
+  const pathOf = {};
+  const options = list.map(w => {
+    pathOf[w.id] = w.path;
+    return {
+      value: w.id,
+      label: (w.id === wsRes.current ? '✓ ' : '📁 ') + w.name,
+      sub: w.path,
+    };
+  });
+  options.push({ value: '__browse__', label: '📂 选择其他文件夹…', sub: '' });
+  const wsPick = await dialogChoose('新会话放到哪个工作区？', options);
+  if (wsPick === null) return;
+  // 第二步：命名（取消或留空 → 不创建，避免出现 s-... 裸名会话）
   const name = await dialogPrompt('新会话名称', '');
-  if (name === null) return;
+  if (name === null || !name.trim()) return;
+  // 选定的工作区与当前不同 → 先切换（会话按创建时的工作区归组）
+  if (wsPick === '__browse__') {
+    const picked = await api().choose_workspace();
+    if (!picked.ok) return;  // 用户取消选文件夹 → 放弃创建
+  } else if (wsPick !== wsRes.current) {
+    await switchWorkspace(pathOf[wsPick]);
+  }
   const s = await api().new_session();
   if (name.trim()) await api().rename_session(s.session, name.trim());
   currentSession = s.session;
   $('thread').innerHTML = '';
+  wsPath = '';
   showHeroIfEmpty();
+  refreshStatus();
   refreshSidebar();
+  loadWsTree();  // 右侧文件树同步到新工作区
 }
 
 /* ---------- 实时步骤（模型运作过程，对齐 dsh） ---------- */
 let liveBlock = null;
 let liveLlmCount = 0;
+let lastRounds = 0;   // 最近一轮对话的 LLM 轮数（展示在「已深度思考」标题里）
+
+function nearBottom(el, margin) {
+  // 用户是否停在底部附近：流式输出只在吸底时自动滚动，不打断向上翻阅
+  return el.scrollHeight - el.scrollTop - el.clientHeight < (margin || 90);
+}
 
 function onAgentEvent(evt) {
+  // 多会话并行：非当前会话的思考/工具步骤不渲染到当前线程
+  if (evt.session && evt.session !== currentSession) return;
   if (!liveBlock) return;
   const steps = liveBlock.querySelector('.steps');
   if (evt.kind === 'llm') {
@@ -1727,6 +3762,8 @@ function onAgentEvent(evt) {
     steps.appendChild(div);
   } else if (evt.kind === 'tool') {
     const firstLine = (evt.result || '').split('\n')[0].slice(0, 80);
+    // 收集到本轮工具列表：收尾时作为「工具调用」区块写入正式回复正文
+    liveTools.push({ name: evt.tool || '?', detail: firstLine });
     const div = document.createElement('div');
     div.className = 'step';
     div.innerHTML = '<span class="s-icon">🔧</span><span class="s-text">' +
@@ -1738,14 +3775,32 @@ function onAgentEvent(evt) {
       steps.appendChild(div);
       steps.appendChild(res);
     } else steps.appendChild(div);
+  } else if (evt.kind === 'subagent') {
+    // 子 agent 动态：在 live 区显示开始/内部工具/完成（右侧面板另有完整记录）
+    const div = document.createElement('div');
+    div.className = 'step';
+    if (evt.phase === 'start') {
+      div.innerHTML = '<span class="s-icon">🤖</span><span class="s-text">子 agent 开始：' +
+        esc(String(evt.task || '').slice(0, 60)) + '</span>';
+    } else if (evt.phase === 'tool') {
+      div.innerHTML = '<span class="s-icon">🤖</span><span class="s-text">子 agent 调用 ' +
+        esc(String(evt.tool || '')) + '</span>';
+    } else {
+      div.innerHTML = '<span class="s-icon">🤖</span><span class="s-text">子 agent 完成（' +
+        ((evt.elapsed_ms || 0) / 1000).toFixed(1) + 's' +
+        (evt.steps && evt.steps.length ? ' · ' + evt.steps.length + ' 步' : '') +
+        '）</span>';
+    }
+    steps.appendChild(div);
   }
   const log = $('log');
-  log.scrollTop = log.scrollHeight;
+  if (nearBottom(log)) log.scrollTop = log.scrollHeight;
 }
 
 function showLiveBlock() {
   removeLiveBlock();
   liveLlmCount = 0;
+  liveTools = [];
   const div = document.createElement('div');
   div.className = 'msg bot';
   div.innerHTML = '<div class="steps"></div><span class="thinking"><i></i><i></i><i></i></span>';
@@ -1754,46 +3809,232 @@ function showLiveBlock() {
   $('log').scrollTop = $('log').scrollHeight;
 }
 function removeLiveBlock() {
+  if (streamFrame) { cancelAnimationFrame(streamFrame); streamFrame = 0; }
+  lastRounds = liveLlmCount;  // 供 add() 在「已深度思考」标题里显示轮数
   if (liveBlock) { liveBlock.remove(); liveBlock = null; }
+  streamEl = null; streamBuf = '';
 }
 
-/* ---------- 发送 ---------- */
-function setBusy(busy) {
-  const send = $('send');
-  send.classList.toggle('busy', busy);
-  send.disabled = busy;
+/* 本轮工具调用（流式期间累积，收尾时写入正式回复正文） */
+let liveTools = [];
+
+/* ---------- 流式输出 ---------- */
+let streamEl = null;   // liveBlock 里承载增量的容器
+let streamBuf = '';    // 已累积的全文（每帧整体重绘，避免增量拼接错位）
+let streamFrame = 0;   // 待执行的 rAF 渲染帧（0 = 无排队）
+
+/* 全局错误捕获：任何未捕获异常都记录到 window.__errs 并弹 toast——
+   界面「莫名空白」时用户能直接看到具体错误，而不是无从排查 */
+window.__errs = [];
+window.onerror = function (msg, src, line, col) {
+  window.__errs.push(String(msg) + ' @' + (src || '?') + ':' + (line || 0));
+  try { toast('脚本错误: ' + msg, true); } catch (e2) { /* 忽略 */ }
+  return false;
+};
+
+window.onStreamEvent = function (evt) {
+  // 多会话并行：非当前会话的增量不渲染（后台继续收，done 时只提示）
+  if (evt.session && evt.session !== currentSession && evt.kind !== 'done') return;
+  if (evt.kind === 'delta') {
+    if (!liveBlock) return;
+    if (!streamEl) {
+      streamEl = document.createElement('div');
+      streamEl.className = 'stream-body live';
+      liveBlock.insertBefore(streamEl, liveBlock.querySelector('.thinking'));
+      const dots = liveBlock.querySelector('.thinking');
+      if (dots) dots.style.display = 'none';
+    }
+    streamBuf += (evt.text || '');
+    // rAF 批量渲染：每个动画帧最多整体重绘一次（Markdown 渲染 + 吸底滚动），
+    // 逐 token 的 evaluate_js 只做字符串拼接，不再每次都触发 layout
+    if (!streamFrame) {
+      streamFrame = requestAnimationFrame(() => {
+        streamFrame = 0;
+        if (!streamEl || !liveBlock) return;
+        const log = $('log');
+        const stick = nearBottom(log);
+        streamEl.innerHTML = md(streamBuf);  // 流式期间也走 Markdown 渲染
+        if (stick) log.scrollTop = log.scrollHeight;
+      });
+    }
+    return;
+  }
+  if (evt.kind === 'done') finishStream(evt);
+};
+
+let roundStart = 0;   // 本轮对话开始时刻（算 tok/s 用）
+let lastSpeed = 0;    // 上一轮生成速度 tokens/s（0=未知）
+
+function roundSpeed(usage) {
+  const c = Number((usage || {}).completion_tokens) || 0;
+  const secs = roundStart ? (Date.now() - roundStart) / 1000 : 0;
+  return (c && secs > 0.3) ? Math.max(1, Math.round(c / secs)) : 0;
 }
 
-async function send() {
-  const input = $('input');
-  const text = input.value.trim();
-  if ((!text && !pendingImages.length) || $('send').disabled) return;
-  const images = pendingImages.slice();
-  pendingImages = []; renderImgChips();
-  input.value = ''; input.style.height = 'auto';
-  add(text || '（图片）', 'user', images.length ? images.map(p => '🖼 ' + p) : null);
-  showLiveBlock();
-  setBusy(true);
-  const res = await api().chat(text, currentSession, images.length ? images : null);
+function finishStream(evt) {
+  busySessions.delete(evt.session);
+  // 非当前会话的完成：不渲染到当前线程，只提示 + 刷新侧栏
+  if (evt.session && evt.session !== currentSession) {
+    updateSendState();
+    refreshSidebar();
+    toast('会话已回复：' + (window.sessionNames && window.sessionNames[evt.session]
+      || evt.session));
+    flushQueue(evt.session);  // 后台会话的排队消息照常续跑
+    return;
+  }
   removeLiveBlock();
   setBusy(false);
   $('input').focus();
-  if (!res.ok) { add(res.error || '未知错误', 'bot error'); return; }
-  const meta = ['模型: ' + (res.model || '?')];
-  for (const call of (res.tool_calls || [])) meta.push(call.name);
-  add(res.reply || '(空回复)', 'bot', meta, res.reasoning || '');
-  currentSession = res.session || currentSession;
+  if (!evt.ok) { add(evt.error || '未知错误', 'bot error'); flushQueue(evt.session); return; }
+  lastSpeed = roundSpeed(evt.usage);
+  const meta = ['模型: ' + (evt.model || '?')];
+  for (const call of (evt.tool_calls || [])) meta.push(call.name);
+  // 空回复兜底：模型多轮工具后没给文字总结时，明确说明而不是显示「（空回复）」
+  let reply = (evt.reply || '').trim();
+  if (!reply) {
+    reply = liveTools.length
+      ? '（本轮模型未返回文字总结。以下是执行的 ' + liveTools.length +
+        ' 步操作；需要说明可再发一句「总结一下刚才做的事」。）'
+      : '（模型没有返回内容。可能是请求被中断或连续工具调用达到上限，重发一次即可。）';
+  }
+  add(reply, 'bot', meta, evt.reasoning || '', undefined, liveTools.slice());
+  liveTools = [];
+  currentSession = evt.session || currentSession;
   refreshSidebar();
   refreshStatus();
+  notifyDone();
+  if (curPanel === 'sub') loadSubagents();  // 子 agent 面板开着时刷新记录
+  flushQueue(evt.session);  // 本轮结束 → 自动发送排队消息
+}
+
+/* ---------- 发送 ---------- */
+// 按会话记录忙状态：一个会话在回答时，其他会话仍可发送（后端并行支持）
+const busySessions = new Set();
+// 每会话的消息排队：回答中仍然可以输入，本轮结束后自动依次发出
+const queueBySession = new Map();
+function queueDepth(sid) { return (queueBySession.get(sid) || []).length; }
+function renderQueueBadge() {
+  const el = $('queueBadge');
+  if (!el) return;
+  const n = queueDepth(currentSession);
+  el.textContent = n ? ('排队 ' + n) : '';
+  el.style.display = n ? '' : 'none';
+  el.title = n ? ('本轮回答完成后将自动依次发送这 ' + n + ' 条消息') : '';
+}
+function updateSendState() {
+  const busy = busySessions.has(currentSession);
+  // 忙时按钮保持可点：此时发送 = 排队（本轮完成后自动发出）
+  $('send').disabled = false;
+  $('send').classList.toggle('busy', busy);
+  renderQueueBadge();
+}
+function setBusy(busy) {
+  if (busy) busySessions.add(currentSession);
+  else busySessions.delete(currentSession);
+  updateSendState();
+}
+
+// 队列自动发送：本轮完成后取该会话队首消息续跑（支持后台会话）
+async function flushQueue(sid) {
+  const q = queueBySession.get(sid);
+  if (!q || !q.length) { if (sid === currentSession) renderQueueBadge(); return; }
+  const item = q.shift();
+  if (q.length) queueBySession.set(sid, q);
+  else queueBySession.delete(sid);
+  if (sid === currentSession) renderQueueBadge();
+  await send({ text: item.text, images: item.images, session: sid });
+}
+
+async function send(opts) {
+  // opts: {text, images, session} —— 队列自动发送走这里（可指定会话，不碰输入框）
+  const o = opts || {};
+  const targetSession = o.session || currentSession;
+  const isCurrent = targetSession === currentSession;
+  let text, images;
+  if (typeof o.text === 'string') {
+    text = o.text;
+    images = o.images || [];
+  } else {
+    const input = $('input');
+    text = input.value.trim();
+    if (!text && !pendingImages.length) return;
+    images = pendingImages.slice();
+    pendingImages = []; renderImgChips();
+    if (isCurrent) { input.value = ''; input.style.height = 'auto'; }
+  }
+  // 该会话正在回答 → 入队，等本轮结束自动发出
+  if (busySessions.has(targetSession)) {
+    const q = queueBySession.get(targetSession) || [];
+    q.push({ text: text || '（图片）', images: images });
+    queueBySession.set(targetSession, q);
+    if (isCurrent) {
+      renderQueueBadge();
+      toast('本轮回答中，已排队 ' + q.length + ' 条；完成后自动发送');
+    }
+    return;
+  }
+  if (isCurrent) {
+    add(text || '（图片）', 'user', images.length ? images.map(p => '🖼 ' + imgLabel(p)) : null);
+    showLiveBlock();
+  }
+  busySessions.add(targetSession);
+  updateSendState();
+  roundStart = Date.now();
+
+  // 流式优先：模型支持 chat_stream 时逐字渲染（delta/done 事件经 onStreamEvent 推回）
+  try {
+    const cs = await api().can_stream();
+    if (cs && cs.stream) {
+      const res = await api().chat_stream(text, targetSession, images.length ? images : null);
+      if (res.ok) {
+        if (isCurrent) currentSession = res.session || targetSession;
+        return;
+      }
+      // 流式派发失败（如已有对话在进行）→ 回退整段
+      if (isCurrent) removeLiveBlock();
+    }
+  } catch (e) { /* 探测失败 → 回退整段 */ }
+
+  const res = await api().chat(text, targetSession, images.length ? images : null);
+  if (isCurrent) removeLiveBlock();
+  busySessions.delete(targetSession);
+  updateSendState();
+  if (isCurrent) $('input').focus();
+  if (!res.ok) {
+    if (isCurrent) add(res.error || '未知错误', 'bot error');
+    else toast('会话回复失败：' + (res.error || '未知错误'), true);
+    await flushQueue(targetSession);
+    return;
+  }
+  lastSpeed = roundSpeed(res.usage);
+  const meta = ['模型: ' + (res.model || '?')];
+  for (const call of (res.tool_calls || [])) meta.push(call.name);
+  let reply = (res.reply || '').trim();
+  if (!reply) {
+    reply = (res.tool_calls || []).length
+      ? '（本轮模型未返回文字总结；共调用 ' + res.tool_calls.length + ' 次工具。）'
+      : '（模型没有返回内容。可能是请求被中断，重发一次即可。）';
+  }
+  if (isCurrent) add(reply, 'bot', meta, res.reasoning || '');
+  if (isCurrent) currentSession = res.session || currentSession;
+  refreshSidebar();
+  refreshStatus();
+  notifyDone();
+  await flushQueue(targetSession);
 }
 
 /* ---------- 图片附加（功能7） ---------- */
 let pendingImages = [];
+function imgLabel(p) {
+  // data URL（剪贴板粘贴的截图）没有文件名，显示固定标签而不是一长串 base64
+  return String(p).startsWith('data:') ? '剪贴板图片' : String(p).split(/[\\\\/]/).pop();
+}
 function renderImgChips() {
   const box = $('imgChips');
   box.innerHTML = pendingImages.map((p, i) =>
-    '<span class="img-chip">🖼 ' + esc(p.split(/[\\\\/]/).pop()) +
-    ' <a style="cursor:pointer" onclick="removeImage(' + i + ')">✕</a></span>').join('');
+    '<span class="img-chip" title="点击预览" style="cursor:pointer" ' +
+    'onclick="previewImage(pendingImages[' + i + '])">🖼 ' + esc(imgLabel(p)) +
+    ' <a style="cursor:pointer" onclick="event.stopPropagation();removeImage(' + i + ')">✕</a></span>').join('');
   box.style.display = pendingImages.length ? 'flex' : 'none';
 }
 function addImagePath(p) {
@@ -1802,20 +4043,60 @@ function addImagePath(p) {
   renderImgChips();
 }
 function removeImage(i) { pendingImages.splice(i, 1); renderImgChips(); }
+
+/* ---------- 图片预览（lightbox：data URL 直显，本地路径走 image_preview） ---------- */
+async function previewImage(p) {
+  const img = $('lightboxImg');
+  if (String(p).startsWith('data:')) {
+    img.src = p;
+  } else {
+    const res = await api().image_preview(p);
+    if (!res.ok) { toast(res.error || '无法预览该图片', true); return; }
+    img.src = res.data;
+  }
+  $('lightbox').classList.add('on');
+}
+$('lightbox').onclick = () => $('lightbox').classList.remove('on');
 async function attachImage() {
   const res = await api().pick_image();
-  if (!res.ok) { add(res.error || '无法打开文件对话框', 'bot error'); return; }
+  if (!res.ok) { toast(res.error || '无法打开文件对话框', true); return; }
   for (const p of (res.paths || [])) {
     const chk = await api().check_image(p);
     if (chk.ok) addImagePath(chk.path);
-    else add(chk.error, 'bot error');
+    else toast(chk.error, true);
   }
 }
 $('input').addEventListener('paste', async (e) => {
-  // 粘贴单个图片路径 → 自动附加而不是插进文本（拖入文件路径同理手动 /image 不适用，走 📎）
-  const text = (e.clipboardData || window.clipboardData).getData('text');
+  const cd = e.clipboardData || window.clipboardData;
+  if (!cd) return;
+  // 1) 剪贴板里是图片本体（截图 / 复制的图片）→ 读成 data URL 直接附加。
+  //    safe_image 对 data: URL 原样放行，无需落临时文件。
+  const imgItem = [...(cd.items || [])].find(i => i.type && i.type.startsWith('image/'));
+  if (imgItem) {
+    e.preventDefault();
+    const blob = imgItem.getAsFile();
+    if (!blob) return;
+    if (blob.size > 8 * 1024 * 1024) {
+      toast('剪贴板图片超过 8MB，请先保存为文件后用 📎 附加。', true);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => addImagePath(String(reader.result));
+    reader.readAsDataURL(blob);
+    return;
+  }
+  // 2) 文本粘贴：图片路径 → 附加；外部工具（如 WorkBuddy）的 @image#N: 引用
+  //    是内部格式、拿不到图片本体 → 明确提示，而不是把占位文本留在输入框
+  const text = cd.getData('text');
   if (!text) return;
   const t = text.trim();
+  const wbRef = t.match(/^@image#\d+:(.+)$/);
+  if (wbRef) {
+    e.preventDefault();
+    add('检测到剪贴板图片引用「' + esc(wbRef[1]) + '」——这是外部聊天工具的内部格式，' +
+        '拿不到图片本体。请直接 Ctrl+V 粘贴图片，或用 📎 选择文件。', 'bot');
+    return;
+  }
   if (!/^[^\r\n]+\.(png|jpe?g|gif|webp)$/i.test(t)) return;
   const chk = await api().check_image(t);
   if (chk.ok) { e.preventDefault(); addImagePath(chk.path); }
@@ -1824,20 +4105,45 @@ $('input').addEventListener('paste', async (e) => {
 $('input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
+
+/* ---------- 全局快捷键（Ctrl+N 新会话 / Ctrl+F 搜索 / Ctrl+, 设置 / Ctrl+B 侧栏 / Ctrl+J 面板） ---------- */
+document.addEventListener('keydown', (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod || e.altKey) return;
+  const k = (e.key || '').toLowerCase();
+  if (k === 'n') { e.preventDefault(); newSessionFlow(); }
+  else if (k === 'f') { e.preventDefault(); searchFlow(); }
+  else if (k === ',') { e.preventDefault(); openSettings(); }
+  else if (k === 'b') { e.preventDefault(); toggleSide(); }
+  else if (k === 'j') { e.preventDefault(); togglePanel(); }
+});
 $('input').addEventListener('input', function () {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 180) + 'px';
 });
+$('sessionFilter').addEventListener('input', () => refreshSidebar());
 $('modelSel').onchange = async () => {
   const res = await api().switch_model($('modelSel').value);
-  if (res.ok) { currentModel = res.model; add(res.message, 'bot', ['模型: ' + res.model]); }
-  else add(res.error || res.message, 'bot error');
+  if (res.ok) { currentModel = res.model; toast('已切换模型: ' + res.model); }
+  else toast(res.error || res.message, true);
   refreshStatus();
 };
 $('thinkSel').onchange = async () => {
   const res = await api().set_thinking($('thinkSel').value);
-  if (res.ok) add(res.thinking_level === 'off' ? '已关闭思考' : '思考级别: ' + res.thinking_level, 'bot', ['思考']);
+  if (res.ok) {
+    updateRegenVisibility();
+    toast(res.thinking_level === 'off' ? '已关闭思考' : '思考级别: ' + res.thinking_level);
+  }
 };
+
+/* ---------- 计划模式（📋 按钮） ---------- */
+async function togglePlanMode() {
+  const on = !$('planBtn').classList.contains('on');
+  const res = await api().set_plan_mode(on);
+  if (!res.ok) { toast(res.error || '切换失败', true); return; }
+  $('planBtn').classList.toggle('on', !!res.plan_mode);
+  toast(res.message);
+}
 
 /* ---------- 设置弹窗 ---------- */
 let editing = { models: [], default_model: '' };
@@ -1850,13 +4156,18 @@ function openSettings() {
 }
 function closeSettings() { $('overlay').style.display = 'none'; }
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-  $('tab-models').style.display = name === 'models' ? '' : 'none';
-  $('tab-plugins').style.display = name === 'plugins' ? '' : 'none';
-  $('tab-skills').style.display = name === 'skills' ? '' : 'none';
-  $('tab-market').style.display = name === 'market' ? '' : 'none';
+  document.querySelectorAll('.set-nav-item').forEach(b =>
+    b.classList.toggle('active', b.dataset.set === name));
+  ['models', 'plugins', 'skills', 'market', 'appearance', 'general', 'usage']
+    .forEach(n => {
+      const el = $('tab-' + n);
+      if (el) el.style.display = n === name ? '' : 'none';
+    });
   if (name === 'market' && !marketLoaded) loadMarket();
   if (name === 'skills') loadSkills();
+  if (name === 'appearance') renderAppearance();
+  if (name === 'general') renderGeneral();
+  if (name === 'usage') loadUsageTab();
 }
 document.addEventListener('keydown', (e) => {
   // 权限确认框可见时 Esc = 明确拒绝（H-05：此前只隐藏不回结果，Python 侧空等超时）
@@ -1882,6 +4193,13 @@ function renderCards() {
     const card = document.createElement('div');
     card.className = 'model-card';
     card.innerHTML = `
+      <div class="model-presets">
+        <label>提供商预设</label>
+        <select onchange="applyPreset(${i}, this.value); this.selectedIndex = 0;">
+          <option value="">— 选择预设，自动填地址与模型，只需再填 API Key —</option>
+          ${MODEL_PRESETS.map((p, pi) => '<option value="' + pi + '">' + esc(p.n) + '</option>').join('')}
+        </select>
+      </div>
       <div class="model-grid">
         <div class="field"><label>名称</label>
           <input value="${esc(m.name)}" oninput="editing.models[${i}].name=this.value"></div>
@@ -1907,6 +4225,31 @@ function renderCards() {
     radio.addEventListener('change', () => { editing.default_model = editing.models[i].name; });
     box.appendChild(card);
   });
+}
+
+/* 内置提供商预设：选一条自动填 base_url + 模型 ID，只需再填 API Key */
+const MODEL_PRESETS = [
+  { n: 'DeepSeek 官方', base: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { n: 'DeepSeek 推理（R1）', base: 'https://api.deepseek.com/v1', model: 'deepseek-reasoner' },
+  { n: 'Moonshot Kimi', base: 'https://api.moonshot.cn/v1', model: 'kimi-k2-turbo-preview' },
+  { n: '智谱 GLM', base: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6' },
+  { n: '阿里百炼 Qwen', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { n: 'SiliconFlow 硅基流动', base: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-V3' },
+  { n: 'OpenAI 官方', base: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { n: 'Anthropic 官方', base: 'https://api.anthropic.com', model: 'claude-sonnet-4-5', provider: 'anthropic' },
+];
+
+function applyPreset(i, val) {
+  const p = MODEL_PRESETS[Number(val)];
+  if (!p || !editing.models[i]) return;
+  editing.models[i].base_url = p.base;
+  editing.models[i].model = p.model;
+  if (p.provider) editing.models[i].provider = p.provider;
+  if (!editing.models[i].name) editing.models[i].name = p.n;
+  renderCards();
+  const note = $('saveNote');
+  note.className = '';
+  note.textContent = '已填入「' + p.n + '」——再填 API Key 后点保存即可';
 }
 
 function addCard() {
@@ -1959,6 +4302,19 @@ async function installPlugin() {
 }
 
 /* ---------- 工作区（composer 上方下拉，新会话时选择） ---------- */
+// 统一切换入口：侧栏工作区点击 / composer 下拉 / 原生对话框都走这里，
+// 保证 composer 上方显示与右侧文件树同步刷新
+async function switchWorkspace(path) {
+  const r = await api().set_workspace(path);
+  if (r.ok) {
+    wsPath = '';            // 右侧文件树回到新工作区根目录
+    await refreshStatus();  // 更新 composer 上方的工作区名
+    refreshSidebar();       // 侧栏分组与当前高亮
+    if (document.querySelector('#rp-ws.active')) loadWsTree();  // 右侧文件树开着才重载
+  }
+  return r;
+}
+
 async function renderWsMenu() {
   const res = await api().workspaces();
   const list = res.workspaces || [];
@@ -1971,8 +4327,7 @@ async function renderWsMenu() {
       '<span>' + esc(ws.name) + '</span><span class="ws-path">' + esc(ws.path) + '</span>';
     btn.onclick = async () => {
       menu.classList.remove('open');
-      const r = await api().set_workspace(ws.path);
-      if (r.ok) { refreshStatus(); refreshSidebar(); }
+      await switchWorkspace(ws.path);
     };
     menu.appendChild(btn);
   }
@@ -1991,7 +4346,7 @@ function toggleWsMenu(e) {
 async function chooseWorkspace() {
   const res = await api().choose_workspace();
   if (res.ok) {
-    refreshStatus(); refreshSidebar();   // 切换工作区不打扰会话区
+    await switchWorkspace(res.workspace);  // 后端已切好，这里只做联动刷新
   } else if (res.error) {
     add(res.error, 'bot error');
   }
@@ -2105,14 +4460,915 @@ let wsPath = '';
 
 function togglePanel() {
   document.body.classList.toggle('panel-hidden');
-  $('panelToggle').classList.toggle('off', document.body.classList.contains('panel-hidden'));
+}
+
+/* ---------- 导出当前会话 ---------- */
+async function exportCurrent() {
+  const res = await api().export_session(currentSession);
+  const hint = $('statusHint');
+  if (res.ok) {
+    hint.textContent = '已导出: ' + res.path;
+    setTimeout(() => { hint.textContent = ''; }, 6000);
+  } else {
+    toast('导出失败: ' + (res.error || '未知错误'), true);
+  }
 }
 function switchPanel(name) {
+  curPanel = name;
   document.querySelectorAll('.rp-tab').forEach(t => t.classList.toggle('active', t.dataset.rp === name));
   document.querySelectorAll('.rp-body').forEach(b => b.classList.toggle('active', b.id === 'rp-' + name));
   if (name === 'ws') loadWsTree();
+  if (name === 'kb') loadKnowledge();
+  if (name === 'todo') loadTodoPanel();
+  if (name === 'usage') loadUsageChart();
   if (name === 'review') loadReview();
+  if (name === 'sub') loadSubagents();
 }
+
+/* ---------- 右侧标签页显隐（点 ✕ 隐藏，「＋」处找回） ---------- */
+let rpHidden = [];
+const TAB_LABELS = { aux: '💬 辅助', ws: '📁 工作区', sub: '🤖 子agent', kb: '📚 知识库',
+                     todo: '✅ 任务', usage: '📈 用量', term: '⌨ 终端',
+                     browser: '🌐 浏览器', review: '🔍 审查' };
+
+function applyTabVisibility() {
+  document.querySelectorAll('.rp-tab[data-rp]').forEach(t => {
+    t.style.display = rpHidden.includes(t.dataset.rp) ? 'none' : '';
+  });
+  // ＋ 按钮无隐藏项时呈禁用态
+  const plus = document.querySelector('.rp-plus');
+  if (plus) plus.classList.toggle('dim', !rpHidden.length);
+  // 当前激活的标签被隐藏 → 切到第一个可见标签
+  const active = document.querySelector('.rp-tab.active');
+  if (active && rpHidden.includes(active.dataset.rp)) {
+    const first = document.querySelector('.rp-tab[data-rp]:not([style*="none"])');
+    if (first) switchPanel(first.dataset.rp);
+  }
+}
+function hideTab(name) {
+  if (!rpHidden.includes(name)) rpHidden.push(name);
+  saveUiPrefs();
+  applyTabVisibility();
+}
+async function showTabMenu() {
+  // 在标签栏内弹出下拉菜单（不再用全屏对话框）
+  const menu = $('tabMenu');
+  const hidden = Object.keys(TAB_LABELS).filter(n => rpHidden.includes(n));
+  if (!hidden.length) return;  // ＋ 按钮此时呈半透明禁用态
+  if (menu.classList.contains('open')) { menu.classList.remove('open'); return; }
+  const plus = document.querySelector('.rp-plus');
+  if (plus) {
+    const r = plus.getBoundingClientRect();
+    menu.style.left = Math.max(4, r.left - 140) + 'px';
+    menu.style.top = (r.bottom + 6) + 'px';
+  }
+  menu.innerHTML = '';
+  for (const n of hidden) {
+    const btn = document.createElement('button');
+    btn.innerHTML = '<span>' + esc(TAB_LABELS[n] || n) + '</span>';
+    btn.title = '恢复显示此标签页';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      menu.classList.remove('open');
+      rpHidden = rpHidden.filter(x => x !== n);
+      saveUiPrefs();
+      applyTabVisibility();
+      switchPanel(n);
+    };
+    menu.appendChild(btn);
+  }
+  menu.classList.add('open');
+}
+/* 标签页顺序：支持拖拽重排 / 右键「左移 / 右移 / 隐藏」，随界面偏好持久化 */
+const RP_TAB_ORDER_DEFAULT = ['aux', 'ws', 'sub', 'todo', 'usage', 'kb', 'term', 'browser', 'review'];
+let rpTabOrder = RP_TAB_ORDER_DEFAULT.slice();
+let curPanel = 'aux';
+
+function renderTabs() {
+  const box = $('rpTabsBox');
+  if (!box) return;
+  box.innerHTML = '';
+  rpTabOrder.forEach((name, idx) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'rp-tab' + (name === curPanel ? ' active' : '');
+    b.dataset.rp = name;
+    b.textContent = TAB_LABELS[name] || name;
+    b.onclick = () => switchPanel(name);
+    // 鼠标自实现拖拽换位（同会话行）：不用 HTML5 原生拖拽，避免系统拖影白框
+    b.onmousedown = (e) => {
+      if (e.button !== 0) return;
+      const startX = e.clientX;
+      let moved = false;
+      const move = (ev) => {
+        if (!moved && Math.abs(ev.clientX - startX) < 5) return;
+        moved = true;
+        ev.preventDefault();
+        const t = document.elementFromPoint(ev.clientX, ev.clientY);
+        const target = t && t.closest ? t.closest('.rp-tab[data-rp]') : null;
+        if (!target || target.dataset.rp === name) return;
+        const from = rpTabOrder.indexOf(name);
+        const to = rpTabOrder.indexOf(target.dataset.rp);
+        if (from < 0 || to < 0 || from === to) return;
+        const movedTab = rpTabOrder.splice(from, 1)[0];
+        rpTabOrder.splice(to, 0, movedTab);
+        saveUiPrefs();
+        renderTabs();  // 旧节点随重建销毁；监听在 document 上，继续命中新节点
+      };
+      const up = () => {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    };
+    b.oncontextmenu = (e) => {
+      e.preventDefault();
+      tabMoveMenu(name, e.clientX, e.clientY);
+    };
+    const x = document.createElement('span');
+    x.className = 'tab-x';
+    x.textContent = '✕';
+    x.title = '隐藏此标签页（右侧「＋」可找回）';
+    x.onclick = (e) => { e.stopPropagation(); hideTab(name); };
+    b.appendChild(x);
+    box.appendChild(b);
+  });
+}
+
+function tabMoveMenu(name, x, y) {
+  // 右键标签页：左移 / 右移 / 隐藏
+  const menu = $('tabMenu');
+  menu.innerHTML = '';
+  const idx = rpTabOrder.indexOf(name);
+  const addItem = (label, enabled, fn) => {
+    const btn = document.createElement('button');
+    btn.innerHTML = '<span>' + esc(label) + '</span>';
+    if (!enabled) btn.style.opacity = '.4';
+    else btn.onclick = (e) => { e.stopPropagation(); menu.classList.remove('open'); fn(); };
+    menu.appendChild(btn);
+  };
+  addItem('◀ 左移', idx > 0, () => {
+    [rpTabOrder[idx - 1], rpTabOrder[idx]] = [rpTabOrder[idx], rpTabOrder[idx - 1]];
+    saveUiPrefs(); renderTabs(); applyTabVisibility();
+  });
+  addItem('▶ 右移', idx < rpTabOrder.length - 1, () => {
+    [rpTabOrder[idx + 1], rpTabOrder[idx]] = [rpTabOrder[idx], rpTabOrder[idx + 1]];
+    saveUiPrefs(); renderTabs(); applyTabVisibility();
+  });
+  addItem('✕ 隐藏此标签页', true, () => hideTab(name));
+  menu.style.left = Math.max(4, x - 30) + 'px';
+  menu.style.top = (y + 10) + 'px';
+  menu.classList.add('open');
+}
+
+(function initTabs() {
+  const tabs = document.querySelector('.rp-tabs');
+  if (!tabs) return;
+  renderTabs();
+  const plus = document.createElement('button');
+  plus.type = 'button';
+  plus.className = 'rp-tab rp-plus';
+  plus.textContent = '＋';
+  plus.title = '找回隐藏的标签页';
+  plus.onclick = (e) => { e.stopPropagation(); showTabMenu(); };
+  const close = tabs.querySelector('.rp-close');
+  if (close) tabs.insertBefore(plus, close); else tabs.appendChild(plus);
+  applyTabVisibility();
+})();
+// 点面板其它位置时收起「找回标签页」下拉
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#tabMenu')) {
+    const menu = $('tabMenu');
+    if (menu) menu.classList.remove('open');
+  }
+});
+
+/* ---------- 任务面板（工作区 TODO.md 渲染） ---------- */
+const TODO_MARKS = [
+  [/^- \[ \]\s*/, 't-pending', '<span class="t-box"></span>'],
+  [/^- \[~\]\s*/, 't-doing', '<span class="t-box t-doing-box">…</span>'],
+  [/^- \[x\]\s*/, 't-done', '<span class="t-box t-done-box">✓</span>'],
+  [/^- \[-\]\s*/, 't-done', '<span class="t-box">—</span>'],
+];
+
+async function loadTodoPanel() {
+  const pane = $('todoPane');
+  pane.innerHTML = '<div class="hint">加载中…</div>';
+  const res = await api().todo_content();
+  pane.innerHTML = '';
+  if (!res.ok) {
+    pane.innerHTML = '<div class="hint">' + esc(res.error || '加载失败') + '</div>';
+    return;
+  }
+  if (!res.exists || !(res.content || '').trim()) {
+    pane.innerHTML = '<div class="hint">工作区还没有 TODO.md。<br>' +
+      '对 agent 说「把工程目标拆成原子任务清单写入 TODO.md」即可自动创建；' +
+      '长程任务会在每个新会话自动读取这里的未完成项。</div>';
+    return;
+  }
+  for (const line of res.content.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    const row = document.createElement('div');
+    let matched = false;
+    for (const [re, cls, box] of TODO_MARKS) {
+      if (re.test(s)) {
+        row.className = 'todo-row ' + cls;
+        row.innerHTML = box + '<span class="t-name">' +
+          esc(s.replace(re, '')) + '</span>';
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      row.className = 'todo-hint';
+      row.textContent = line;
+    }
+    pane.appendChild(row);
+  }
+}
+
+/* ---------- 一键无状态重置（总结写回 TODO.md → 自动新会话） ---------- */
+async function statelessReset() {
+  const ok = await dialogConfirm('无状态重置',
+    '将请 agent 把当前进展总结写回工作区 TODO.md，然后自动开始一个全新会话' +
+    '（新会话会自动读取 TODO.md 与最近提交接续任务；旧会话保留可回看）。继续？');
+  if (!ok) return;
+  showLiveBlock(); setBusy(true);
+  const r = await api().stateless_reset();
+  removeLiveBlock(); setBusy(false);
+  if (!r.ok) {
+    toast('无状态重置失败: ' + (r.error || '未知错误'), true);
+    return;
+  }
+  toast('已写入 TODO.md：' + (r.note || '（空）'));
+  await selectSession(r.session);
+}
+
+/* ---------- 远程仓库配置与手动推送（审查面板；agent 无 push 能力） ---------- */
+async function loadGitRemote() {
+  const res = await api().git_remote_get();
+  if (res.ok) $('gitRemoteUrl').value = res.url || '';
+}
+
+async function saveGitRemote() {
+  const url = $('gitRemoteUrl').value.trim();
+  if (!url) { toast('远程地址为空', true); return; }
+  const res = await api().git_remote_set(url);
+  const out = $('reviewOut');
+  if (res.ok) {
+    out.textContent = (res.action || '已保存') + ' origin → ' + res.url +
+      '\n（提交请手动执行；推送点「⇅ 推送」）';
+  } else {
+    out.textContent = '保存失败: ' + (res.error || '未知错误');
+  }
+}
+
+async function pushNow() {
+  const ok = await dialogConfirm('推送到远程',
+    '将执行 git push -u origin HEAD（把当前分支推送到已保存的 origin）。继续？');
+  if (!ok) return;
+  const out = $('reviewOut');
+  out.textContent = '推送中…';
+  const res = await api().git_push();
+  out.textContent = res.ok ? (res.output || '推送完成')
+                           : '推送失败:\n' + (res.output || res.error || '');
+  refreshSidebar();
+}
+
+/* ---------- 侧栏宽度拖拽 ---------- */
+(function initSideResize() {
+  const grip = $('sideResize');
+  const side = document.querySelector('aside');
+  if (!grip || !side) return;
+  let dragging = false, startX = 0, startW = 0;
+  grip.addEventListener('mousedown', (e) => {
+    dragging = true; startX = e.clientX;
+    startW = side.getBoundingClientRect().width;
+    grip.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const w = Math.max(180, Math.min(460, startW + (e.clientX - startX)));
+    side.style.width = w + 'px';
+    side.style.minWidth = w + 'px';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    grip.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    saveUiPrefs();
+  });
+  const saved = parseInt(lsGet('sh_side_width') || '0', 10);
+  if (saved >= 180 && saved <= 460) {
+    side.style.width = saved + 'px';
+    side.style.minWidth = saved + 'px';
+  }
+})();
+
+/* ---------- 知识库面板 ---------- */
+let kbNote = '';
+
+async function loadKnowledge() {
+  const res = await api().knowledge_status();
+  const pane = $('kbPane');
+  pane.innerHTML = '';
+  if (kbNote) {
+    const note = document.createElement('div');
+    note.className = 'hint';
+    note.style.marginBottom = '8px';
+    note.textContent = kbNote;
+    pane.appendChild(note);
+    kbNote = '';
+  }
+  if (!res.ok) {
+    const err = document.createElement('div');
+    err.className = 'hint';
+    err.textContent = res.error || '知识库不可用';
+    pane.appendChild(err);
+    return;
+  }
+  const rows = [
+    ['片段数', res.chunks === -1 ? '已入库（条数待重建后可知）' : String(res.chunks ?? 0)],
+    ['向量后端', res.backend || 'numpy'],
+    ['Embedding', res.embedding_model || '（模型默认）'],
+    ['索引目录', res.dir || ''],
+  ];
+  for (const [k, v] of rows) {
+    const div = document.createElement('div');
+    div.className = 'ctx-row';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = k;
+    const val = document.createElement('span');
+    val.className = 'pct';
+    val.textContent = v;
+    val.title = v;
+    div.appendChild(name);
+    div.appendChild(val);
+    pane.appendChild(div);
+  }
+  const hint = document.createElement('div');
+  hint.className = 'hint';
+  hint.style.marginTop = '10px';
+  hint.textContent = 'agent 对话会自动用 search_knowledge 检索这里的内容；' +
+    '也可以直接让它「把 xx 文件加入知识库」。只索引 md/txt/py/json/yaml/rst/csv/sahou 等文本文件。';
+  pane.appendChild(hint);
+
+  // 细粒度管理：按来源文件列出片段数，可单独删除某个来源
+  const srcRes = await api().knowledge_sources();
+  if (!srcRes.ok) return;
+  const sources = srcRes.sources || [];
+  const title = document.createElement('div');
+  title.className = 'side-label';
+  title.style.margin = '14px 0 4px';
+  title.textContent = '已索引来源（' + sources.length + '）';
+  pane.appendChild(title);
+  if (!sources.length) {
+    const empty = document.createElement('div');
+    empty.className = 'hint';
+    empty.textContent = '（还没有来源记录；新索引的文件会出现在这里）';
+    pane.appendChild(empty);
+    return;
+  }
+  for (const s of sources) {
+    const row = document.createElement('div');
+    row.className = 'ctx-row';
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = s.source;
+    name.title = s.source;
+    const pct = document.createElement('span');
+    pct.className = 'pct';
+    pct.textContent = s.chunks + ' 段';
+    const del = document.createElement('button');
+    del.className = 'msg-act';
+    del.textContent = '删除';
+    del.style.marginLeft = '6px';
+    del.onclick = () => kbRemoveSource(s.source);
+    row.append(dot, name, pct, del);
+    pane.appendChild(row);
+  }
+}
+
+async function kbPickIndex() {
+  const res = await api().knowledge_pick_index();
+  kbNote = res.ok ? (res.summary || '已索引') : (res.error || '已取消');
+  loadKnowledge();
+}
+
+async function kbClear() {
+  const ok = await dialogConfirm('清空知识库', '确定清空所有已索引片段？索引文件将被删除，此操作不可恢复。');
+  if (!ok) return;
+  const res = await api().knowledge_clear();
+  kbNote = res.ok ? (res.summary || '已清空知识库') : (res.error || '清空失败');
+  loadKnowledge();
+}
+
+async function kbRemoveSource(name) {
+  const ok = await dialogConfirm('删除来源',
+    '删除来源「' + name + '」的全部片段？其余来源不受影响。');
+  if (!ok) return;
+  const res = await api().knowledge_remove_source(name);
+  kbNote = res.ok ? res.summary : (res.error || res.summary || '删除失败');
+  loadKnowledge();
+}
+
+/* ---------- 会话搜索（当前会话 / 全部历史，命中跳转） ---------- */
+async function searchFlow() {
+  const q = await dialogPrompt('搜索会话消息（在全部历史中查找，跳到当前会话的命中处）', '');
+  if (q === null || !q.trim()) return;
+  const keyword = q.trim();
+  // 先给一个范围选择：全部历史 / 仅当前会话
+  const scope = await dialogChoose('搜索范围', [
+    { value: 'all', label: '🗂 全部会话历史', sub: keyword },
+    { value: 'current', label: '💬 仅当前会话', sub: keyword },
+  ]);
+  if (scope === null) return;
+  const res = await api().search_sessions(keyword, scope);
+  if (!res.ok) { toast(res.error || '搜索失败', true); return; }
+  const hits = res.hits || [];
+  if (!hits.length) { toast('没有找到包含「' + keyword + '」的消息'); return; }
+  const options = hits.map(h => ({
+    value: h,
+    label: (h.role === 'user' ? '👤 ' : '🤖 ') + h.session_name,
+    sub: h.snippet,
+  }));
+  options.push({ value: '__cancel__', label: '取消', sub: '' });
+  const pick = await dialogChoose(
+    '找到 ' + hits.length + ' 条' + (res.truncated ? '（仅显示前 60 条，可换更精确的关键词）' : ''),
+    options);
+  if (!pick || pick === '__cancel__') return;
+  if (pick.session !== currentSession) await selectSession(pick.session);
+  const el = document.querySelector('#thread .msg[data-hi="' + pick.index + '"]');
+  if (el) {
+    el.scrollIntoView({ block: 'center' });
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  }
+}
+
+/* ---------- 导出全部会话 zip ---------- */
+async function exportAll() {
+  const hint = $('statusHint');
+  hint.textContent = '正在打包全部会话…';
+  const res = await api().export_all_sessions();
+  if (res.ok) {
+    hint.textContent = '已导出: ' + res.path;
+    setTimeout(() => { hint.textContent = ''; }, 8000);
+  } else {
+    hint.textContent = '';
+    toast('导出失败: ' + (res.error || '未知错误'), true);
+  }
+}
+
+/* ---------- 用量图表（近 30 天，按天聚合的 SVG 折线） ---------- */
+async function loadSubagents() {
+  const pane = $('subPane');
+  if (!pane) return;
+  pane.innerHTML = '<div class="hint">加载中…</div>';
+  const r = await api().subagents(50);
+  pane.innerHTML = '';
+  const items = (r && r.items) || [];
+  if (!items.length) {
+    pane.innerHTML = '<div class="hint">还没有子 agent 调用记录。<br>' +
+      '让主 agent「派个子 agent 去做某个独立子任务」即可，这里会列出每次调用的' +
+      '任务、耗时、执行步骤与结论。</div>';
+    return;
+  }
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'sub-row';
+    const when = it.ts ? new Date(it.ts * 1000).toLocaleString('zh-CN') : '';
+    const secs = it.elapsed_ms ? (it.elapsed_ms / 1000).toFixed(1) + 's' : '';
+    const head = document.createElement('div');
+    head.className = 'sub-head';
+    head.innerHTML = '<span class="sub-badge ' + (it.ok ? 'ok' : 'bad') + '">' +
+      (it.ok ? '✓' : '✕') + '</span>' +
+      '<span class="sub-task">' + esc((it.task || '（无任务描述）').slice(0, 80)) + '</span>' +
+      '<span class="sub-time">' + esc(secs) + '</span>';
+    head.title = it.task || '';
+    head.onclick = () => row.classList.toggle('open');
+    row.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'sub-body';
+    const trace = (it.trace || []);
+    const steps = (it.steps || []);
+    let traceHtml = '';
+    if (trace.length) {
+      traceHtml = '<div class="sub-steps">' + trace.slice(0, 25).map(t => {
+        const res = (t.result || '').split('\n')[0].slice(0, 70);
+        const bad = (t.result || '').startsWith('错误');
+        return '<div class="sub-step' + (bad ? ' bad' : '') + '">🔧 ' + esc(t.name || '') +
+          (res ? ' <span class="sub-res">' + esc(res) + '</span>' : '') + '</div>';
+      }).join('') + '</div>';
+    } else if (steps.length) {
+      traceHtml = '<div class="sub-steps">🔧 ' + esc(steps.join(' · ')) + '</div>';
+    }
+    body.innerHTML = traceHtml +
+      (it.error ? '<div class="sub-err">' + esc(it.error) + '</div>' : '') +
+      '<div class="sub-out">' + esc((it.output || '（无结论）')) + '</div>' +
+      '<div class="sub-meta">' + esc(when) + ' · ' + esc(it.sub_session || '') + '</div>';
+    row.appendChild(body);
+    pane.appendChild(row);
+  }
+}
+
+async function loadUsageChart() {
+  const pane = $('usagePane');
+  pane.innerHTML = '<div class="hint">加载中…</div>';
+  const res = await api().usage_daily(30);
+  if (!res.ok) {
+    pane.innerHTML = '<div class="hint">' + esc(res.error || '加载失败') + '</div>';
+    return;
+  }
+  renderUsageChart(pane, res.days || []);
+}
+
+function renderUsageChart(pane, pts) {
+  const W = 560, H = 190, P = 38;
+  const hasCached = pts.some(p => (p.cached || 0) > 0);
+  const maxTok = Math.max(1, ...pts.map(p => p.total));
+  const stepX = pts.length > 1 ? (W - 2 * P) / (pts.length - 1) : 0;
+  const xy = (i, v) => [P + i * stepX, H - P - (v / maxTok) * (H - 2 * P)];
+  const path = pts.map((p, i) => {
+    const [x, y] = xy(i, p.total);
+    return (i ? 'L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const lastX = (P + (pts.length - 1) * stepX).toFixed(1);
+  const area = path + ' L' + lastX + ',' + (H - P) + ' ' + P + ',' + (H - P) + ' Z';
+  // 缓存命中折线（虚线，仅当数据里有 cached_tokens 时绘制）
+  const cachedPath = hasCached
+    ? pts.map((p, i) => {
+        const [x, y] = xy(i, p.cached || 0);
+        return (i ? 'L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ')
+    : '';
+  let grid = '';
+  for (let g = 0; g <= 3; g++) {
+    const v = maxTok * g / 3;
+    const y = (H - P - (v / maxTok) * (H - 2 * P)).toFixed(1);
+    grid += '<line x1="' + P + '" y1="' + y + '" x2="' + (W - P) + '" y2="' + y +
+      '" stroke="var(--line-soft)" stroke-width="1"/>' +
+      '<text x="' + (P - 5) + '" y="' + (Number(y) + 3) + '" text-anchor="end" font-size="9" fill="var(--faint)">' +
+      fmtTokens(Math.round(v)) + '</text>';
+  }
+  let dots = '';
+  pts.forEach((p, i) => {
+    const [x, y] = xy(i, p.total);
+    dots += '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5" fill="var(--accent)">' +
+      '<title>' + p.day + '｜共 ' + p.total + ' tokens（入 ' + p.prompt + ' / 出 ' + p.completion +
+      '，' + p.calls + ' 轮）</title></circle>';
+    if (i % 5 === 0 || i === pts.length - 1) {
+      dots += '<text x="' + x.toFixed(1) + '" y="' + (H - P + 13) +
+        '" text-anchor="middle" font-size="9" fill="var(--faint)">' + p.day.slice(5) + '</text>';
+    }
+  });
+  const total = pts.reduce((a, p) => a + p.total, 0);
+  const cachedLine = hasCached
+    ? '<path d="' + cachedPath + '" fill="none" stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="4 3"/>'
+    : '';
+  const cachedLegend = hasCached
+    ? '<span><i style="background:var(--dim)"></i>其中缓存命中</span>'
+    : '';
+  pane.innerHTML =
+    '<div class="chart-legend"><span><i></i>每日 tokens</span>' +
+    cachedLegend +
+    '<span>近 30 天累计 ' + fmtTokens(total) + '</span>' +
+    '<span style="margin-left:auto">峰值 ' + fmtTokens(maxTok) + '</span></div>' +
+    '<div class="chart-box"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">' +
+    grid + '<path d="' + area + '" fill="var(--accent-soft)" stroke="none"/>' +
+    '<path d="' + path + '" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>' +
+    cachedLine + dots + '</svg></div>' +
+    '<div class="hint">数据来自 profile 的 usage.jsonl（每轮对话记录一条），悬停圆点看当天明细。</div>';
+}
+
+/* ---------- 完成提示音 / 窗口通知 ---------- */
+function playBeep() {
+  try {
+    const ctx = playBeep._ctx ||
+      (playBeep._ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = 830;
+    gain.gain.setValueAtTime(0.06, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.25);
+    osc.start(); osc.stop(ctx.currentTime + 0.26);
+  } catch (e) { /* 音频不可用就静默 */ }
+}
+
+function notifyDone() {
+  if (uiPrefs.notify_sound) playBeep();
+  if (uiPrefs.notify_desktop && document.hidden &&
+      window.Notification && Notification.permission === 'granted') {
+    try { new Notification('卅 harness', { body: '回复已完成，点回窗口查看。' }); } catch (e) {}
+  }
+}
+
+async function toggleNotify(key) {
+  uiPrefs[key] = !uiPrefs[key];
+  if (key === 'notify_desktop' && uiPrefs[key] && window.Notification &&
+      Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch (e) { /* 忽略 */ }
+  }
+  saveUiPrefs();
+}
+
+/* ---------- 自定义强调色 / 字体 ---------- */
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec((hex || '').trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function shiftColor(rgb, amt) {
+  const c = v => Math.max(0, Math.min(255, v + amt));
+  return '#' + [c(rgb.r), c(rgb.g), c(rgb.b)]
+    .map(v => v.toString(16).padStart(2, '0')).join('');
+}
+function applyAccent(hex) {
+  const root = document.documentElement;
+  const rgb = hexToRgb(hex);
+  if (!rgb) {  // 空 / 非法 → 恢复主题默认
+    ['--accent', '--accent-2', '--accent-grad', '--accent-soft', '--ring', '--accent-glow']
+      .forEach(v => root.style.removeProperty(v));
+    return;
+  }
+  const light = shiftColor(rgb, 46);
+  root.style.setProperty('--accent', hex.startsWith('#') ? hex : '#' + hex);
+  root.style.setProperty('--accent-2', light);
+  root.style.setProperty('--accent-grad',
+    'linear-gradient(135deg, #' + hex.replace('#', '') + ' 0%, ' + light + ' 100%)');
+  root.style.setProperty('--accent-soft', 'rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',.15)');
+  root.style.setProperty('--ring', '0 0 0 3px rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',.22)');
+  root.style.setProperty('--accent-glow', '0 4px 16px rgba(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ',.35)');
+}
+function applyFont(f) {
+  document.body.style.fontFamily = f
+    ? "'" + f.replace(/'/g, '') + "', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif"
+    : '';
+}
+/* ---------- 设置页：外观（主题 / 强调色 / 字体） ---------- */
+const ACCENT_PRESETS = [
+  ['', '默认（靛蓝）', '#5b7cfa'],
+  ['#2f9bff', '天蓝', '#2f9bff'],
+  ['#22b573', '翠绿', '#22b573'],
+  ['#f08c3a', '暖橙', '#f08c3a'],
+  ['#e5588a', '玫红', '#e5588a'],
+  ['#8b5cf6', '紫', '#8b5cf6'],
+];
+
+async function pickTheme(mode) {
+  applyTheme(mode);
+  await api().set_theme(mode);
+  renderAppearance();
+}
+
+function applyCustomAccent() {
+  const hex = $('accentInput').value.trim();
+  if (hex && !hexToRgb(hex)) {
+    $('appearanceNote').className = 'note-err';
+    $('appearanceNote').textContent = '颜色格式不对，需要 #RRGGBB';
+    return;
+  }
+  uiPrefs.accent = hex;
+  applyAccent(hex);
+  saveUiPrefs();
+  $('appearanceNote').className = 'note-ok';
+  $('appearanceNote').textContent = hex ? '已应用强调色 ' + hex : '已恢复默认强调色';
+  renderAppearance();
+}
+
+function applyCustomFont() {
+  uiPrefs.font = $('fontInput').value.trim();
+  applyFont(uiPrefs.font);
+  saveUiPrefs();
+  $('appearanceNote').className = 'note-ok';
+  $('appearanceNote').textContent = uiPrefs.font ? '已应用字体 ' + uiPrefs.font : '已恢复默认字体';
+  renderAppearance();
+}
+
+function renderAppearance() {
+  document.querySelectorAll('#themeSeg button').forEach(b =>
+    b.classList.toggle('sel', b.textContent.includes(THEME_TEXT[theme])));
+  const box = $('swatches');
+  box.innerHTML = '';
+  for (const [hex, label, demo] of ACCENT_PRESETS) {
+    const sw = document.createElement('button');
+    sw.type = 'button';
+    sw.className = 'swatch' + ((uiPrefs.accent || '') === hex ? ' sel' : '');
+    sw.style.background = hex || demo;
+    sw.title = label;
+    sw.onclick = () => {
+      uiPrefs.accent = hex;
+      applyAccent(hex);
+      saveUiPrefs();
+      renderAppearance();
+    };
+    box.appendChild(sw);
+  }
+  $('accentInput').value = uiPrefs.accent || '';
+  $('fontInput').value = uiPrefs.font || '';
+  $('appearanceNote').textContent = '';
+}
+
+/* ---------- 设置页：通用（界面开关 / 数据） ---------- */
+const GENERAL_TOGGLES = [
+  { label: '工作区选择条', get: () => !wsBarDismissed, act: () => toggleWsBar() },
+  { label: '右侧面板', get: () => !document.body.classList.contains('panel-hidden'),
+    act: () => togglePanel() },
+  { label: '左侧栏', get: () => !sideHidden, act: () => toggleSide() },
+  { label: '回复完成提示音', get: () => !!uiPrefs.notify_sound,
+    act: () => toggleNotify('notify_sound') },
+  { label: '窗口通知（最小化时）', get: () => !!uiPrefs.notify_desktop,
+    act: () => toggleNotify('notify_desktop') },
+  { label: '显示已完成的会话', get: () => !!uiPrefs.show_done,
+    act: () => { uiPrefs.show_done = !uiPrefs.show_done; saveUiPrefs(); refreshSidebar(); } },
+];
+
+function renderGeneral() {
+  const toggles = $('generalToggles');
+  toggles.innerHTML = '';
+  for (const t of GENERAL_TOGGLES) {
+    const row = document.createElement('div');
+    row.className = 'set-row';
+    const main = document.createElement('div');
+    main.className = 'set-main';
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = t.label;
+    main.appendChild(name);
+    const btn = document.createElement('button');
+    btn.className = 'msg-act';
+    btn.textContent = t.get() ? '已开启' : '已关闭';
+    btn.onclick = async () => { await t.act(); renderGeneral(); };
+    row.append(main, btn);
+    toggles.appendChild(row);
+  }
+  $('generalNote').textContent = '';
+}
+
+/* ---------- 设置页：用量统计 ---------- */
+async function loadUsageTab() {
+  const stats = $('usageStats');
+  stats.innerHTML = '<div class="hint">加载中…</div>';
+  const [u, d] = await Promise.all([api().usage(), api().usage_daily(30)]);
+  if (!d.ok) {
+    stats.innerHTML = '<div class="hint">' + esc(d.error || '加载失败') + '</div>';
+    return;
+  }
+  const days = d.days || [];
+  const sum = days.reduce((a, p) => ({
+    total: a.total + p.total, calls: a.calls + p.calls,
+    prompt: a.prompt + p.prompt, completion: a.completion + p.completion,
+  }), { total: 0, calls: 0, prompt: 0, completion: 0 });
+  const today = days.length ? days[days.length - 1] : { total: 0, calls: 0 };
+  const life = u.usage || {};
+  const lifeTotal = (life.prompt_tokens || 0) + (life.completion_tokens || 0);
+  const card = (v, l) => '<div class="stat"><div class="v">' + v + '</div><div class="l">' + l + '</div></div>';
+  stats.innerHTML =
+    card(fmtTokens(today.total), '今日 tokens（' + today.calls + ' 轮）') +
+    card(fmtTokens(sum.total), '近 30 天 tokens（' + sum.calls + ' 轮）') +
+    card(fmtTokens(sum.prompt) + ' / ' + fmtTokens(sum.completion), '近 30 天 输入 / 输出') +
+    card(fmtTokens(lifeTotal), '本进程累计 tokens');
+  renderUsageChart($('usageChartHolder'), days);
+}
+
+/* ---------- 设置页入口的数据动作（先关弹窗再执行，避免遮挡跳转结果） ---------- */
+function settingsSearch() {
+  closeSettings();
+  searchFlow();
+}
+function settingsExport(all) {
+  closeSettings();
+  if (all) exportAll();
+  else exportCurrent();
+}
+
+/* 跳到审查面板配置远程仓库（若该标签页此前被隐藏，先找回） */
+function gotoReview() {
+  closeSettings();
+  if (rpHidden.includes('review')) {
+    rpHidden = rpHidden.filter(n => n !== 'review');
+    saveUiPrefs();
+    applyTabVisibility();
+  }
+  switchPanel('review');
+  loadGitRemote();
+  setTimeout(() => { const el = $('gitRemoteUrl'); if (el) el.focus(); }, 80);
+}
+
+/* ---------- 初始化工程（Bootstrap：目录 + git 基线 + TODO.md） ---------- */
+async function bootstrapFlow() {
+  const goal = await dialogPrompt('工程目标（一句话，用于 README 与 TODO.md；可留空）', '');
+  if (goal === null) return;
+  showLiveBlock(); setBusy(true);
+  const res = await api().bootstrap_project(goal.trim());
+  removeLiveBlock(); setBusy(false);
+  if (!res.ok) {
+    toast('Bootstrap 失败: ' + (res.error || '未知错误'), true);
+    return;
+  }
+  const parts = (res.created || []).slice();
+  toast('Bootstrap 完成：' + (parts.length ? parts.join('、') : '工作区已就绪') +
+    (res.committed ? ' · 已提交基线' : ''));
+  if (res.commit_error) add('基线提交未完成: ' + res.commit_error, 'bot error');
+  if (res.todo_note) toast('TODO.md：' + res.todo_note);
+  refreshSidebar();
+  loadWsTree();
+}
+
+/* ---------- 快捷指令（常用提示词片段，一键插入） ---------- */
+async function snipMenu() {
+  const res = await api().snippets_list();
+  const items = res.snippets || [];
+  const ta = $('input');
+  if (!items.length) {
+    // 一条都没有：引导从当前输入新建
+    const name = await dialogPrompt('新建快捷指令：名称', '');
+    if (name === null || !name.trim()) return;
+    const text = await dialogPrompt('提示词内容', ta.value.trim());
+    if (text === null || !text.trim()) return;
+    const r = await api().snippets_save(name.trim(), text.trim());
+    if (!r.ok) add(r.error || '保存失败', 'bot error');
+    return;
+  }
+  const options = items.map(s => ({
+    value: 'use:' + s.name, label: s.name, sub: s.text.split('\n')[0].slice(0, 40),
+  }));
+  if (ta.value.trim()) options.push({ value: 'add', label: '＋ 把当前输入存为指令', sub: '' });
+  options.push({ value: 'del', label: '🗑 删除指令…', sub: '' });
+  const pick = await dialogChoose('快捷指令（选中后插入输入框）', options);
+  if (pick === null) return;
+  if (pick.startsWith('use:')) {
+    const s = items.find(i => i.name === pick.slice(4));
+    if (s) {
+      ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n' + s.text : s.text;
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    }
+  } else if (pick === 'add') {
+    const name = await dialogPrompt('指令名称', '');
+    if (name === null || !name.trim()) return;
+    const r = await api().snippets_save(name.trim(), ta.value.trim());
+    if (!r.ok) add(r.error || '保存失败', 'bot error');
+  } else if (pick === 'del') {
+    const del = await dialogChoose('删除哪个指令？',
+      items.map(s => ({ value: s.name, label: s.name, sub: s.text.split('\n')[0].slice(0, 40) })));
+    if (del !== null) await api().snippets_delete(del);
+  }
+}
+
+/* ---------- 拖拽文件入窗（图片 → 附加；文本 → 插入输入框） ---------- */
+const DROP_IMG_RE = /\.(png|jpe?g|gif|webp)$/i;
+const DROP_TEXT_RE = /\.(md|txt|py|js|ts|json|yaml|yml|html|css|go|saho|csv|rst|toml|ini|sh|bat|c|cpp|h|hpp|java|rs|xml|sql)$/i;
+let dragDepth = 0;
+
+window.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragDepth++;
+  document.body.classList.add('dragging');
+});
+window.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) document.body.classList.remove('dragging');
+});
+window.addEventListener('dragover', (e) => { e.preventDefault(); });
+window.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('dragging');
+  for (const f of (e.dataTransfer.files || [])) {
+    if (DROP_IMG_RE.test(f.name)) {
+      const p = f.path || '';  // WebView2 会带上磁盘路径；拿不到就只能提示
+      if (!p) {
+        toast('拿不到「' + f.name + '」的磁盘路径，请用 📎 选择或粘贴完整路径', true);
+        continue;
+      }
+      const chk = await api().check_image(p);
+      if (chk.ok) addImagePath(chk.path);
+      else toast(chk.error, true);
+    } else if (DROP_TEXT_RE.test(f.name) && f.size <= 200 * 1024) {
+      const text = await f.text();
+      const ta = $('input');
+      const head = '【文件: ' + f.name + '】\n';
+      const body = text.slice(0, 8000) + (text.length > 8000 ? '\n…（已截断）' : '');
+      ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n\n' + head + body : head + body;
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    } else {
+      toast('已跳过「' + f.name + '」——只支持图片或 200KB 内的文本文件', true);
+    }
+  }
+});
 
 async function loadWsTree() {
   const res = await api().ws_tree(wsPath);
@@ -2136,11 +5392,229 @@ async function loadWsTree() {
     row.innerHTML = '<span>' + (e.dir ? '📁' : '📄') + '</span>' +
       '<span class="t-name">' + esc(e.name) + '</span>' +
       (e.dir ? '' : '<span class="t-size">' + fmtTokens(e.size) + 'B</span>');
-    if (e.dir) row.onclick = () => { wsPath = wsPath ? wsPath + '/' + e.name : e.name; loadWsTree(); };
+    if (e.dir) {
+      row.onclick = () => { wsPath = wsPath ? wsPath + '/' + e.name : e.name; loadWsTree(); };
+    } else {
+      row.title = '点击预览：' + e.name;
+      row.onclick = () => previewWsFile(e.name);
+    }
     frag.appendChild(row);
   }
   pane.appendChild(frag);
 }
+/* ---------- 文件预览（工作区面板内） ---------- */
+const FP_KINDS = { image: '图片', markdown: 'Markdown', table: '表格数据',
+  code: '文本/代码', html: 'HTML 页面', pdf: 'PDF', office: 'Office 文档',
+  archive: '压缩包', audio: '音频', video: '视频', binary: '二进制', unknown: '未知' };
+const FP_KW = {
+  py: ['def', 'class', 'return', 'if', 'elif', 'else', 'for', 'while', 'import',
+       'from', 'try', 'except', 'finally', 'with', 'as', 'lambda', 'yield', 'None',
+       'True', 'False', 'and', 'or', 'not', 'in', 'is', 'raise', 'async', 'await'],
+  js: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while',
+       'class', 'new', 'import', 'export', 'from', 'async', 'await', 'try', 'catch',
+       'throw', 'typeof', 'this', 'null', 'undefined', 'true', 'false', 'switch',
+       'case', 'default', 'break', 'continue', 'extends', 'super'],
+  go: ['func', 'package', 'import', 'var', 'const', 'type', 'struct', 'interface',
+       'return', 'if', 'else', 'for', 'range', 'switch', 'case', 'default', 'go',
+       'defer', 'chan', 'map', 'nil', 'true', 'false'],
+  rs: ['fn', 'let', 'mut', 'struct', 'enum', 'impl', 'trait', 'use', 'pub', 'mod',
+       'match', 'if', 'else', 'for', 'while', 'loop', 'return', 'Some', 'None', 'Ok', 'Err'],
+  sh: ['if', 'then', 'fi', 'else', 'elif', 'for', 'in', 'do', 'done', 'while',
+       'case', 'esac', 'function', 'export', 'local', 'echo'],
+  sql: ['select', 'from', 'where', 'join', 'left', 'inner', 'group', 'order', 'by',
+        'insert', 'update', 'delete', 'create', 'table', 'as', 'and', 'or', 'limit'],
+  saho: ['函数', '如果', '否则', '循环', '当', '返回', '变量', '定义', '输出', '读取', '引入', '真', '假'],
+};
+FP_KW.ts = (FP_KW.js || []).concat(['interface', 'type', 'enum', 'public', 'private']);
+FP_KW.tsx = FP_KW.ts;
+FP_KW.jsx = FP_KW.js;
+FP_KW.mjs = FP_KW.js;
+FP_KW.cjs = FP_KW.js;
+FP_KW.java = ['public', 'private', 'class', 'static', 'void', 'final', 'new', 'return',
+              'if', 'else', 'for', 'while', 'try', 'catch', 'import', 'package', 'extends'];
+FP_KW.c = ['int', 'char', 'float', 'double', 'void', 'return', 'if', 'else', 'for',
+           'while', 'struct', 'typedef', 'static', 'const', 'include', 'define'];
+FP_KW.cpp = (FP_KW.c || []).concat(['class', 'public', 'private', 'template', 'namespace', 'new']);
+FP_KW.cs = FP_KW.java;
+FP_KW.php = ['function', 'class', 'public', 'private', 'echo', 'if', 'else', 'foreach',
+             'return', 'new', 'namespace', 'use'];
+
+// 轻量语法着色：先按正则切词再逐段转义，绝不在已生成的 HTML 上做替换
+// （那样会把 class="c-com" 之类的名字也当关键字染色，导致结构错乱）
+function hlCode(text, ext) {
+  const kw = new Set(FP_KW[String(ext || '').replace('.', '')] || []);
+  const re = /(\/\/[^\n]*|#[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\b\d[\w.]*\b)|([A-Za-z_一-龥][\w一-龥]*)/g;
+  let out = '', last = 0, m;
+  const push = (raw, cls) => {
+    out += cls ? '<span class="' + cls + '">' + esc(raw) + '</span>' : esc(raw);
+  };
+  while ((m = re.exec(text)) !== null) {
+    push(text.slice(last, m.index), '');
+    if (m[1]) push(m[0], 'c-com');
+    else if (m[2]) push(m[0], 'c-str');
+    else if (m[3]) push(m[0], 'c-num');
+    else push(m[0], kw.has(m[0]) ? 'c-kw' : '');
+    last = m.index + m[0].length;
+  }
+  push(text.slice(last), '');
+  return out;
+}
+
+function fpTable(text, sep) {
+  // CSV/TSV 简易表格（最多 300 行、每行最多 40 列）
+  const lines = text.split(/\r?\n/).filter(l => l.trim()).slice(0, 300);
+  if (!lines.length) return '<div class="hint">（空文件）</div>';
+  const rows = lines.map(l => l.split(sep).slice(0, 40));
+  const head = rows[0];
+  let h = '<div class="fp-table"><table><thead><tr>';
+  for (const c of head) h += '<th>' + esc(c) + '</th>';
+  h += '</tr></thead><tbody>';
+  for (const r of rows.slice(1)) {
+    h += '<tr>';
+    for (const c of r) h += '<td>' + esc(c) + '</td>';
+    h += '</tr>';
+  }
+  return h + '</tbody></table></div>';
+}
+
+async function previewWsFile(name) {
+  const rel = wsPath ? wsPath + '/' + name : name;
+  const box = $('filePreview');
+  box.classList.add('open');
+  box.innerHTML = '<div class="hint">预览加载中…</div>';
+  const r = await api().file_preview(rel);
+  if (!r.ok) {
+    box.innerHTML = '<div class="hint">' + esc(r.error || '无法预览') + '</div>';
+    return;
+  }
+  const size = (r.size || 0) >= 1024
+    ? ((r.size / 1024).toFixed(1) + ' KB') : (r.size + ' B');
+  const when = r.mtime ? new Date(r.mtime * 1000).toLocaleString('zh-CN') : '';
+  const head = document.createElement('div');
+  head.className = 'fp-head';
+  const nm = document.createElement('span');
+  nm.className = 'fp-name';
+  nm.textContent = '📄 ' + r.name;
+  const meta = document.createElement('span');
+  meta.className = 'fp-meta';
+  meta.textContent = (FP_KINDS[r.kind] || r.kind) + ' · ' + size +
+    (when ? ' · ' + when : '') + (r.truncated ? ' · 已截断（>256KB）' : '') +
+    (r.note ? ' · ' + r.note : '');
+  const sp = document.createElement('span');
+  sp.className = 'sp';
+  const bOpen = document.createElement('button');
+  bOpen.className = 'mini-btn';
+  bOpen.textContent = '用系统打开';
+  bOpen.onclick = () => openFileExternal(r.rel);
+  const bClose = document.createElement('button');
+  bClose.className = 'mini-btn';
+  bClose.textContent = '✕';
+  bClose.onclick = closeFilePreview;
+  head.append(nm, meta, sp, bOpen, bClose);
+
+  const body = document.createElement('div');
+  if (r.kind === 'image') {
+    const img = document.createElement('img');
+    img.className = 'fp-img';
+    img.src = r.data_url || '';
+    img.alt = r.name;
+    body.appendChild(img);
+  } else if (r.kind === 'pdf' && r.data_url) {
+    const fr = document.createElement('iframe');
+    fr.className = 'fp-frame';
+    fr.src = r.data_url;
+    fr.title = r.name;
+    body.appendChild(fr);
+  } else if (r.kind === 'audio' && r.data_url) {
+    const au = document.createElement('audio');
+    au.className = 'fp-media';
+    au.controls = true;
+    au.src = r.data_url;
+    body.appendChild(au);
+  } else if (r.kind === 'video' && r.data_url) {
+    const vd = document.createElement('video');
+    vd.className = 'fp-media';
+    vd.controls = true;
+    vd.src = r.data_url;
+    body.appendChild(vd);
+  } else if (r.kind === 'html' && r.text !== undefined) {
+    // HTML：默认沙箱渲染（禁脚本/同源），可切换看源码
+    const wrap = document.createElement('div');
+    wrap.className = 'fp-html-wrap';
+    const view = document.createElement('div');
+    view.className = 'fp-html-view';
+    const fr = document.createElement('iframe');
+    fr.className = 'fp-frame';
+    fr.setAttribute('sandbox', '');
+    fr.srcdoc = r.text;
+    view.appendChild(fr);
+    let asSource = false;
+    const bToggle = document.createElement('button');
+    bToggle.className = 'mini-btn';
+    bToggle.textContent = '查看源码';
+    bToggle.onclick = () => {
+      asSource = !asSource;
+      bToggle.textContent = asSource ? '渲染页面' : '查看源码';
+      view.innerHTML = '';
+      if (asSource) {
+        const pre = document.createElement('pre');
+        pre.className = 'fp-code';
+        pre.innerHTML = hlCode(r.text || '', r.ext);
+        view.appendChild(pre);
+      } else {
+        const f2 = document.createElement('iframe');
+        f2.className = 'fp-frame';
+        f2.setAttribute('sandbox', '');
+        f2.srcdoc = r.text;
+        view.appendChild(f2);
+      }
+    };
+    const bar = document.createElement('div');
+    bar.className = 'fp-html-bar';
+    bar.appendChild(bToggle);
+    wrap.append(bar, view);
+    body.appendChild(wrap);
+  } else if (r.kind === 'markdown') {
+    body.innerHTML = md(r.text || '');
+  } else if (r.kind === 'table') {
+    body.innerHTML = fpTable(r.text || '', r.ext === '.tsv' ? '\t' : ',');
+  } else if (r.text !== undefined && r.kind !== 'unknown') {
+    // code / office 文本 / 压缩包清单 / 二进制摘要：统一按等宽文本呈现
+    const pre = document.createElement('pre');
+    pre.className = 'fp-code';
+    pre.innerHTML = (r.kind === 'code' || r.kind === 'html')
+      ? hlCode(r.text || '', r.ext) : esc(r.text || '');
+    body.appendChild(pre);
+  } else {
+    const p = document.createElement('div');
+    p.className = 'fp-info';
+    const why = {
+      office: '该 Office 格式（老格式或 >8MB）无法在面板内解析',
+      archive: '该压缩格式（非 zip 或 >8MB）无法在面板内列出内容',
+      audio: '音频超过内嵌上限',
+      video: '视频超过内嵌上限',
+      pdf: 'PDF 超过内嵌上限',
+      binary: '二进制内容无法解析',
+    }[r.kind] || '该类型暂不支持内嵌预览';
+    p.textContent = why + ' —— 点「用系统打开」用本机默认程序查看。';
+    body.appendChild(p);
+  }
+  box.innerHTML = '';
+  box.append(head, body);
+}
+
+function closeFilePreview() {
+  const box = $('filePreview');
+  if (!box) return;
+  box.classList.remove('open');
+  box.innerHTML = '';
+}
+
+async function openFileExternal(rel) {
+  const r = await api().open_external(rel);
+  if (!r.ok) toast(r.error || '打开失败', true);
+}
+
 function wsUp() {
   if (!wsPath) return;
   const idx = wsPath.lastIndexOf('/');
@@ -2161,19 +5635,96 @@ async function termRun() {
   out.scrollTop = out.scrollHeight;
 }
 
+/* ---------- 浏览器（多标签页，各自独立 iframe） ---------- */
+let brTabsArr = [];   // [{id, url}]
+let brActive = 0;
+let brSeq = 0;
+
+function renderBrTabs() {
+  const box = $('brTabs');
+  box.innerHTML = '';
+  brTabsArr.forEach((t, i) => {
+    const el = document.createElement('div');
+    el.className = 'br-tab' + (i === brActive ? ' active' : '');
+    let host = t.url;
+    try { host = t.url ? (new URL(t.url).host || t.url) : '新标签页'; } catch (err) { host = t.url; }
+    el.innerHTML = '<span class="bt-name" title="' + esc(t.url || '新标签页') + '">' +
+      esc(host) + '</span><span class="bt-x" title="关闭此标签页">✕</span>';
+    el.querySelector('.bt-name').onclick = () => { brActive = i; renderBrTabs(); showBrFrame(); };
+    el.querySelector('.bt-x').onclick = (e) => { e.stopPropagation(); brClose(i); };
+    box.appendChild(el);
+  });
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'br-add';
+  add.textContent = '＋';
+  add.title = '新标签页';
+  add.onclick = () => {
+    brTabsArr.push({ id: ++brSeq, url: '' });
+    brActive = brTabsArr.length - 1;
+    renderBrTabs(); showBrFrame();
+  };
+  box.appendChild(add);
+}
+
+function showBrFrame() {
+  const frames = $('brFrames');
+  frames.querySelectorAll('iframe').forEach(f => f.classList.remove('on'));
+  const t = brTabsArr[brActive];
+  $('brEmpty').style.display = (t && t.url) ? 'none' : 'flex';
+  $('brUrl').value = (t && t.url) || '';
+  if (!t) return;
+  let f = frames.querySelector('iframe[data-bid="' + t.id + '"]');
+  if (!f) {
+    f = document.createElement('iframe');
+    f.dataset.bid = String(t.id);
+    f.src = 'about:blank';
+    frames.appendChild(f);
+  }
+  f.classList.add('on');
+}
+
+function brClose(i) {
+  const t = brTabsArr[i];
+  if (t) {
+    const f = $('brFrames').querySelector('iframe[data-bid="' + t.id + '"]');
+    if (f) f.remove();
+  }
+  brTabsArr.splice(i, 1);
+  if (!brTabsArr.length) brTabsArr.push({ id: ++brSeq, url: '' });
+  if (brActive >= brTabsArr.length) brActive = brTabsArr.length - 1;
+  renderBrTabs();
+  showBrFrame();
+}
+
 function brGo() {
   let url = $('brUrl').value.trim();
   if (!url) return;
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
   $('brUrl').value = url;
-  $('browserFrame').src = url;
+  if (!brTabsArr[brActive]) brTabsArr[brActive] = { id: ++brSeq, url: '' };
+  const t = brTabsArr[brActive];
+  t.url = url;
+  const frames = $('brFrames');
+  let f = frames.querySelector('iframe[data-bid="' + t.id + '"]');
+  if (!f) {
+    f = document.createElement('iframe');
+    f.dataset.bid = String(t.id);
+    frames.appendChild(f);
+  }
+  f.src = url;
+  $('brEmpty').style.display = 'none';
+  renderBrTabs();
 }
 function brExternal() {
   const url = $('brUrl').value.trim();
   if (url) api().open_url(/^https?:\/\//i.test(url) ? url : 'https://' + url);
 }
+renderBrTabs();
+showBrFrame();
 
 async function loadReview() {
+  loadGitRemote();
   const out = $('reviewOut');
   out.textContent = '正在生成…';
   const res = await api().review();
@@ -2221,12 +5772,14 @@ function auxAdd(text, cls, reasoning) {
     if (reasoning) {
       const rd = document.createElement('div');
       rd.className = 'reasoning';
-      rd.innerHTML = '<div class="r-head">🧠 思考 · 点击展开</div><div class="r-body"></div>';
+      rd.innerHTML = '<div class="r-head"><span class="r-caret">▶</span><span>🧠</span>' +
+        '<span class="r-title">思考过程 · 展开查看</span></div><div class="r-body"></div>';
       rd.querySelector('.r-body').textContent = reasoning;
       rd.querySelector('.r-head').onclick = () => rd.classList.toggle('open');
       div.appendChild(rd);
     }
     const body = document.createElement('div');
+    body.className = 'md-body';
     body.innerHTML = md(text);
     div.appendChild(body);
   }
@@ -2251,12 +5804,40 @@ $('brUrl').addEventListener('keydown', (e) => {
 
 /* ---------- 启动 ---------- */
 window.addEventListener('pywebviewready', async () => {
-  await refreshStatus();
-  await refreshSidebar();
-  const s = await api().session_history(currentSession);
-  for (const m of (s.history || [])) add(m.content, m.role === 'user' ? 'user' : 'bot');
-  showHeroIfEmpty();
-  await auxInit();
+  // 整条启动链互相隔离：任何一步抛错都只影响那一步，并在聊天区显示
+  // 具体错误——绝不让整个聊天区「莫名空白」且无从排查
+  const step = async (name, fn) => {
+    try { await fn(); }
+    catch (err) {
+      try {
+        add('启动步骤「' + name + '」失败: ' + (err && err.message || err), 'bot error');
+      } catch (e2) { /* 连 add 都失败时至少留在 console */ }
+      console.error('[boot]', name, err);
+    }
+  };
+  // localStorage 快速恢复外观（不等后端，避免闪一下默认色）
+  const savedAccent = lsGet('sh_accent');
+  if (savedAccent) { uiPrefs.accent = savedAccent; applyAccent(savedAccent); }
+  const savedFont = lsGet('sh_font');
+  if (savedFont) { uiPrefs.font = savedFont; applyFont(savedFont); }
+  await step('状态加载', async () => {
+    await refreshStatus();
+    await refreshSidebar();
+  });
+  await step('界面偏好恢复', async () => {
+    const p = await api().get_ui_prefs();
+    if (p && p.ok) applyUiPrefs(p.prefs);
+  });
+  await step('会话历史加载', async () => {
+    const s = await api().session_history(currentSession);
+    (s.history || []).filter(m => (m.content || '').trim()).forEach((m, i) =>
+      add(m.content, m.role === 'user' ? 'user' : 'bot', null, null, i));
+    showHeroIfEmpty();
+  });
+  await step('辅助对话初始化', async () => {
+    await auxInit();
+  });
+  updateSendState();
   $('input').focus();
 });
 </script></body></html>"""

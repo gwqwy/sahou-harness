@@ -10,9 +10,16 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 WORK = ROOT / "build_pyi"
 
+# nanoagent 是 PEP 660 editable 安装（__editable__ finder），PyInstaller 解析不到
+# 它的子模块 —— 必须把真实源码目录显式加进 --paths（动态解析，不硬编码）。
+import nanoagent  # noqa: E402
+
+NANO_SRC = Path(nanoagent.__file__).resolve().parent.parent
+
 COMMON = [
     "--noconfirm", "--clean",
     "--paths", str(ROOT),
+    "--paths", str(NANO_SRC),
     "--collect-submodules", "harness",
     "--collect-submodules", "nanoagent",
     "--collect-all", "webview",
@@ -26,8 +33,9 @@ COMMON = [
 ]
 
 BUILDS = [
-    ("sha", ["--onefile", str(ROOT / "launcher_sha.py")]),
-    ("ShaDesktop", ["--onefile", "--noconsole", str(ROOT / "launcher_desktop.py")]),
+    ("sha", ["--onefile", str(ROOT / "tools" / "launcher_sha.py")]),
+    ("ShaDesktop", ["--onefile", "--noconsole",
+                    str(ROOT / "tools" / "launcher_desktop.py")]),
 ]
 
 for name, extra in BUILDS:

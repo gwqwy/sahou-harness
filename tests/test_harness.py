@@ -545,6 +545,16 @@ class ToolTests(unittest.TestCase):
             self.assertIn("缺少 content", write_todo.invoke({"items": [{"status": "done"}]}))
             self.assertIn("需要是数组", write_todo.invoke({"items": {"content": "x"}}))
 
+            # F1：清单落盘为工作区 TODO.md（Markdown 勾选格式，跨会话持久）
+            todo_md = Path(tmp) / "TODO.md"
+            self.assertTrue(todo_md.is_file())
+            self.assertIn("- [x] 第一步", todo_md.read_text(encoding="utf-8"))
+            # 预置手写 TODO.md → todo_read 能解析（人可读、Git 可跟踪）
+            todo_md.write_text(
+                "# TODO\n\n- [ ] 手写任务 —— 补充\n- [x] 已完成项\n", encoding="utf-8")
+            self.assertIn("[ ] 1. 手写任务 —— 补充", read_todo.invoke({}))
+            self.assertIn("[x] 2. 已完成项", read_todo.invoke({}))
+
     def test_shell_cwd_and_env(self):
         with tempfile.TemporaryDirectory() as tmp, patch_model_build():
             host = allow_shell(build_host(Path(tmp)))
@@ -1356,6 +1366,46 @@ class ProfileTests(unittest.TestCase):
             self.assertIn("这不是 json", backups[0].read_text(encoding="utf-8"))
 
 
+class ToolParamAliasTests(unittest.TestCase):
+    """参数别名兼容层：模型用 path/file/glob 等叫法也能调到工具（不再 TypeError）。"""
+
+    def _run(self, host, reg, name, arguments):
+        from nanoagent.tools import ToolCall
+
+        return reg.execute(ToolCall(id="t", name=name, arguments=arguments))
+
+    def test_alias_normalization(self):
+        from nanoagent.tools import ToolRegistry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            ws = Path(tmp) / "ws"
+            ws.mkdir(exist_ok=True)
+            (ws / "a.txt").write_text("hello-alias", encoding="utf-8")
+            host.workspace = str(ws)
+            # 权限门默认 ask（非交互场景一律拒绝）——测别名需要放开写入
+            host.profile.update_config(
+                permissions={"shell": "allow", "fs": "allow", "git": "allow"})
+            reg = ToolRegistry()
+            for tool in host.collect_tools():
+                reg.register(tool)
+            # list_files：模型常写 path / glob（真实参数名是 pattern）
+            out = self._run(host, reg, "list_files", {"path": "."})
+            self.assertNotIn("unexpected keyword", out)
+            out = self._run(host, reg, "list_files", {"glob": "**/*.txt"})
+            self.assertNotIn("unexpected keyword", out)
+            self.assertIn("a.txt", out)
+            # read_file：file= 别名 → path
+            out = self._run(host, reg, "read_file", {"file": "a.txt"})
+            self.assertIn("hello-alias", out)
+            # write_file：filename + text 别名
+            out = self._run(host, reg, "write_file",
+                            {"filename": "b.txt", "text": "written"})
+            self.assertNotIn("unexpected keyword", out)
+            self.assertTrue((ws / "b.txt").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1461,6 +1511,58 @@ class ExportUsageTests(unittest.TestCase):
             self.assertIn("## 用户", content)
             self.assertIn("## 助手", content)
 
+    def test_exporter_module_shared_with_desktop(self):
+        from harness.exporter import export_session_markdown, usage_records
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            profile.save_session("s1", [
+                {"role": "user", "content": "你好"},
+                {"role": "assistant", "content": "你好！"},
+            ])
+            (profile.root / "usage.jsonl").write_text(
+                json.dumps({"session": "s1", "prompt_tokens": 5,
+                            "completion_tokens": 7}) + "\n", encoding="utf-8")
+            dest = export_session_markdown(profile, "s1", Path(tmp) / "exports")
+            self.assertEqual(dest.name, "s1.md")
+            content = dest.read_text(encoding="utf-8")
+            self.assertIn("## 用户", content)
+            self.assertIn("## 助手", content)
+            self.assertIn("输入 5 + 输出 7 = 12 tokens", content)
+            self.assertEqual(usage_records(profile)[0]["session"], "s1")
+            # 空会话 → FileNotFoundError（由调用方呈现）
+            with self.assertRaises(FileNotFoundError):
+                export_session_markdown(profile, "missing", Path(tmp) / "exports")
+
+    def test_schedule_pause_resume_cli(self):
+        import contextlib
+        import io
+
+        from harness.cli import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "schedule", "add", "巡检",
+                                       "--every", "60", "--prompt", "看看"]), 0)
+                self.assertEqual(main([*base, "schedule", "pause", "巡检"]), 0)
+            self.assertIn("已暂停任务 巡检", buf.getvalue())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "schedule", "list"]), 0)
+            self.assertIn("[停用]", buf.getvalue())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(main([*base, "schedule", "resume", "巡检"]), 0)
+                self.assertEqual(main([*base, "schedule", "list"]), 0)
+            self.assertIn("已恢复任务 巡检", buf.getvalue())
+            self.assertIn("[启用]", buf.getvalue())
+            # 不存在的任务 → 报错退出码 1
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(main([*base, "schedule", "pause", "不存在"]), 1)
+
 
 class RoundtableCliTests(unittest.TestCase):
     """功能2：sha roundtable 多角色圆桌讨论。"""
@@ -1522,3 +1624,105 @@ class RoundtableCliTests(unittest.TestCase):
                 rc = main([*base, "roundtable", "议题"])
             self.assertEqual(rc, 1)
             self.assertIn("没有可用模型", err.getvalue())
+
+
+class BareShaDefaultChatTests(unittest.TestCase):
+    """裸敲 `sha`（无子命令）默认走 chat。
+
+    回归：command 默认 "chat" 但顶层 Namespace 没有 chat 子命令的
+    message/session/new 字段，直接 args.message 会 AttributeError，
+    用户只看到一行裸异常（2026-09-27 实测）。
+    """
+
+    def test_bare_sha_reaches_repl_with_defaults(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        import harness.cli as cli
+        from harness.cli import main
+
+        captured = {}
+
+        class FakeHost:
+            def service(self, name):
+                def ui(once_message=None, session_id=None, force_new=False):
+                    captured["call"] = (once_message, session_id, force_new)
+                return ui
+
+            def shutdown(self):
+                captured["shutdown"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = ["--home", tmp, "--workspace", tmp]
+            with mock.patch.object(cli, "build_runtime", return_value=FakeHost()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = main([*base, "chat", "-m", "你好"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured["call"], ("你好", None, False))
+            # 裸 `sha`：没有 message/session/new 属性也必须正常进 REPL
+            with mock.patch.object(cli, "build_runtime", return_value=FakeHost()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = main([*base])
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured["call"], (None, None, False))
+
+
+class LongrunInjectionTests(unittest.TestCase):
+    """F2/F3：长程执行准则注入 + 新会话自动恢复（TODO.md 未完成项 + git log）。"""
+
+    def test_guidelines_and_recovery_injected(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ws = Path(host.workspace)
+            (ws / "TODO.md").write_text(
+                "# TODO\n\n- [ ] 待办任务甲\n- [x] 已完成项乙\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=ws, check=False)
+            (ws / "f.txt").write_text("x", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=ws, check=False)
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                            "commit", "-qm", "基线提交"], cwd=ws, check=False)
+
+            agent = host.service("agent_factory")()
+            self.assertIn("长程任务执行准则", agent.instructions)
+            self.assertIn("原子任务最小粒度", agent.instructions)
+            # 恢复：未完成项与提交进入 instructions，已完成项不注入
+            self.assertIn("待办任务甲", agent.instructions)
+            self.assertIn("基线提交", agent.instructions)
+            self.assertNotIn("- [x]", agent.instructions)
+
+    def test_guidelines_and_recovery_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            ws = Path(host.workspace)
+            (ws / "TODO.md").write_text("# TODO\n\n- [ ] 待办任务甲\n", encoding="utf-8")
+            host.profile.update_config(longrun={"guidelines": False, "recovery": False})
+            agent = host.service("agent_factory")()
+            self.assertNotIn("长程任务执行准则", agent.instructions)
+            self.assertNotIn("待办任务甲", agent.instructions)
+
+
+class PlanModeTests(unittest.TestCase):
+    """计划模式：开启时注入「先出计划等确认」指令；关闭即恢复。"""
+
+    def test_plan_mode_injection_and_toggle(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            host.profile.update_config(plan_mode=True)
+            agent = host.service("agent_factory")()
+            self.assertIn("计划模式（当前开启）", agent.instructions)
+            self.assertIn("先输出实现计划", agent.instructions)
+            self.assertIn("等待用户确认", agent.instructions)
+
+            # set_plan_mode(False) → 重建 agent 后指令恢复
+            message = host.service("set_plan_mode")(False)
+            self.assertIn("已关闭", message)
+            agent2 = host.service("agent_factory")()
+            self.assertNotIn("计划模式（当前开启）", agent2.instructions)
+
+            # 再开 → 重建后再次注入
+            host.service("set_plan_mode")(True)
+            agent3 = host.service("agent_factory")()
+            self.assertIn("计划模式（当前开启）", agent3.instructions)

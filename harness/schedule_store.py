@@ -105,6 +105,25 @@ def remove_task(profile: Profile, name: str) -> bool:
     return True
 
 
+def set_task_enabled(profile: Profile, name: str, enabled: bool) -> bool:
+    """暂停 / 恢复单个任务（只翻 enabled 标志，不动 last_run）。
+
+    任务不存在返回 False；存在则写入并返回 True。worker 每轮 tick 重读盘，
+    因此对正在运行的 harness 立即生效。
+    """
+    clean = validate_name(name)
+    tasks = load_tasks(profile)
+    hit = False
+    for task in tasks:
+        if str(task.get("name")) == clean:
+            task["enabled"] = bool(enabled)
+            hit = True
+            break
+    if hit:
+        save_tasks(profile, tasks)
+    return hit
+
+
 def due_tasks(tasks: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
     """挑出到点应执行的任务（enabled 且 now - last_run >= every）。
 

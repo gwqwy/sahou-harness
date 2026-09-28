@@ -53,6 +53,71 @@ class EventBus:
 
 
 # ----------------------------------------------------------------------
+# 参数别名兼容层：模型对同一语义的参数有多种叫法（path / file / filename…），
+# 参数名不匹配会让工具直接 TypeError，看起来像「工具没用/没返回结果」。
+# 注册时包一层：把常见别名归一成函数实际参数名，再调用。
+_PARAM_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+    # 路径 / 模式（list_files 的 pattern 与 read_file 的 path 常被混叫）
+    frozenset({"path", "file", "files", "filepath", "file_path", "filename",
+               "target", "dir", "directory", "subdir", "root", "pattern", "glob",
+               "query"}),
+    # 文本内容
+    frozenset({"content", "text", "data", "body", "value"}),
+    # 命令
+    frozenset({"command", "cmd", "script", "shell"}),
+    # 编辑工具
+    frozenset({"old", "old_text", "old_string", "search", "find"}),
+    frozenset({"new", "new_text", "new_string", "replace", "replacement"}),
+    # 数量 / 上限
+    frozenset({"count", "times", "max_results", "limit", "max_lines", "offset",
+               "start", "start_line", "end", "end_line", "n"}),
+)
+
+
+def _tolerant_signature(fn: Callable) -> Callable:
+    """包装工具函数：容忍参数别名（path↔file↔pattern…），减少无谓的工具失败。"""
+    import functools
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters)
+    except (TypeError, ValueError):
+        return fn
+    if not params:
+        return fn
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not kwargs or all(k in params for k in kwargs):
+            return fn(*args, **kwargs)
+        fixed: dict[str, Any] = {}
+        unknown: dict[str, Any] = {}
+        for key, val in kwargs.items():
+            if key in params:
+                fixed[key] = val
+                continue
+            target = None
+            for group in _PARAM_ALIAS_GROUPS:
+                if key in group:
+                    # 在该别名组里找一个「函数真有的、还没被赋值」的参数
+                    target = next((p for p in params
+                                   if p in group and p not in fixed and p not in args),
+                                  None)
+                    break
+            if target:
+                fixed[target] = val
+            else:
+                unknown[key] = val
+        fixed.update(unknown)  # 认不出来的原样传下去，由工具层给出可读报错
+        return fn(*args, **fixed)
+
+    # 保留原签名信息（make_tool 靠它生成 schema）
+    wrapper.__signature__ = sig  # type: ignore[attr-defined]
+    return wrapper
+
+
+# ----------------------------------------------------------------------
 class _Tools:
     """ctx.tools：注册 agent 可调用的工具。"""
 
@@ -62,7 +127,8 @@ class _Tools:
     def register(self, source: Any, name: str | None = None) -> Any:
         from nanoagent.tools import Tool, make_tool
 
-        tool = source if isinstance(source, Tool) else make_tool(source, name=name)
+        tool = (source if isinstance(source, Tool)
+                else make_tool(_tolerant_signature(source), name=name))
         self._ctx.tools_list.append(tool)
         return tool
 

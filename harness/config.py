@@ -41,11 +41,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "permissions": {
         "shell": DEFAULT_PERMISSION_MODE,
         "fs": DEFAULT_PERMISSION_MODE,
+        "git": DEFAULT_PERMISSION_MODE,  # tools_git 写操作（add/commit）权限门
         # 免二次确认的命令 glob（只在 shell=ask 时起作用；shell=deny 仍然一律拒绝）
         "shell_allow": [],
         # 审批决定是否写审计日志（<profile>/audit/shell.jsonl）
         "audit": True,
     },
+    # 长程任务（F4/F7）：git 测试门与子代理只读
+    # allow_agent_commit=False：提交/推送由用户手动完成，agent 不代劳（F4 修订）
+    "git": {"test_command": "", "allow_agent_commit": False},
+    "subagent": {"readonly": False},
+    # 计划模式：实现类任务先出计划等确认再动手（桌面端 📋 按钮 / REPL /plan）
+    "plan_mode": False,
 }
 
 CONFIG_EXAMPLE = {
@@ -320,10 +327,13 @@ class Profile:
         import subprocess
         import tempfile
 
+        from .procutil import CREATE_NO_WINDOW
+
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 subprocess.run(["git", "clone", "--depth", "1", url, tmp],
-                               check=True, capture_output=True, timeout=300)
+                               check=True, capture_output=True, timeout=300,
+                               creationflags=CREATE_NO_WINDOW)
             except FileNotFoundError as exc:
                 raise OSError("未找到 git 命令，无法从地址安装插件") from exc
             except subprocess.CalledProcessError as exc:
@@ -331,7 +341,8 @@ class Profile:
                 raise OSError(f"git clone 失败: {detail or exc}") from exc
             try:
                 subprocess.run(["git", "-C", tmp, "remote", "remove", "origin"],
-                               check=False, capture_output=True, timeout=60)
+                               check=False, capture_output=True, timeout=60,
+                               creationflags=CREATE_NO_WINDOW)
             except (OSError, subprocess.SubprocessError):
                 pass
             root = Path(tmp)
@@ -412,15 +423,33 @@ class Profile:
     def session_ids(self) -> list[str]:
         return sorted(p.stem for p in self.sessions_dir.glob("*.json"))
 
+    def delete_session(self, session_id: str) -> bool:
+        """删除会话文件；不存在或 id 非法返回 False。
+
+        文件定位走与 load/save 相同的 ``_safe_session_file`` 白名单，
+        元数据（sessions_meta）由调用方负责清理。
+        """
+        path = self._safe_session_file(session_id, self.sessions_dir)
+        if path is None or not path.is_file():
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
+
 
 def _normalize_permissions(raw: Any) -> dict[str, Any]:
     """把 permissions 段归一为完整形状：缺键补默认、非法值收敛。
 
-    注意新增键（``shell_allow`` / ``audit``）也必须在这里归一 —— 否则 ``update_config``
-    的深合并会**静默丢掉**它们（H-07 是同一类问题的前科）。
+    注意新增键（``git`` / ``shell_allow`` / ``audit``）也必须在这里归一 —— 否则
+    ``update_config`` 的深合并会**静默丢掉**它们（H-07 是同一类问题的前科）。
     """
     perms = raw if isinstance(raw, dict) else {}
-    result: dict[str, Any] = {key: normalize_permission(perms.get(key)) for key in ("shell", "fs")}
+    result: dict[str, Any] = {
+        key: normalize_permission(perms.get(key))
+        for key in ("shell", "fs", "git")
+    }
     result["shell_allow"] = normalize_allowlist(perms.get("shell_allow"))
     result["audit"] = audit_enabled({"permissions": perms})
     return result

@@ -54,7 +54,8 @@ def _install_readline(host, profile_root) -> None:
     atexit.register(save_history)
 
     candidates = ["/exit", "/new", "/help", "/sessions", "/resume", "/usage",
-                  "/image", "/reload", "/plugins", "/status", "/approvals"]
+                  "/image", "/reload", "/plugins", "/status", "/approvals",
+                  "/snip", "/plan"]
     candidates += [f"/{name}" for name in host.collect_commands()]
 
     def completer(text: str, state: int):
@@ -136,7 +137,7 @@ def register(ctx) -> None:
         def print_help() -> str:
             lines = [(
                 "内置: /exit /new /help /sessions /resume <id> /usage /image <路径|URL> "
-                "/reload <插件> /plugins /status /approvals"
+                "/reload <插件> /plugins /status /approvals /snip /plan"
             )]
             for name, cmd in sorted(host.collect_commands().items()):
                 lines.append(f"  /{name}  {cmd.get('help', '')}")
@@ -162,6 +163,47 @@ def register(ctx) -> None:
                 print("（暂无用量记录）")
                 return
             print("累计用量: " + "  ".join(f"{k}={v}" for k, v in usage.items()))
+
+        def run_snip(args: str) -> bool:
+            """/snip 快捷指令库。返回 True 表示已作为一轮对话发送（run_snip 内部处理）。"""
+            from harness.snippets import snippets_delete, snippets_list, snippets_save
+
+            name, _, rest = args.strip().partition(" ")
+            if not name or name in ("list", "ls"):
+                items = snippets_list(host.profile)
+                if not items:
+                    print("（还没有快捷指令。添加：/snip add <名称> <提示词内容>）")
+                    return False
+                print("快捷指令:")
+                for entry in items:
+                    first = entry["text"].split("\n")[0][:50]
+                    print(f"  {entry['name']}  {first}")
+                return False
+            if name == "add":
+                item_name, _, text = rest.strip().partition(" ")
+                res = snippets_save(host.profile, item_name, text)
+                print(res.get("error") or f"已保存快捷指令「{res.get('name')}」")
+                return False
+            if name == "del":
+                if not rest.strip():
+                    print("用法：/snip del <名称>")
+                    return False
+                res = snippets_delete(host.profile, rest.strip())
+                print(res.get("error") or f"已删除快捷指令「{res.get('name')}」")
+                return False
+            # /snip <名称> → 把片段作为一轮对话直接发送
+            item: dict[str, str] | None = None
+            for entry in snippets_list(host.profile):
+                if entry["name"] == name:
+                    item = entry
+                    break
+            if item is None:
+                print(f"没有快捷指令「{name}」（/snip 查看全部）")
+                return False
+            text = str(item.get("text") or "")
+            print(f"▶ 发送快捷指令「{item.get('name')}」")
+            run_turn(text)
+            return True
 
         def run_command(line: str) -> None:
             nonlocal session_id, ask, new_session, switch_session
@@ -196,6 +238,20 @@ def register(ctx) -> None:
                 return
             if name == "/image":
                 add_image(args)
+                return
+            if name == "/snip":
+                run_snip(args)
+                return
+            if name == "/plan":
+                # 计划模式开关：/plan 切换；/plan on|off 显式设置
+                setter = host.service("set_plan_mode")
+                if not callable(setter):
+                    print("错误：对话插件未激活")
+                    return
+                arg = args.strip().lower()
+                current = bool(host.profile.load_config().get("plan_mode"))
+                plan_on = (arg == "on") if arg in ("on", "off") else (not current)
+                print(setter(plan_on))
                 return
             if name == "/reload":
                 target = args.strip()

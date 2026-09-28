@@ -1,11 +1,16 @@
-"""待办清单插件：把「计划」也变成一个工具。
+"""TODO.md 工作区任务索引（长程任务架构 F1：环境即状态）。
 
-为什么需要：多步任务里 agent 没有地方记「我做到哪了」，于是要么漏掉步骤，
-要么在长上下文里反复重新规划。有了显式清单，它可以先列步骤、逐条推进、
-随时回看进度。
+此前待办清单是**纯内存态**——重启即丢、不在工作区、Git 看不见。
+现在清单持久化为工作区根的 ``TODO.md``（Markdown 勾选格式）：
 
-数据结构直接复用 nanoagent 的 :class:`~nanoagent.task.TodoItem` 与状态常量，
-不另造一套 —— 将来若接 ``TaskRunner``（LLM 自主拆解并执行）也能共用同一表示。
+    # TODO
+
+    - [ ] 待办任务
+    - [~] 进行中任务 —— 补充说明
+    - [x] 已完成任务
+
+人可读、Git 可跟踪、跨会话/跨进程不丢；新会话靠读它即可无损恢复工程状态。
+状态常量复用 nanoagent 的 :mod:`~nanoagent.task`，不另造一套。
 
 注意：插件由 loader 以合成模块名加载（无包上下文），只能用绝对导入。
 """
@@ -13,6 +18,8 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 from nanoagent.task import (
     STATUS_DONE,
@@ -29,6 +36,15 @@ MARKS = {
     STATUS_SKIPPED: "[-]",
 }
 
+# Markdown 勾选标记 → 状态（[ ] 空 / [~] 进行中 / [x] 完成 / [-] 跳过）
+MARK_BY_CHAR = {
+    " ": STATUS_PENDING,
+    "~": STATUS_IN_PROGRESS,
+    "x": STATUS_DONE,
+    "-": STATUS_SKIPPED,
+}
+_LINE_RE = re.compile(r"^-\s*\[([ x~\-])\]\s*(.+)$")
+
 # 容忍模型/用户用同义词表达状态
 STATUS_ALIASES = {
     "pending": STATUS_PENDING, "todo": STATUS_PENDING, "open": STATUS_PENDING,
@@ -44,32 +60,76 @@ STATUS_ALIASES = {
 MAX_ITEMS = 50
 
 
-def _as_int(value, default: int) -> int:
-    if isinstance(value, bool) or value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def _todo_path(host) -> Path:
+    return Path(host.workspace) / "TODO.md"
+
+
+def _parse_md(text: str) -> list[TodoItem]:
+    """从 TODO.md 文本解析任务项；容错：忽略不认识的行与非法标记。"""
+    items: list[TodoItem] = []
+    for line in text.splitlines():
+        m = _LINE_RE.match(line.strip())
+        if not m:
+            continue
+        status = MARK_BY_CHAR.get(m.group(1))
+        if status is None:
+            continue
+        rest = m.group(2).strip()
+        title, sep, detail = rest.partition("——")
+        items.append(TodoItem(
+            id=len(items) + 1,
+            title=title.strip() or rest,
+            detail=detail.strip() if sep else "",
+            status=status,
+        ))
+    return items
+
+
+def _render(items: list[TodoItem]) -> str:
+    if not items:
+        return "（待办清单为空）"
+    done = sum(1 for item in items if item.status in (STATUS_DONE, STATUS_SKIPPED))
+    lines = [f"{MARKS.get(item.status, '[ ]')} {item.id}. {item.title}"
+             + (f" —— {item.detail}" if item.detail else "")
+             for item in items]
+    return f"待办清单（{done}/{len(items)} 已完成）\n" + "\n".join(lines)
+
+
+def _render_md(items: list[TodoItem]) -> str:
+    lines = ["# TODO", ""]
+    for item in items:
+        lines.append(f"- {MARKS.get(item.status, '[ ]')} {item.title}"
+                     + (f" —— {item.detail}" if item.detail else ""))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def register(ctx) -> None:
-    state: dict = {"items": []}
+    host = ctx.host
 
-    def _render() -> str:
-        items = state["items"]
-        if not items:
-            return "（待办清单为空）"
-        done = sum(1 for item in items if item.status in (STATUS_DONE, STATUS_SKIPPED))
-        lines = [f"{MARKS.get(item.status, '[ ]')} {item.id}. {item.title}"
-                 + (f" —— {item.detail}" if item.detail else "")
-                 for item in items]
-        return f"待办清单（{done}/{len(items)} 已完成）\n" + "\n".join(lines)
+    def _load() -> list[TodoItem]:
+        path = _todo_path(host)
+        if not path.is_file():
+            return []
+        try:
+            return _parse_md(path.read_text(encoding="utf-8"))
+        except OSError:
+            return []
+
+    def _save(items: list[TodoItem]) -> str:
+        path = _todo_path(host)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_render_md(items), encoding="utf-8")
+        except OSError as exc:
+            return f"错误：TODO.md 写入失败（{exc}）"
+        return _render(items)
 
     def todo_write(items: list) -> str:
-        """写入（覆盖）当前的待办清单，用于规划与更新进度。
+        """写入（覆盖）工作区 TODO.md 任务清单，用于规划与更新进度。
 
-        每次提交**完整**清单（不是增量），这样它能真实反映现状。
+        每次提交**完整**清单（不是增量），这样它能真实反映现状；
+        完成一个原子任务后请立即更新对应条目的状态。
 
         Args:
             items: 清单数组，每项形如
@@ -83,15 +143,12 @@ def register(ctx) -> None:
         if not isinstance(items, list):
             return "错误：items 需要是数组，每项为 {content, status, detail?}"
         if not items:
-            state["items"] = []
-            return "已清空待办清单"
+            return _save([])
         if len(items) > MAX_ITEMS:
             return f"错误：清单最多 {MAX_ITEMS} 项（收到 {len(items)} 项），请合并同类型步骤"
 
         parsed: list[TodoItem] = []
         for index, raw_entry in enumerate(items, start=1):
-            # 不要把 str 的归一化写回循环变量：那会让「同一变量既是原始项又是解析结果」，
-            # 读到第 3 行的人无法判断 entry 此时到底是什么。
             entry = {"content": raw_entry} if isinstance(raw_entry, str) else raw_entry
             if not isinstance(entry, dict):
                 return f"错误：第 {index} 项不是对象（收到 {type(entry).__name__}）"
@@ -106,14 +163,13 @@ def register(ctx) -> None:
             parsed.append(TodoItem(id=index, title=title,
                                    detail=str(entry.get("detail") or "").strip(),
                                    status=status))
-        state["items"] = parsed
-        return _render()
+        return _save(parsed)
 
     def todo_read() -> str:
-        """查看当前待办清单与进度。"""
-        return _render()
+        """查看工作区 TODO.md 任务清单与进度（跨会话持久）。"""
+        return _render(_load())
 
     ctx.tools.register(todo_write)
     ctx.tools.register(todo_read)
-    # 暴露给界面（桌面端/REPL 将来可直接渲染进度条）
-    ctx.provide("todos", state)
+    # 暴露给界面（桌面端「✅ 任务」面板直接读工作区 TODO.md 文件本体）
+    ctx.provide("todos", {"path": lambda: str(_todo_path(host))})

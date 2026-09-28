@@ -92,6 +92,93 @@ class DesktopApiTests(unittest.TestCase):
             models = app.get_models()
             self.assertEqual(models["default_model"], "m1")
 
+    def test_ui_prefs_roundtrip_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _host, app = self._app(Path(tmp))
+            # 初始为空
+            prefs = app.get_ui_prefs()
+            self.assertTrue(prefs["ok"])
+            self.assertEqual(prefs["prefs"], {})
+            # 写入面板宽度 / 工作区条显隐
+            saved = app.set_ui_prefs({"rp_width": 420, "wsbar_hidden": True})
+            self.assertTrue(saved["ok"])
+            loaded = app.get_ui_prefs()
+            self.assertEqual(loaded["prefs"]["rp_width"], 420)
+            self.assertTrue(loaded["prefs"]["wsbar_hidden"])
+            # 覆盖写入
+            app.set_ui_prefs({"rp_width": 360, "wsbar_hidden": False})
+            loaded = app.get_ui_prefs()
+            self.assertEqual(loaded["prefs"]["rp_width"], 360)
+            self.assertFalse(loaded["prefs"]["wsbar_hidden"])
+            # 非法入参
+            self.assertFalse(app.set_ui_prefs("bad")["ok"])
+
+    def test_export_session_to_workspace_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("你好", "t1")
+            res = app.export_session("t1")
+            self.assertTrue(res["ok"])
+            dest = Path(res["path"])
+            self.assertEqual(dest.parent, Path(host.workspace) / "exports")
+            self.assertEqual(dest.name, "t1.md")
+            self.assertIn("## 用户", dest.read_text(encoding="utf-8"))
+            # 不存在 / 空会话 → 友好错误
+            missing = app.export_session("missing")
+            self.assertFalse(missing["ok"])
+            self.assertIn("不存在", missing["error"])
+
+    def test_new_session_friendly_default_name_and_legacy_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            created = app.new_session()
+            sid = created["session"]
+            items = {s["id"]: s for s in app.sessions()["sessions"]}
+            # 新会话默认名不再是裸 id（s-2026...）
+            self.assertNotEqual(items[sid]["name"], sid)
+            self.assertTrue(items[sid]["name"].startswith("会话 "))
+            # 历史遗留：meta 里名字就是裸 id → 显示层兜底
+            meta = dict(host.profile.load_config().get("sessions_meta") or {})
+            meta["s-20200101-000000"] = {"name": "s-20200101-000000",
+                                         "ws": "", "updated": 0}
+            host.profile.update_config(sessions_meta=meta)
+            items = {s["id"]: s for s in app.sessions()["sessions"]}
+            self.assertEqual(items["s-20200101-000000"]["name"], "未命名会话")
+
+    def test_delete_session_file_meta_and_current_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("第一句", "s1")
+            app.chat("第二句", "s2")  # s2 更新时间更新
+            # 删非当前会话
+            app.new_session()          # 当前变为新 id
+            current = app.sessions()["current"]
+            res = app.delete_session("s1")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["deleted"], "s1")
+            self.assertEqual(res["next"], "")
+            self.assertEqual(host.profile.load_session("s1"), [])
+            ids = {s["id"] for s in app.sessions()["sessions"]}
+            self.assertNotIn("s1", ids)
+            # 删除当前会话 → 自动切到最近的剩余会话
+            res = app.delete_session(current)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["next"], "s2")
+            self.assertEqual(app.sessions()["current"], "s2")
+            # 只命名过、还没有消息的会话（仅 meta，无文件）也能删
+            fresh = app.new_session()
+            app.rename_session(fresh["session"], "空会话")
+            res = app.delete_session(fresh["session"])
+            self.assertTrue(res["ok"])
+            self.assertEqual(app.sessions()["current"], "s2")
+            # 不存在 → 报错
+            bad = app.delete_session("s1")
+            self.assertFalse(bad["ok"])
+            self.assertIn("不存在", bad["error"])
+            # 非法 id（路径穿越）→ 报错，不删任何文件
+            evil = app.delete_session("../escape")
+            self.assertFalse(evil["ok"])
+
     def test_chat_roundtrip_reasoning_and_session_persistence(self):
         with tempfile.TemporaryDirectory() as tmp:
             from nanoagent.llm import LLMResponse
@@ -174,7 +261,9 @@ class DesktopApiTests(unittest.TestCase):
             off = app.set_thinking("off")
             self.assertTrue(off["ok"])
             for llm in runtime["pool"].values():
-                self.assertIsNone(getattr(llm, "reasoning_effort", None))
+                # off 也显式标记（llm 端会转成 enable_thinking=false 下发），
+                # 不再留 None 给服务端默认——否则默认开思考的端点关不掉
+                self.assertEqual(getattr(llm, "reasoning_effort", None), "off")
             bad = app.set_thinking("ultra")
             self.assertFalse(bad["ok"])
 
@@ -577,6 +666,725 @@ class DesktopApiTests(unittest.TestCase):
             self.assertEqual(tool_evt["tool"], "run_command")
             llm_evts = [e for e in events if e["kind"] == "llm"]
             self.assertEqual(llm_evts[-1]["reasoning"], "想一想")
+
+
+class DesktopStreamTests(unittest.TestCase):
+    """桌面端流式输出（chat_stream/can_stream）：事件推送、会话落盘、用量补记。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def _stream_app(self, tmp: Path):
+        """用 StreamingFakeLLM 构建运行时（激活期就注入，模型池里才是流式模型）。"""
+        import nanoagent
+        from test_harness import StreamingFakeLLM
+
+        from harness.desktop import DesktopApp
+
+        profile = make_profile(tmp)
+        from harness.cli import build_runtime
+
+        orig = nanoagent.LLM
+        nanoagent.LLM = lambda **kwargs: StreamingFakeLLM()
+        try:
+            host = build_runtime(profile, str(tmp))
+        finally:
+            nanoagent.LLM = orig
+        app = DesktopApp(host)
+        window = FakeWindow([])
+        app._window = window
+        return host, app, window
+
+    @staticmethod
+    def _events(window, kind: str) -> list[dict]:
+        import json
+
+        found = []
+        for js in window.calls:
+            if "onStreamEvent(" in js:
+                payload = js.split("onStreamEvent(", 1)[1].rsplit(")", 1)[0]
+                try:
+                    evt = json.loads(payload)
+                except ValueError:
+                    continue
+                if evt.get("kind") == kind:
+                    found.append(evt)
+        return found
+
+    def test_can_stream_false_without_stream_llm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+
+            _host, app = self._app(Path(tmp))  # FakeLLM 无 chat_stream
+            self.assertFalse(app.can_stream()["stream"])
+
+    def test_chat_stream_pushes_delta_and_done(self):
+        import time
+
+        from test_harness import StreamingFakeLLM
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app, window = self._stream_app(Path(tmp))
+            self.assertTrue(app.can_stream()["stream"])
+            res = app.chat_stream("你好", "s1")
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["stream"])
+            self.assertEqual(res["session"], "s1")
+            self.assertIn("s1", app._busy_sessions)  # 立即进入该会话的流式状态（防双发）
+
+            deadline = time.time() + 5
+            done: list[dict] = []
+            while time.time() < deadline:
+                done = self._events(window, "done")
+                if done:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(done, "5 秒内应收到 done 事件")
+            self.assertTrue(done[0]["ok"])
+            self.assertEqual(done[0]["reply"], "".join(StreamingFakeLLM.chunks))
+            self.assertEqual(done[0]["session"], "s1")
+            self.assertEqual(done[0]["model"], "m1")
+            deltas = self._events(window, "delta")
+            self.assertTrue(deltas, "应有 delta 增量事件")
+            # done 事件先于 worker 收尾推送，等会话真正落盘再收尾
+            # （直接轮询落盘结果，避免与 worker 的收尾写入产生文件竞态）
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    if len(host.profile.load_session("s1")) >= 2:
+                        break
+                except Exception:  # noqa: BLE001 —— 落盘中途读失败继续等
+                    pass
+                time.sleep(0.05)
+            self.assertEqual(len(host.profile.load_session("s1")), 2)
+            # 用量已补记（此前流式轮次在 usage.jsonl 是空白）——落盘晚于会话，轮询等待
+            deadline = time.time() + 5
+            while time.time() < deadline and not (host.profile.root / "usage.jsonl").is_file():
+                time.sleep(0.05)
+            self.assertTrue((host.profile.root / "usage.jsonl").is_file())
+            # 双开防护：流已结束可再次发起
+            self.assertTrue(app.chat_stream("再来", "s1")["ok"])
+            # 等第二轮流收尾（含落盘），否则临时目录清理会撞上在写的 tmp 文件
+            deadline = time.time() + 5
+            while "s1" in app._busy_sessions and time.time() < deadline:
+                time.sleep(0.05)
+
+    def test_chat_stream_error_pushed_as_done(self):
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp), models=[])  # 无模型 → ask_stream 抛错
+            from harness.cli import build_runtime
+
+            host = build_runtime(profile, str(tmp))
+            from harness.desktop import DesktopApp
+
+            app = DesktopApp(host)
+            window = FakeWindow([])
+            app._window = window
+            res = app.chat_stream("你好", "s1")
+            self.assertTrue(res["ok"])  # 派发成功，错误在事件里
+            deadline = time.time() + 5
+            done: list[dict] = []
+            while time.time() < deadline:
+                done = self._events(window, "done")
+                if done:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(done and not done[0]["ok"])
+            self.assertIn("模型", done[0].get("error", ""))
+
+
+class Batch11FeatureTests(unittest.TestCase):
+    """第六批十一项功能：搜索/置顶/重新生成/编辑重发/导出全部/用量图表/快捷指令/知识库来源。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def test_pin_session_sorts_first_in_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _host, app = self._app(Path(tmp))
+            app.chat("一", "s1")
+            app.chat("二", "s2")
+            self.assertTrue(app.set_session_pin("s1", True)["ok"])
+            items = app.sessions()["sessions"]
+            self.assertEqual(items[0]["id"], "s1")
+            self.assertTrue(items[0]["pinned"])
+            self.assertFalse(items[1]["pinned"])
+            # 取消置顶 → 恢复按更新时间排序（s2 更新）
+            app.set_session_pin("s1", False)
+            items = app.sessions()["sessions"]
+            self.assertEqual(items[0]["id"], "s2")
+            # 缺 id → 报错
+            self.assertFalse(app.set_session_pin("", True)["ok"])
+
+    def test_search_sessions_current_and_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _host, app = self._app(Path(tmp))
+            app.chat("今天天气如何", "s1")
+            app.chat("写一首诗", "s2")  # 当前会话变为 s2
+            res = app.search_sessions("天气", "all")
+            self.assertTrue(res["ok"])
+            self.assertTrue(any(h["session"] == "s1" for h in res["hits"]))
+            # 仅当前会话（s2）→ 搜不到 s1 的内容
+            res_cur = app.search_sessions("天气", "current")
+            self.assertFalse(any(h["session"] == "s1" for h in res_cur["hits"]))
+            # 命中项带可定位的过滤后序号与摘要
+            hit = next(h for h in res["hits"] if h["session"] == "s1")
+            self.assertEqual(hit["role"], "user")
+            self.assertIn("天气", hit["snippet"])
+            # 空关键词 / 未知范围
+            self.assertFalse(app.search_sessions("  ", "all")["ok"])
+            self.assertFalse(app.search_sessions("x", "bad")["ok"])
+
+    def test_regenerate_last_replaces_final_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from nanoagent.llm import LLMResponse
+
+            _host, app = self._app(Path(tmp))
+            agent = _host.service("agent_factory")()
+            agent.llm.script = [LLMResponse(content="第一版"), LLMResponse(content="第二版")]
+            app.chat("问题", "t1")
+            res = app.regenerate_last()
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(res["reply"], "第二版")
+            history = app.session_history("t1")["history"]
+            self.assertEqual([m["content"] for m in history], ["问题", "第二版"])
+            # 没有用户消息（新会话）→ 可读错误
+            app.new_session()
+            self.assertFalse(app.regenerate_last()["ok"])
+
+    def test_edit_message_resend_truncates_and_reruns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from nanoagent.llm import LLMResponse
+
+            _host, app = self._app(Path(tmp))
+            agent = _host.service("agent_factory")()
+            agent.llm.script = [LLMResponse(content="回答1"), LLMResponse(content="回答2")]
+            app.chat("原始问题", "t2")
+            res = app.edit_message_resend(0, "改后问题")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(res["reply"], "回答2")
+            history = app.session_history("t2")["history"]
+            self.assertEqual([m["content"] for m in history], ["改后问题", "回答2"])
+            # 只能编辑用户消息
+            self.assertFalse(app.edit_message_resend(1, "x")["ok"])
+            # 序号越界 / 空文本
+            self.assertFalse(app.edit_message_resend(9, "x")["ok"])
+            self.assertFalse(app.edit_message_resend(0, "  ")["ok"])
+
+    def test_export_all_sessions_zip_and_cli_flag(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("甲", "s1")
+            app.chat("乙", "s2")
+            res = app.export_all_sessions()
+            self.assertTrue(res["ok"], res.get("error"))
+            import zipfile
+
+            with zipfile.ZipFile(res["path"]) as zf:
+                names = zf.namelist()
+            self.assertIn("index.md", names)
+            self.assertIn("s1.md", names)
+            self.assertIn("s2.md", names)
+            # CLI：sha export --all
+            from harness.cli import _export_sessions
+
+            ns = SimpleNamespace(session=None, out=str(Path(host.workspace) / "exports"),
+                                 all_zip=True, usage=False, workspace=str(host.workspace))
+            self.assertEqual(_export_sessions(host.profile, ns), 0)
+            # 一个会话都没有 → ValueError 报「没有可导出」
+            from harness.exporter import export_all_sessions_zip
+
+            with tempfile.TemporaryDirectory() as empty:
+                empty_profile = make_profile(Path(empty), models=[])
+                with self.assertRaises(ValueError):
+                    export_all_sessions_zip(empty_profile, Path(empty) / "x.zip")
+
+    def test_usage_daily_aggregates_by_local_day(self):
+        import json
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            now = time.time()
+            rows = [
+                {"ts": now, "session": "s1", "model": "m",
+                 "prompt_tokens": 100, "completion_tokens": 50,
+                 "cached_tokens": 40},
+                {"ts": now - 86400, "session": "s1", "model": "m",
+                 "prompt_tokens": 10, "completion_tokens": 5},
+                {"ts": now - 40 * 86400, "session": "s1", "model": "m",
+                 "prompt_tokens": 999, "completion_tokens": 999},
+                {"这行不是合法 json": True},
+            ]
+            (host.profile.root / "usage.jsonl").write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                encoding="utf-8")
+            res = app.usage_daily(30)
+            self.assertTrue(res["ok"])
+            days = res["days"]
+            self.assertEqual(len(days), 30)  # 空档天补齐，横轴连续
+            today = days[-1]
+            self.assertEqual(today["prompt"], 100)
+            self.assertEqual(today["total"], 150)
+            self.assertEqual(today["calls"], 1)
+            self.assertEqual(today["cached"], 40)  # 缓存命中 tokens 单独聚合
+            yesterday = days[-2]
+            self.assertEqual(yesterday["total"], 15)
+            # 40 天前的记录被排除
+            self.assertEqual(sum(d["total"] for d in days), 165)
+
+    def test_snippets_roundtrip_via_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _host, app = self._app(Path(tmp))
+            self.assertTrue(app.snippets_save("审查", "请审查改动")["ok"])
+            items = app.snippets_list()["snippets"]
+            self.assertEqual([i["name"] for i in items], ["审查"])
+            # 同名覆盖
+            app.snippets_save("审查", "v2")
+            items = app.snippets_list()["snippets"]
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["text"], "v2")
+            # 删除（幂等）
+            self.assertTrue(app.snippets_delete("审查")["ok"])
+            self.assertEqual(app.snippets_list()["snippets"], [])
+            self.assertTrue(app.snippets_delete("不存在")["ok"])
+            # 校验
+            self.assertFalse(app.snippets_save("", "x")["ok"])
+            self.assertFalse(app.snippets_save("名", " ")["ok"])
+
+    def test_knowledge_sources_and_remove_source(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            kb_dir = host.profile.root / "knowledge"
+            kb_dir.mkdir(parents=True, exist_ok=True)
+            (kb_dir / "index.npz").write_text(json.dumps({
+                "texts": ["a1", "a2", "b1"],
+                "vectors": [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                "metadata": [{"source": "a.md"}, {"source": "a.md"}, {"source": "b.md"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            res = app.knowledge_sources()
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual({s["source"]: s["chunks"] for s in res["sources"]},
+                             {"a.md": 2, "b.md": 1})
+            # 删除 a.md 的全部片段；其余来源保留（需要构建 KB：池里有 FakeLLM）
+            rm = app.knowledge_remove_source("a.md")
+            self.assertTrue(rm["ok"], rm.get("summary"))
+            self.assertIn("2", rm["summary"])
+            res = app.knowledge_sources()
+            self.assertEqual([s["source"] for s in res["sources"]], ["b.md"])
+            # 来源不存在 → ok=False
+            self.assertFalse(app.knowledge_remove_source("不存在.md")["ok"])
+
+    def test_image_preview_returns_data_url_and_jails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            ws = Path(host.workspace)
+            ws.mkdir(parents=True, exist_ok=True)
+            # 1x1 PNG（最小心智合理的合法图片字节）
+            png = bytes.fromhex(
+                "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                "1f15c4890000000d49444154789c6260000000060005"
+                "27de41ba0000000049454e44ae426082")
+            (ws / "pic.png").write_bytes(png)
+            res = app.image_preview(str(ws / "pic.png"))
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertTrue(res["data"].startswith("data:image/png;base64,"))
+            # 越出工作区 → 拒绝（放在另一个临时目录，确保不在工作区内）
+            outside_dir = Path(tempfile.mkdtemp(prefix="sha-outside-"))
+            outside = outside_dir / "evil.png"
+            outside.write_bytes(png)
+            bad = app.image_preview(str(outside))
+            self.assertFalse(bad["ok"])
+            # 不存在 → 拒绝
+            self.assertFalse(app.image_preview(str(ws / "no.png"))["ok"])
+
+class LongrunResetTests(unittest.TestCase):
+    """F1/F6 桌面端：TODO.md 任务面板数据源 + 一键无状态重置。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def test_chat_rebinds_session_workspace(self):
+        """跨工作区会话联动：继续旧会话时自动切回它首次使用的工作区。
+
+        修复「问当前工作区文件却答成另一个工作区」——会话历史属于某个工程，
+        agent 的工具与上下文必须指回那个工程。
+        """
+        import os
+
+        from nanoagent.llm import LLMResponse
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            ws_a = Path(tmp) / "projA"
+            ws_b = Path(tmp) / "projB"
+            ws_a.mkdir()
+            ws_b.mkdir()
+            # 在 projA 里开一个会话（打上 projA 的 ws 戳）
+            app.set_workspace(str(ws_a))
+            agent = host.service("agent_factory")()
+            agent.llm.script = [LLMResponse(content="收到")]
+            app.chat("在 projA 干活", "s-a")
+            meta = host.profile.load_config().get("sessions_meta") or {}
+            ws_id_a = meta["s-a"]["ws"]
+            self.assertTrue(ws_id_a)
+            # 切到 projB 另起炉灶
+            app.set_workspace(str(ws_b))
+            self.assertEqual(app.status()["workspace"], str(ws_b))
+            # 继续旧会话 s-a → 自动切回 projA，工具/上下文指向 projA
+            agent.llm.script = [LLMResponse(content="好的")]
+            res = app.chat("继续", "s-a")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(app.status()["workspace"], str(ws_a))
+            self.assertEqual(os.path.realpath(host.workspace),
+                             os.path.realpath(str(ws_a)))
+
+    def test_todo_content_reads_workspace_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            ws = Path(host.workspace)
+            ws.mkdir(parents=True, exist_ok=True)
+            res = app.todo_content()
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["exists"])
+            (ws / "TODO.md").write_text(
+                "# TODO\n\n- [ ] 任务一\n- [x] 任务二\n", encoding="utf-8")
+            res = app.todo_content()
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["exists"])
+            self.assertIn("任务一", res["content"])
+
+    def test_stateless_reset_writes_back_and_switches(self):
+        from nanoagent.llm import LLMResponse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _host, app = self._app(Path(tmp))
+            agent = _host.service("agent_factory")()
+            agent.llm.script = [LLMResponse(content="收到"),
+                                LLMResponse(content="已写入 TODO.md")]
+            app.chat("做任务一", "s1")
+            r = app.stateless_reset()
+            self.assertTrue(r["ok"], r.get("error"))
+            self.assertEqual(r["note"], "已写入 TODO.md")
+            self.assertNotEqual(r["session"], "s1")
+            self.assertEqual(app.sessions()["current"], r["session"])
+            # 旧会话保留可回看：含重置前的对话与「写回 TODO.md」这一轮
+            old = [m["content"] for m in app.session_history("s1")["history"]]
+            self.assertEqual(old[0], "做任务一")
+            self.assertEqual(old[-1], "已写入 TODO.md")
+            self.assertEqual(len(old), 4)
+
+class GitRemoteTests(unittest.TestCase):
+    """远程仓库地址配置（用户手动提交/推送的入口）：get/set 与无 origin 的推送拒绝。"""
+
+    def _app(self, tmp: Path):
+        import subprocess
+
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        ws = Path(host.workspace)
+        ws.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=False)
+        return DesktopApp(host), ws
+
+    def test_remote_set_and_get(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ws = self._app(Path(tmp))
+            res = app.git_remote_get()
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["configured"])
+            bad = app.git_remote_set("ftp://example.com/x.git")
+            self.assertFalse(bad["ok"])
+            res = app.git_remote_set("https://github.com/gwqwy/demo.git")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(res["action"], "已添加")
+            # 再次设置 → 更新而非重复添加
+            res = app.git_remote_set("git@github.com:gwqwy/demo.git")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["action"], "已更新")
+            res = app.git_remote_get()
+            self.assertTrue(res["configured"])
+            self.assertEqual(res["url"], "git@github.com:gwqwy/demo.git")
+
+    def test_push_without_remote_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ws = self._app(Path(tmp))
+            res = app.git_push()
+            self.assertFalse(res["ok"])
+            self.assertIn("origin", res["output"])
+
+    def test_plan_mode_toggle_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ws = self._app(Path(tmp))
+            host = app.host
+            res = app.set_plan_mode(True)
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertIn("已开启", res["message"])
+            self.assertTrue(app.status()["plan_mode"])
+            agent = host.service("agent_factory")()
+            self.assertIn("计划模式（当前开启）", agent.instructions)
+            res = app.set_plan_mode(False)
+            self.assertTrue(res["ok"])
+            self.assertFalse(app.status()["plan_mode"])
+
+
+class ParallelStreamTests(unittest.TestCase):
+    """多会话并行：不同会话可同时回答，同一会话仍拒绝双开。"""
+
+    def test_parallel_streams_per_session(self):
+        import threading
+        import time as _time
+        import types
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            release: dict[str, threading.Event] = {}
+            done_marker: dict[str, bool] = {}
+
+            def fake_ask_stream(message, session_id=None, images=None):
+                ev = release.setdefault(session_id, threading.Event())
+                yield {"type": "delta", "text": "hi"}
+                ev.wait(2)  # 保持流不结束，便于断言并行/互斥状态
+                yield {"type": "done", "result": types.SimpleNamespace(
+                    content="回复", reasoning="", tool_calls=[],
+                    usage={"prompt_tokens": 1, "completion_tokens": 1})}
+                done_marker[session_id] = True
+
+            orig = host.service
+            host.service = (lambda name, *a, **k:
+                            fake_ask_stream if name == "ask_stream"
+                            else orig(name, *a, **k))
+            app.set_workspace(str(Path(host.workspace)))
+            r1 = app.chat_stream("m1", "s1")
+            r2 = app.chat_stream("m2", "s2")
+            self.assertTrue(r1["ok"], r1.get("error"))
+            self.assertTrue(r2["ok"], r2.get("error"))
+            self.assertIn("s1", app._busy_sessions)
+            self.assertIn("s2", app._busy_sessions)
+            # 同一会话第二个流被拒绝；另一会话不受影响
+            r3 = app.chat_stream("m3", "s1")
+            self.assertFalse(r3["ok"])
+            self.assertIn("进行中", r3["error"])
+            r4 = app.chat_stream("m4", "s3")
+            self.assertTrue(r4["ok"], r4.get("error"))
+            release["s1"].set()
+            release["s2"].set()
+            release["s3"].set()
+            for _ in range(100):
+                if not app._busy_sessions:
+                    break
+                _time.sleep(0.05)
+            self.assertEqual(app._busy_sessions, set())
+            self.assertTrue(done_marker.get("s1") and done_marker.get("s2"))
+
+
+class SessionOrderTests(unittest.TestCase):
+    """侧栏拖拽排序：set_session_order 持久化 order，sessions() 按序返回。"""
+
+    def test_set_order_persists_and_sorts(self):
+        import time as _time
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            ws_id = "w1"
+            now = _time.time()
+            host.profile.update_config(
+                current_workspace=ws_id,
+                workspaces=[{"id": ws_id, "name": "ws", "path": host.workspace}],
+                sessions_meta={
+                    "a": {"ws": ws_id, "updated": now, "name": "a"},
+                    "b": {"ws": ws_id, "updated": now + 5, "name": "b"},
+                    "c": {"ws": ws_id, "updated": now + 9, "name": "c"},
+                })
+            # 默认按最近更新：c, b, a
+            ids = [s["id"] for s in app.sessions()["sessions"]]
+            self.assertEqual(ids, ["c", "b", "a"])
+            # 拖拽成 a, b, c → order 落盘
+            res = app.set_session_order(["a", "b", "c"])
+            self.assertTrue(res["ok"])
+            ids = [s["id"] for s in app.sessions()["sessions"]]
+            self.assertEqual(ids, ["a", "b", "c"])
+            meta = host.profile.load_config()["sessions_meta"]
+            self.assertEqual(meta["a"]["order"], 0)
+            self.assertEqual(meta["c"]["order"], 2)
+
+
+class FilePreviewTests(unittest.TestCase):
+    """文件预览：类型判定、图片转 data URL、路径越界拦截。"""
+
+    def test_preview_kinds_and_jail(self):
+        import base64
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            ws = Path(host.workspace)
+            (ws / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            (ws / "b.md").write_text("# 标题\n\n正文\n", encoding="utf-8")
+            (ws / "c.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+            (ws / "d.bin").write_bytes(b"\x00\x01\x02\x03")
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AF/6n2jAAAAAElFTkSuQmCC")
+            (ws / "e.png").write_bytes(png)
+            (ws / "f.txt").write_text("中文内容\n第二行\n", encoding="gbk")
+
+            r = app.file_preview("a.py")
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["kind"], "code")
+            self.assertIn("def f():", r["text"])
+            self.assertGreaterEqual(r["lines"], 2)  # 末尾换行使计数比可见行多 1
+            self.assertEqual(app.file_preview("b.md")["kind"], "markdown")
+            self.assertEqual(app.file_preview("c.csv")["kind"], "table")
+            self.assertEqual(app.file_preview("d.bin")["kind"], "binary")
+            # GBK 文本也要能读出中文（编码回退）
+            self.assertIn("中文内容", app.file_preview("f.txt")["text"])
+
+            ri = app.file_preview("e.png")
+            self.assertEqual(ri["kind"], "image")
+            self.assertTrue(ri["data_url"].startswith("data:image/png;base64,"))
+
+            # 路径越界 / 不存在都必须失败
+            self.assertFalse(app.file_preview("../outside.py")["ok"])
+            self.assertFalse(app.file_preview("nope.txt")["ok"])
+
+
+class FilePreviewExtTests(unittest.TestCase):
+    """文件预览扩展：OOXML 解析 / 压缩包清单 / 二进制摘要 / 媒体 data URL / HTML。"""
+
+    def _app(self, tmp: str):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(Path(tmp))
+        app = DesktopApp(host)
+        ws = Path(tmp) / "ws"
+        ws.mkdir(exist_ok=True)
+        app.set_workspace(str(ws))
+        return app, ws
+
+    def test_preview_ooxml_zip_and_binary(self):
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app, ws = self._app(tmp)
+            # docx：提取段落文本
+            with zipfile.ZipFile(ws / "a.docx", "w") as zf:
+                zf.writestr("word/document.xml",
+                            "<w:p><w:r><w:t>你好</w:t></w:r></w:p>"
+                            "<w:p><w:r><w:t>世界</w:t></w:r></w:p>")
+            r = app.file_preview("a.docx")
+            self.assertEqual(r["kind"], "office")
+            self.assertIn("你好", r["text"])
+            self.assertIn("世界", r["text"])
+            # xlsx：共享字符串 + 首表 → TSV
+            with zipfile.ZipFile(ws / "b.xlsx", "w") as zf:
+                zf.writestr("xl/sharedStrings.xml",
+                            "<sst><si><t>甲</t></si><si><t>乙</t></si></sst>")
+                zf.writestr("xl/worksheets/sheet1.xml",
+                            '<worksheet><sheetData><row>'
+                            '<c t="s"><v>0</v></c><c t="s"><v>1</v></c>'
+                            "</row></sheetData></worksheet>")
+            r = app.file_preview("b.xlsx")
+            self.assertEqual(r["kind"], "table")
+            self.assertEqual(r["text"], "甲\t乙")
+            # pptx：逐页文本
+            with zipfile.ZipFile(ws / "c.pptx", "w") as zf:
+                zf.writestr("ppt/slides/slide1.xml",
+                            "<p:sld><a:t>标题页</a:t></p:sld>")
+            r = app.file_preview("c.pptx")
+            self.assertEqual(r["kind"], "office")
+            self.assertIn("标题页", r["text"])
+            # zip：条目清单
+            with zipfile.ZipFile(ws / "d.zip", "w") as zf:
+                zf.writestr("inner/readme.txt", "hi")
+            r = app.file_preview("d.zip")
+            self.assertEqual(r["kind"], "archive")
+            self.assertIn("inner/readme.txt", r["text"])
+            # 二进制：十六进制摘要
+            (ws / "e.bin").write_bytes(b"\x00\x01\x02hello")
+            r = app.file_preview("e.bin")
+            self.assertEqual(r["kind"], "binary")
+            self.assertIn("00000000", r["text"])
+            # HTML：文本 + html kind
+            (ws / "f.html").write_text("<html><body>ok</body></html>",
+                                       encoding="utf-8")
+            r = app.file_preview("f.html")
+            self.assertEqual(r["kind"], "html")
+            self.assertIn("<html>", r["text"])
+
+    def test_preview_media_data_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, ws = self._app(tmp)
+            (ws / "a.mp3").write_bytes(b"ID3\x04\x00\x00\x00")
+            r = app.file_preview("a.mp3")
+            self.assertEqual(r["kind"], "audio")
+            self.assertTrue(r["data_url"].startswith("data:audio/mpeg;base64,"))
+            (ws / "v.webm").write_bytes(b"\x1aE\xdf\xa3")
+            r = app.file_preview("v.webm")
+            self.assertEqual(r["kind"], "video")
+            self.assertTrue(r["data_url"].startswith("data:video/webm;base64,"))
+
+
+class SubagentLogTests(unittest.TestCase):
+    """子 agent 调用记录：读取 profile/subagents.jsonl（最新在前，坏行跳过）。"""
+
+    def test_subagents_reads_jsonl(self):
+        import json
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            path = host.profile.root / "subagents.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"ts": 1, "task": "旧任务", "ok": True}, ensure_ascii=False) + "\n" +
+                "{坏行\n" +
+                json.dumps({"ts": 2, "task": "新任务", "ok": False}, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            r = app.subagents(10)
+            self.assertTrue(r["ok"])
+            self.assertEqual(len(r["items"]), 2)          # 坏行被跳过
+            self.assertEqual(r["items"][0]["task"], "新任务")  # 最新在前
+            # 无文件时返回空列表而不是报错
+            path.unlink()
+            self.assertEqual(app.subagents()["items"], [])
 
 
 if __name__ == "__main__":

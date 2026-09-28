@@ -105,9 +105,11 @@ def register(ctx) -> None:
     if runtime["current"] not in pool and order:
         runtime["current"] = order[0]
 
-    # 思考级别（off/low/medium/high）：映射到 OpenAI 兼容的 reasoning_effort
+    # 思考级别（off/low/medium/high）：映射到 OpenAI 兼容的 reasoning_effort；
+    # off 也显式下发（enable_thinking=false），否则留给服务端默认——
+    # 不少兼容端点默认开思考，导致「思考关了还在深度思考」
     level = (config.get("thinking_level") or "").strip()
-    if level and level != "off":
+    if level:
         for llm in pool.values():
             llm.reasoning_effort = level
 

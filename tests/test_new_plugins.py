@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -15,7 +16,7 @@ from typing import ClassVar
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nanoagent.llm import LLMResponse
-from test_harness import build_host, make_profile, patch_model_build
+from test_harness import build_host, make_profile, patch_model_build, tool
 
 from harness.cli import build_runtime
 from harness.schedule_store import ScheduleError, add_task, due_tasks, load_tasks
@@ -145,6 +146,24 @@ class ScheduleStoreTests(unittest.TestCase):
         self.assertTrue(remove_task(self.profile, "t1"))
         self.assertFalse(remove_task(self.profile, "t1"))
 
+    def test_pause_and_resume(self) -> None:
+        from harness.schedule_store import set_task_enabled
+
+        add_task(self.profile, "暂停我", 10, "p")
+        # 暂停 → enabled 翻 False，due_tasks 不再挑出
+        self.assertTrue(set_task_enabled(self.profile, "暂停我", enabled=False))
+        now = time.time()
+        tasks = load_tasks(self.profile)
+        self.assertFalse(tasks[0]["enabled"])
+        self.assertEqual(due_tasks(tasks, now), [])
+        # 恢复 → 重新可见
+        self.assertTrue(set_task_enabled(self.profile, "暂停我", enabled=True))
+        tasks = load_tasks(self.profile)
+        self.assertTrue(tasks[0]["enabled"])
+        self.assertEqual([t["name"] for t in due_tasks(tasks, now)], ["暂停我"])
+        # 不存在的任务
+        self.assertFalse(set_task_enabled(self.profile, "不存在", enabled=True))
+
     def test_due_tasks(self) -> None:
         now = time.time()
         tasks = [
@@ -155,6 +174,31 @@ class ScheduleStoreTests(unittest.TestCase):
         ]
         names = [t["name"] for t in due_tasks(tasks, now)]
         self.assertEqual(names, ["到期"])
+
+
+class KnowledgeServiceTests(unittest.TestCase):
+    """知识库插件以 host.service("knowledge") 暴露给桌面端的能力（不联网，懒构建）。"""
+
+    def test_status_clear_and_abs_path_guard(self) -> None:
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp(prefix="sha-kb-"))
+        profile = make_profile(tmp)
+        with patch_model_build():
+            host = build_runtime(profile, str(tmp))
+            self.addCleanup(host.shutdown)
+            svc = host.service("knowledge")
+            self.assertIsInstance(svc, dict)
+            # 空库状态（不要求模型可用）
+            info = svc["status"]()
+            self.assertEqual(info["chunks"], 0)
+            self.assertEqual(info["backend"], "numpy")
+            # 不存在的绝对路径 → 可读错误
+            self.assertIn("错误", svc["index_absolute"](str(tmp / "no-such-dir")))
+            # 清空：索引目录还没有文件也应当成功
+            summary = svc["clear"]()
+            self.assertIn("已清空", summary)
+            self.assertEqual(svc["status"]()["chunks"], 0)
 
 
 class SchedulerPluginTests(unittest.TestCase):
@@ -170,12 +214,26 @@ class SchedulerPluginTests(unittest.TestCase):
             self.assertEqual(host.plugins["scheduler"].state, "ACTIVE")
 
             log = profile.root / "scheduled" / "e2e.log"
+            # 轮询到日志内容出现（文件先创建、内容后写入，不能只看 exists()）
+            content = ""
             deadline = time.time() + 15
-            while (not log.exists()) and time.time() < deadline:
+            while time.time() < deadline:
+                if log.exists():
+                    try:
+                        content = log.read_text(encoding="utf-8")
+                    except OSError:  # 写入中 temporarily 不可读，继续等
+                        content = ""
+                    if "完成" in content:
+                        break
                 time.sleep(0.2)
-            self.assertTrue(log.exists(), "15 秒内应看到任务日志落盘")
-            content = log.read_text(encoding="utf-8")
             self.assertIn("完成", content)
+            # 任务状态（last_run / runs）与日志写入异步，同样轮询
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                tasks = load_tasks(profile)
+                if tasks[0]["last_run"] > 0 and tasks[0]["runs"]:
+                    break
+                time.sleep(0.2)
             tasks = load_tasks(profile)
             self.assertGreater(tasks[0]["last_run"], 0)
             self.assertTrue(tasks[0]["runs"])
@@ -350,3 +408,119 @@ class MultimodalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolsGitTests(unittest.TestCase):
+    """F4：受限 git 工具——只读三件套免门，add/commit 走权限门，测试门可拒绝提交。"""
+
+    def _repo_host(self, tmp: Path):
+        import subprocess
+
+        with patch_model_build():
+            host = build_host(Path(tmp))
+        ws = Path(host.workspace)
+        ws.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=ws, check=False)
+        # 有一个已跟踪文件，diff 才有内容（untracked 不进 git diff）
+        (ws / "README.md").write_text("demo", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=ws, check=False)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-qm", "基线"], cwd=ws, check=False)
+        return host, ws
+
+    def test_readonly_tools_and_commit_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, ws = self._repo_host(Path(tmp))
+            status = tool(host, "git_status")
+            diff = tool(host, "git_diff")
+            log = tool(host, "git_log")
+            add = tool(host, "git_add")
+            commit = tool(host, "git_commit")
+
+            self.assertIn("分支:", status.invoke({}))
+            self.assertIn("基线", log.invoke({}))
+            (ws / "README.md").write_text("changed", encoding="utf-8")
+            self.assertIn("README.md", diff.invoke({}))
+
+            # F4 修订：提交默认由用户手动完成——agent 调 add/commit 直接被拒
+            self.assertIn("由用户手动完成", add.invoke({"paths": "README.md"}))
+            self.assertIn("由用户手动完成", commit.invoke({"message": "更新 README"}))
+            # 开放 agent 提交后：暂存区为空的检查先于权限确认（不打扰）
+            host.profile.update_config(git={"allow_agent_commit": True})
+            out = commit.invoke({"message": "更新 README"})
+            self.assertIn("暂存区为空", out)
+
+            def allow_confirm(prompt: str) -> bool:
+                return True
+
+            host.confirm = allow_confirm
+            self.assertIn("已暂存", add.invoke({"paths": "README.md"}))
+            # 测试门：配置了 test_command 且失败 → 拒绝提交
+            host.profile.update_config(
+                git={"allow_agent_commit": True, "test_command": "exit 1"})
+            gated = commit.invoke({"message": "更新 README"})
+            self.assertIn("测试门未通过", gated)
+            # 测试门通过 → 提交成功
+            host.profile.update_config(
+                git={"allow_agent_commit": True, "test_command": "exit 0"})
+            self.assertIn("已提交", commit.invoke({"message": "更新 README"}))
+            self.assertIn("更新 README", log.invoke({"count": 1}))
+
+    def test_deny_blocks_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, _ws = self._repo_host(Path(tmp))
+            host.profile.update_config(permissions={"git": "deny"})
+            self.assertIn("deny", tool(host, "git_status").invoke({}))
+            self.assertIn("deny", tool(host, "git_add").invoke({"paths": "."}))
+
+    def test_agent_commit_disabled_by_default_even_allow(self):
+        """F4 修订：即使 permissions.git=allow，agent 提交默认仍关闭（用户手动）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host, _ws = self._repo_host(Path(tmp))
+            host.profile.update_config(permissions={"git": "allow"})
+            self.assertIn("由用户手动完成",
+                          tool(host, "git_add").invoke({"paths": "."}))
+            self.assertIn("由用户手动完成",
+                          tool(host, "git_commit").invoke({"message": "x"}))
+
+
+class BootstrapTests(unittest.TestCase):
+    """F5：工程脚手架——只增量创建；git 基线提交；目标写入 README。"""
+
+    def test_run_bootstrap_creates_and_commits(self):
+        import subprocess
+
+        from harness.bootstrap import run_bootstrap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "proj"
+            ws.mkdir()
+            res = run_bootstrap(ws, "做一个待办应用")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertTrue(res["committed"])
+            for name in ("src", "tests", "docs", ".gitignore"):
+                self.assertTrue((ws / name).exists(), name)
+            self.assertIn("待办应用", (ws / "README.md").read_text(encoding="utf-8"))
+            log = subprocess.run(["git", "log", "--oneline"], cwd=ws,
+                                 capture_output=True, check=False)
+            self.assertIn("做一个待办应用", log.stdout.decode("utf-8", "replace"))
+            # 重复执行：不覆盖、不报错
+            res2 = run_bootstrap(ws, "另一个目标")
+            self.assertTrue(res2["ok"])
+            self.assertEqual(res2["created"], [])
+            # README 已存在不会被第二个目标覆盖
+            self.assertIn("待办应用", (ws / "README.md").read_text(encoding="utf-8"))
+
+
+class SubagentReadonlyTests(unittest.TestCase):
+    """F7：subagent.readonly=true 时剥离写类工具。"""
+
+    def test_readonly_filters_write_tools(self):
+        with tempfile.TemporaryDirectory() as tmp, patch_model_build():
+            host = build_host(Path(tmp))
+            host.profile.update_config(subagent={"readonly": True})
+            agent = host.service("subagent_factory")()
+            names = set(agent.tools.names())
+            self.assertIn("read_file", names)
+            self.assertNotIn("write_file", names)
+            self.assertNotIn("run_command", names)

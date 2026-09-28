@@ -18,7 +18,8 @@ Harness 微内核（kernel.py）──────── 一切皆插件（16 �
    │  卸载时 LIFO 回滚、幂等          ├─ tools_fs     文件读写 / 局部编辑（路径监狱）
    │  状态机 PENDING→ACTIVE→         ├─ tools_search 全工作区文本搜索
    │  FAILED/DISPOSED                ├─ tools_shell  Shell 执行（三级权限门 + 审计）
-   │  插件依赖拓扑激活 / 热重载        ├─ tools_todo   多步任务待办
+   │  插件依赖拓扑激活 / 热重载        ├─ tools_todo   TODO.md 任务索引（工作区持久）
+   │                                 ├─ tools_git    受限 git（status/diff/log/add/commit，无 push；测试门）
    │                                 ├─ skills       SKILL.md 技能（渐进式披露）
    │                                 ├─ mcp_client   MCP 服务器接入（stdio/SSE/HTTP）
    │                                 ├─ guardrails   输入/输出护栏
@@ -54,12 +55,33 @@ sha desktop                          :: 打开桌面窗口
 桌面端能力（全部基于同一套插件运行时，与 CLI 共享 profile）：
 
 - **对话**：会话侧栏（历史会话点击回放 / 新会话），工具调用与模型信息随回复展示
+- **新会话向导**：先选工作区（含「选择其他文件夹…」）、再命名；取消/留空不创建；
+  默认名自动生成（不再出现裸 id 会话名）
 - **图片输入**：📎 按钮选图或直接粘贴图片路径，随下一条消息发给视觉模型（路径受工作区监狱约束）
 - **模型可视化设置**：弹窗内增删改模型卡片（名称/提供商/Base URL/模型 ID/API Key/默认），
   保存即校验（名称、模型、Key 必填，provider 仅 openai/anthropic，名称唯一）并**热重建模型池**，无需重启
 - **当前模型下拉切换**：等价 `/model`，持久化到 config.json
 - **插件管理**：侧栏查看插件状态、输入本地目录**可视化安装**（热激活）、点击移除
+- **会话管理**：重命名 / 🗑 删除（确认对话框；删除当前会话自动切到最近的）；
+  ★ 置顶（排在分组最前）；🔍 按关键词搜索全部历史并跳转高亮
+- **消息操作**：bot 消息「↻ 重新生成」（仅最后一条）、用户消息「✎ 编辑后重发」、一键复制
+- **知识库（RAG）**：右侧「📚 知识库」面板看库状态、选文件夹索引文本文件、按来源管理（单独删除某文件的片段）、一键清空；
+  agent 对话自动用 `search_knowledge` 检索
+- **任务索引（TODO.md）**：agent 的 todo_write/todo_read 读写工作区根 `TODO.md`
+  （Markdown 勾选格式，Git 可跟踪）；右侧「✅ 任务」面板可视化渲染
+- **长程任务支持**：系统提示词内置长程执行准则（原子粒度 / 串行 / TDD 默认失败，
+  `config.longrun.guidelines=false` 可关）；新会话自动恢复上下文（TODO.md 未完成项 +
+  最近 git log，`config.longrun.recovery=false` 可关）；上下文卡片 ≥80% 水位警示，
+  一键「⟳ 无状态重置」（进展写回 TODO.md → 自动新会话接续）
+- **用量图表**：右侧「📈 用量」标签页，usage.jsonl 按天聚合近 30 天 tokens 折线图
+- **完成提醒**：回复完成提示音 / 最小化时系统通知（上下文卡片内开关，可持久化）
 - **Shell 权限门**：`permissions.shell=ask` 时弹**原生确认对话框**（无窗口时 fail-closed 拒绝）
+- **可调布局**：右侧面板与左侧栏都可拖拽调宽（记忆）；工作区选择条可隐藏/从侧栏找回；
+  右侧标签页可 ✕ 隐藏、从「＋」找回；偏好持久化到 `config.ui_prefs`
+- **导出**：📤 导出当前会话为 Markdown；🗂 导出全部会话打包 zip（等价 `sha export --all`）
+- **个性化**：🎨 自定义强调色（预设/任意 #RRGGBB）与界面字体，全套主题变量联动
+- **更多**：浏览器多标签页（各自独立 iframe）、⚡ 快捷指令库（常用提示词一键插入，
+  REPL `/snip` 同步可用）、拖拽文件入窗（图片附加 / 文本插入输入框）
 
 架构：`harness/desktop.py` 的 `DesktopApp` 是纯 Python API 层（可独立测试，见 `tests/test_desktop.py`），
 `run()` 负责创建窗口并注入 `js_api`；渲染层是单页 HTML 常量，不含任何业务逻辑。

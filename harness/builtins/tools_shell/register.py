@@ -48,6 +48,7 @@ from harness.config import (
     permission_mode,
     shell_allowlist,
 )
+from harness.procutil import CREATE_NO_WINDOW
 from harness.workspace import workspace_root
 
 DEFAULT_TIMEOUT = 60
@@ -182,6 +183,7 @@ def register(ctx) -> None:
                 command, shell=True, cwd=workdir, env=child_env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
             )
         except FileNotFoundError:
             return f"错误：找不到命令: {command}"

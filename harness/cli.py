@@ -15,7 +15,7 @@
     sha model list | use <名>      # 查看 / 切换模型
     sha model add | remove <名>    # 增删模型（此前只能手改 config.json）
     sha skill list                 # 列出技能
-    sha schedule add|list|remove   # 定时任务（scheduler 插件到点执行）
+    sha schedule add|list|remove|pause|resume   # 定时任务（scheduler 插件到点执行）
     sha status                     # 插件与能力总览
 """
 
@@ -88,6 +88,8 @@ def _make_parser() -> argparse.ArgumentParser:
     sub.add_parser("desktop", help="桌面端：pywebview 原生窗口（需 pip install pywebview）")
 
     sub.add_parser("init", help="初始化 profile")
+    boot = sub.add_parser("bootstrap", help="工程脚手架：目录规范 + .gitignore + git 基线提交")
+    boot.add_argument("--goal", default=None, help="工程目标（一句话；给出后让 agent 生成 TODO.md 原子任务）")
     sub.add_parser("status", help="插件与能力总览")
     sub.add_parser("sessions", help="列出历史会话")
     sub.add_parser("trace", help="查看最近一次对话的 trace 摘要（需 tracing 插件）")
@@ -95,6 +97,8 @@ def _make_parser() -> argparse.ArgumentParser:
     export.add_argument("session", nargs="?", default=None,
                         help="会话 id（省略则导出全部会话）")
     export.add_argument("--out", default=None, help="输出目录（默认 <工作区>/exports）")
+    export.add_argument("--all", dest="all_zip", action="store_true",
+                        help="打包为单个 zip（每会话一个 Markdown + 目录）")
     export.add_argument("--usage", dest="usage", action="store_true",
                         help="附带 token 用量汇总")
     usage_p = sub.add_parser("usage", help="token 用量统计（按天/会话汇总）")
@@ -150,6 +154,10 @@ def _make_parser() -> argparse.ArgumentParser:
     sched_sub.add_parser("list", help="列出任务")
     s_rm = sched_sub.add_parser("remove", help="删除任务")
     s_rm.add_argument("name")
+    s_pause = sched_sub.add_parser("pause", help="暂停任务（保留配置，不再到点执行）")
+    s_pause.add_argument("name")
+    s_resume = sched_sub.add_parser("resume", help="恢复已暂停的任务")
+    s_resume.add_argument("name")
     return parser
 
 
@@ -290,7 +298,13 @@ def _model_remove(profile: Profile, name: str) -> int:
 
 def _schedule(profile: Profile, args) -> int:
     """定时任务管理（功能5）：与 scheduler 插件共用 schedule_store 的同一份 tasks.json。"""
-    from .schedule_store import ScheduleError, add_task, load_tasks, remove_task
+    from .schedule_store import (
+        ScheduleError,
+        add_task,
+        load_tasks,
+        remove_task,
+        set_task_enabled,
+    )
 
     command = args.schedule_command
     try:
@@ -305,6 +319,12 @@ def _schedule(profile: Profile, args) -> int:
         if command == "remove":
             if remove_task(profile, args.name):
                 print(f"已删除任务 {args.name}")
+                return 0
+            print(f"错误：没有任务 '{args.name}'", file=sys.stderr)
+            return 1
+        if command in ("pause", "resume"):
+            if set_task_enabled(profile, args.name, enabled=command == "resume"):
+                print(f"已{'恢复' if command == 'resume' else '暂停'}任务 {args.name}")
                 return 0
             print(f"错误：没有任务 '{args.name}'", file=sys.stderr)
             return 1
@@ -344,54 +364,36 @@ def _list_sessions(profile: Profile) -> int:
     return 0
 
 
-def _usage_records(profile: Profile) -> list[dict]:
-    """读 usage.jsonl（功能3：ask 每轮追加一条）；文件不存在或行损坏即跳过。"""
-    path = profile.root / "usage.jsonl"
-    if not path.is_file():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict):
-            records.append(rec)
-    return records
-
-
 def _export_sessions(profile: Profile, args) -> int:
-    """把会话导出为 Markdown（含可选的 token 用量附录）。"""
+    """把会话导出为 Markdown（含可选的 token 用量附录）；实现与桌面端共用 exporter。"""
+    from .exporter import export_all_sessions_zip, export_session_markdown
+
+    out_dir = Path(args.out) if args.out else Path(args.workspace) / "exports"
+    if getattr(args, "all_zip", False):
+        if args.session:
+            print("--all 与指定会话 id 不能同时使用", file=sys.stderr)
+            return 2
+        dest = out_dir / f"sessions-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        try:
+            export_all_sessions_zip(profile, dest)
+        except ValueError as exc:
+            print(f"导出失败：{exc}", file=sys.stderr)
+            return 1
+        print(f"已打包全部会话 → {dest}")
+        return 0
+
     ids = [args.session] if args.session else profile.session_ids()
     if not ids:
         print("（没有可导出的会话）", file=sys.stderr)
         return 1
-    out_dir = Path(args.out) if args.out else Path(args.workspace) / "exports"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    usage_by_session: dict[str, list[dict]] = {}
-    if args.usage:
-        for rec in _usage_records(profile):
-            usage_by_session.setdefault(str(rec.get("session")), []).append(rec)
     exported = 0
     for sid in ids:
-        history = profile.load_session(sid)
-        if not history:
+        try:
+            dest = export_session_markdown(profile, sid, out_dir,
+                                           include_usage=bool(args.usage))
+        except FileNotFoundError:
             print(f"跳过 {sid}：会话为空或不存在")
             continue
-        lines = [f"# 会话 {sid}", ""]
-        for item in history:
-            role = {"user": "用户", "assistant": "助手"}.get(
-                str(item.get("role")), str(item.get("role")))
-            content = str(item.get("content", ""))
-            lines += [f"## {role}", "", content or "（空）", ""]
-        session_usage = usage_by_session.get(sid) or []
-        if session_usage:
-            p_tok = sum(int(r.get("prompt_tokens") or 0) for r in session_usage)
-            c_tok = sum(int(r.get("completion_tokens") or 0) for r in session_usage)
-            lines += ["---", "", (f"**Token 用量**：{len(session_usage)} 轮对话，"
-                       f"输入 {p_tok} + 输出 {c_tok} = {p_tok + c_tok} tokens"), ""]
-        dest = out_dir / f"{sid}.md"
-        dest.write_text("\n".join(lines), encoding="utf-8")
         print(f"已导出: {dest}")
         exported += 1
     if not exported:
@@ -402,7 +404,9 @@ def _export_sessions(profile: Profile, args) -> int:
 
 def _usage_summary(profile: Profile, args) -> int:
     """按天 / 会话汇总 token 用量（数据来自 <profile>/usage.jsonl）。"""
-    records = _usage_records(profile)
+    from .exporter import usage_records
+
+    records = usage_records(profile)
     if not records:
         print("暂无用量记录（对话后自动累积）")
         return 0
@@ -496,6 +500,41 @@ def main(argv: list | None = None) -> int:
     if command == "init":
         print(f"profile 已就绪: {profile.root}")
         print(f"配置文件: {profile.config_path}（编辑 models 填入你的模型）")
+        return 0
+
+    if command == "bootstrap":
+        from .bootstrap import run_bootstrap
+
+        goal = str(getattr(args, "goal", "") or "").strip()
+        res = run_bootstrap(args.workspace, goal)
+        for item in res.get("created") or []:
+            print(f"已创建: {item}")
+        if res.get("committed"):
+            print("已提交工程基线")
+        elif res.get("error"):
+            print(f"基线提交未完成: {res['error']}", file=sys.stderr)
+        if goal:
+            # 有目标 → 再用一轮对话让 agent 把目标拆成原子任务写入 TODO.md
+            try:
+                host = build_runtime(profile, args.workspace)
+            except ConfigError as exc:
+                print(f"错误：{exc}", file=sys.stderr)
+                return 2
+            import atexit
+
+            atexit.register(host.shutdown)
+            ask = host.service("ask")
+            if not callable(ask):
+                print("错误：对话插件未激活", file=sys.stderr)
+                return 1
+            result = ask(
+                f"工程目标：{goal}\n"
+                "请立即调用 todo_write 工具，把该目标拆解为 3~8 个原子任务写入"
+                " TODO.md（status=pending，每项带简短 detail），然后只回复："
+                "已生成 TODO.md")
+            print(result.get("reply") or "")
+        else:
+            print("提示：带 --goal \"工程目标\" 可让 agent 继续生成 TODO.md 原子任务清单")
         return 0
 
     if command == "plugin":
@@ -633,7 +672,12 @@ def main(argv: list | None = None) -> int:
         print("错误：repl 插件未激活，没有可用界面", file=sys.stderr)
         return 1
     try:
-        ui(once_message=args.message, session_id=args.session, force_new=args.new)
+        # 裸敲 `sha`（command 默认 "chat" 但未走 chat 子命令）时，顶层 Namespace
+        # 上没有 message/session/new 字段——必须用 getattr 兜默认值，
+        # 否则直接 AttributeError（用户只看到一行裸异常）
+        ui(once_message=getattr(args, "message", None),
+           session_id=getattr(args, "session", None),
+           force_new=getattr(args, "new", False))
     except KeyboardInterrupt:
         print("\n再见！")
     except ConfigError as exc:
