@@ -69,7 +69,11 @@ def run_register(record: Any, ctx: Any) -> None:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
-        spec.loader.exec_module(module)
+        # 直接 exec 源码而不用 spec.loader.exec_module：后者走 __pycache__ 字节码缓存，
+        # 其有效性按「mtime 秒级 + 文件大小」判断——同一秒内改写 register.py（大小不变）
+        # 会命中旧缓存，热重载/重装拿到的是旧代码。
+        source = register_py.read_text(encoding="utf-8")
+        exec(compile(source, str(register_py), "exec"), module.__dict__)  # noqa: S102
     except Exception:
         sys.modules.pop(module_name, None)
         raise

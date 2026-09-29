@@ -452,6 +452,15 @@ def _normalize_permissions(raw: Any) -> dict[str, Any]:
     }
     result["shell_allow"] = normalize_allowlist(perms.get("shell_allow"))
     result["audit"] = audit_enabled({"permissions": perms})
+    # 写前 diff 确认开关：即使 fs=allow 也要求每次写入先过目（默认关）
+    result["confirm_write"] = bool(perms.get("confirm_write"))
+    # 审批等待上限（秒）：0/缺失用宿主默认，非法值忽略
+    try:
+        timeout = float(perms.get("approval_timeout") or 0)
+        if timeout > 0:
+            result["approval_timeout"] = timeout
+    except (TypeError, ValueError):
+        pass
     return result
 
 

@@ -6,6 +6,297 @@
 版本号依据 [Semantic Versioning](https://semver.org/spec/v2.0.0.html)。  
 类型：新增 / 变更 / 修复 / 工程。
 
+## [未发布] —— 2026-09-28 第四十三批：标签滚轮横滚 + 回复样式 v3 + 辅助对话选模型（用户反馈）
+
+### 变更
+
+- **回退右缘悬停自动展开**（第四十二批该功能移除）；改为**标签栏滚轮横滚**：
+  标签多放不下时，在标签条上滚动滚轮即左右移动（Shift 滚轮原生横滚不重复叠加）。
+- **回复样式 v3**：行内 `code` 改强调色文字；任务清单 `- [ ]`/`- [x]` 渲染为
+  ☐/☑（展示用）；代码块语言徽标强调色加粗；表格表头加 2px 底边线；
+  消息 meta 行（模型/工具）加虚线上边分隔、更小更淡。
+
+### 修复
+
+- **辅助对话回放看不到思考过程**：`auxInit` 回放历史时此前丢弃 `m.reasoning`，
+  现与主会话一致重建「思考过程」折叠块。
+- **辅助对话无法选模型**：💬 辅助面板顶部新增模型下拉（列表来自全部已配置
+  模型，默认标「（默认）」）；chat_loop 新增 `ask_with` 服务——指定模型≠当前
+  模型时经 `build_agent_with` 构建一次性 agent（不缓存、不动全局 state），
+  会话照常落盘与计用量；`chat` API 增加 `model` 参数透传。
+
+### 测试与工程
+
+- 新增 `test_ask_with_custom_model`（指定模型回复/落盘/坏模型可读错误）→
+  **harness 215 条全绿**；UI JS `node --check` + md() 任务清单断言通过；
+  `dist/sha.exe` + `dist/ShaDesktop.exe` 已重建并冒烟。
+
+## [未发布] —— 2026-09-28 第四十二批：右缘悬停展开 + 回答排版 v2（用户反馈）
+
+### 新增
+
+- **右缘悬停自动展开**：右侧面板隐藏后，鼠标移到窗口右缘（10px 热区）即以
+  **浮层**临时展开（不挤动主内容、带阴影），移开 250ms 自动收回；正式
+  「展开/收起」（✕ / Ctrl+J / 通用开关）随时覆盖悬停态。
+
+### 变更（回答排版 v2）
+
+- 标题层级拉开：h1 底部分隔线、h2 强调色竖条、h3 强调色文字、块前间距加大；
+- 列表（ul/ol）：强调色项目符、行距、缩进；容器恢复正常空白——此前父级
+  pre-wrap 会把块间换行渲染成空行；
+- 引用块：强调色竖条 + 微底色圆角；链接：强调色下划线（hover 提亮）；
+  分隔线更轻；行高 1.65 → 1.7。
+
+### 测试与工程
+
+- `check_ui_js.py` 探针扩展：md() 的列表/引用/链接/hr/标题结构断言；
+  **214 条测试全绿**；`dist/sha.exe` + `dist/ShaDesktop.exe` 已重建并冒烟。
+
+## [未发布] —— 2026-09-28 第四十一批：第三批功能（记忆 / 时间线 diff / hooks / 预算 / 备份）
+
+### 新增
+
+- **长期记忆（🧠 记忆）**：profile/memory.md 由右侧新标签直接编辑，chat_loop
+  `_compose_instructions` 在构建 agent 时自动注入（截断 4000 字符）——跨会话
+  记住项目约定/代码规范；保存即 `reset_agent`，下一轮对话生效。
+- **改动时间线 diff 预览**：通用设置的检查点列表每条新增「🔍 diff」——
+  `checkpoint_diff(cid)` 用 unified diff 对照「留底的旧内容 vs 磁盘当前内容」，
+  当时新建的文件展示内容预览。
+- **Agent Hooks**：`config.hooks = {"reply_end": ["pytest -q"]}`——每轮回复结束后
+  在工作区自动执行命令（超时 180s、输出取尾部），以「[自动钩子]」段附在回复后；
+  chat_loop 提供 `run_hooks` 服务，整段与流式（worker 推送前）两条路径都生效。
+  hooks 是用户写进自己配置的受信命令（与 CI 脚本同性质），不走 shell 权限门。
+- **用量预算提醒**：`config.usage_budget`（token/天，0=不限）——当日用量超预算
+  时对话结果携带 `budget_warning`，前端 toast 提示。
+- **Profile 备份/恢复**：`export_profile`（config+会话+记忆+定时任务+知识库索引+
+  用量 → zip）/ `import_profile`（白名单成员、拒绝路径穿越、恢复前把当前 config
+  备份为 config.pre-import.json）；通用 → 数据面板新增 📦 备份 / 📂 恢复。
+
+### 测试与工程
+
+- 新增 `Batch41ApisTests`×5（记忆注入、时间线 diff、hooks 附加与关闭、预算告警
+  两态、备份恢复往返+穿越拦截）→ **harness 214 条全绿**。
+- `dist/sha.exe` + `dist/ShaDesktop.exe` 已重新打包并冒烟。
+
+## [未发布] —— 2026-09-28 第四十批：多模型并答对比 + 会话分支
+
+### 新增
+
+- **多模型并答对比（⚖）**：输入问题后点 ⚖ 选一个对手模型，两侧并行作答、
+  左右卡片对照（各带模型名与耗时，窄窗口自动上下堆叠）。对比走临时 agent
+  （chat_loop 新增 `build_agent_with(llm, session_id, tools)` 服务，复用主指令
+  装配与技能注册）：**纯对话不带工具、不落会话、不计用量**——它是「选模型」
+  不是「干活」。桌面端 `compare_models(message, a, b)`，a 省略=当前模型、
+  b 省略=池子里下一个不同模型；单模型池给出明确提示。
+- **会话分支（⎇）**：回放会话时每条 bot 消息的操作条新增「⎇ 分支」——把该条
+  及之前的历史复制成一个新会话（命名 = 原名 + ⎇，工作区继承），原会话不动。
+  后端 `branch_session(sid, index)` 按界面同款「可见消息」过滤规则换算下标，
+  避免空消息错位；分支只复制磁盘历史，不重建 agent。
+
+### 变更
+
+- chat_loop 指令/技能装配抽为 `_compose_instructions`/`_build_skills_registry`
+  （get_agent 与 build_agent_with 共用，单一事实来源）；新增 `build_agent_with` 服务。
+
+### 测试与工程
+
+- 新增 `Batch40ApisTests`×4 → **harness 209 条全绿**；UI JS `node --check` 通过；
+  `dist/sha.exe` + `dist/ShaDesktop.exe` 已重新打包并冒烟。
+
+## [未发布] —— 2026-09-28 第三十九批：第二批功能（代码应用 / @引用 / 试检索 / 定时面板）
+
+### 新增
+
+- **代码块工具条**：模型回答里的围栏代码块带「复制」与「应用到文件」——后者弹路径
+  输入框后走 `apply_code` → **复用 write_file 工具**（fs 权限门、confirm_write 看
+  diff、写前 checkpoint 留底可 ↶ 撤销全部生效）。代码原文存元素 `data-code` 属性
+  （流式每帧重渲染下注册表式存储会膨胀，挂元素上天然自愈）。
+- **@文件引用**：输入 `@` 触发工作区文件补全弹窗（`ws_files` 扁平清单 30s 缓存，
+  忽略目录跳过；↑↓ 选择 / Tab·Enter 确认 / Esc 关闭）；发送时 `expandAtRefs` 把
+  引用路径展开为原文内容块（最多 3 个 × 12k 字符，后端 `ws_file_text` 走路径监狱）。
+- **知识库试检索**：📚 知识库面板新增查询行——`knowledge_query` 直接调
+  search_knowledge 工具看命中片段与来源，不进对话、不计用量。
+- **定时任务面板**：右侧新增「⏰ 定时」标签——列表（名称/间隔/上次运行/提示词）、
+  启停切换、移除；与 scheduler 插件、`sha schedule` 共用同一 tasks.json（插件逐轮
+  重读盘，改动即时生效）。新建仍走 CLI 或让 agent 代劳。
+
+### 测试与工程
+
+- 新增 `Batch39ApisTests`×4（清单+监狱、门的 fail-closed 与放行写入、试检索冒烟、
+  定时任务往返）→ **harness 205 条全绿**；UI JS `node --check` + md 冒烟通过。
+- `dist/sha.exe` + `dist/ShaDesktop.exe` 已重新打包并冒烟。
+- 多模型并答对比（第二批第 5 项）涉及双 agent 会话架构，留待下批。
+
+## [未发布] —— 2026-09-28 第三十八批：停止生成 / 会话自动起名 / MCP 可视化管理
+
+### 新增
+
+- **回复中断（停止按钮）**：nanoagent `run_stream`/`arun_stream` 新增 `should_stop`
+  中止钩子（每轮开始与每个 delta 之间检查；命中后关闭底层流——`StreamResult.close`/
+  `AsyncStreamResult.aclose`，不发 done、不落盘、不跑输出护栏）；chat_loop `ask_stream`
+  透传该钩子；桌面端 `stop_stream(sid)` API + 输入区 ■ 停止按钮（回答中显示），
+  worker 中途停止时补发 `cancelled` done——前端保留已生成的部分内容并标注
+  「已停止生成，内容未保存到会话历史」，残余 delta 丢弃。
+- **会话自动起名**：`_maybe_auto_title`——首轮回复后给默认命名（「会话 月-日 时:分」）
+  的会话用当前模型一次廉价调用起 ≤12 字标题；用户/向导起过的名字不动；
+  `config.auto_title=false` 关闭。整段路径在锁外调用（不占全局锁），流式在 worker 收尾后调用。
+- **MCP 服务器可视化管理**：设置弹窗新增 🔗 MCP 页——卡片式增删改（名称/传输类型
+  stdio·http·sse/URL·启动命令/参数），Headers 与 Env 走 JSON、值掩码回显
+  （回传掩码 = 保持原值，同模型 API Key 约定）；后端 `mcp_servers()` / `save_mcp(list)`
+  （名称唯一、stdio 必填命令、http(s) URL 校验；保存即全量替换 + `host.reload("mcp_client")`
+  热重连 + `reset_agent` 丢弃 agent 下一轮重建工具集）。chat_loop 新增 `reset_agent` 服务。
+
+### 测试与工程
+
+- nanoagent +4（`StreamStopTests`：中途停/立即停/放行完跑/异步路径）→ **332 全绿**；
+  harness +7（should_stop 截断、stop_stream 置位、自动起名三态、MCP 往返与校验）→ **201 全绿**。
+  受自动起名影响的脚本化测试（regenerate/edit-resend/stateless-reset）显式
+  `auto_title=False` 隔离；`fake_ask_stream` 签名补 `should_stop`。
+- `.audit_tmp/check_ui_js.py`：UI JS `node --check` 通过 + md 表格冒烟通过。
+- `dist/sha.exe` + `dist/ShaDesktop.exe` 已重新打包并冒烟。
+
+## [未发布] —— 2026-09-28 第三十七批：桌面端四项体验修复（用户反馈）
+
+### 修复
+
+- **二次进入会话看不到思考过程**：chat_loop 新增 `_attach_reasoning`——`ask`/`ask_stream`
+  落盘前把本轮思考附到最后一条 assistant 消息（`Memory.history` 返回副本，不污染内存记忆）；
+  桌面端 `selectSession` 回放时透传 `m.reasoning`，重建「深度思考」折叠块。
+- **模型表格回答显示为原始竖线文本**：`md()` 主循环改索引式并支持 md 表格
+  （`isMdTableSep` 分隔行判定 + `renderMdTable` 渲染：`\|` 转义还原、`:---:` 对齐、
+  列数与表头补齐；不成表格的散 `|` 行回落段落）。样式 `.md-table`（pre-wrap 上下文
+  恢复 normal 空白、表头底色、斑马行）。
+- **会话区与两侧底色不一致**：`main` 补 `background:var(--panel)`，中央与左右面板同色。
+
+### 新增
+
+- **子 agent 调用记录可移除**：`_record` 给每条记录加 `id`；桌面端
+  `remove_subagents(ids)`（按 id 过滤 + tmp 原子替换重写 jsonl，坏行保留；
+  ids 为空 → 清空全部）；面板头部 🗑 清空按钮 + 每行 × 删除（旧版无 id 记录不渲染 ×）。
+
+### 测试与工程
+
+- 新增回归：`ReasoningReplayTests`（`_attach_reasoning` 边界）、
+  `test_remove_subagents_by_ids_and_clear`（按 id 删/清空/坏行保留/无 tmp 残留）、
+  `test_chat_roundtrip_reasoning_and_session_persistence` 补回放断言。
+  **194 条测试全绿**（+2）。`.audit_tmp/check_ui_js.py`：UI 内嵌 JS `node --check`
+  + `md()` 表格渲染冒烟（表头/单元格/转义竖线/非表格回落）。
+- `dist/sha.exe` + `dist/ShaDesktop.exe` 已重新打包并冒烟（每次改动后重建约定）。
+
+## [未发布] —— 2026-09-28 第三十六批：审计边角项清理（nanoagent，第二轮续）
+
+> 官方 N-*/H-* 清单经逐项代码核对已全部闭环；本批处理的是首轮审查报告过、
+> 但未进入官方清单的边角项。复现脚本 `.audit_tmp/verify_mcp_fix.py`。
+
+### 修复（均在 nanoagent 仓库）
+
+- **MCP 工具名未净化**（`nanoagent/mcp.py`）：`mcp_schema_to_nanoagent` 现对工具名
+  走 `sanitize_tool_name`——MCP 常见 `server.tool` 带点号名会被 OpenAI 兼容服务 400
+  拒绝；原始名经 `list_tools` → `_bind(raw_name)` 保留用于转发调用，干净名字原样不动。
+- **MCPManager 配置容错**（`nanoagent/mcp.py`）：`_load` 遇损坏 mcp.json 抛带路径的
+  ValueError（此前裸 `json.loads` 栈，且静默当空配置会被后续 save 覆盖用户全部声明）；
+  `_save` 改 tmp + `os.replace` 原子写。
+- **结构化输出重试 usage 漏计**（`nanoagent/agent.py`）：run/arun/arun_stream 三处，
+  重试那一次 LLM 调用的 usage 现累加进 `usage_total`（此前返回给调用方的统计偏低）。
+- **迭代上限空内容进记忆**（`nanoagent/agent.py`）：达到 `max_iterations` 且最后一轮
+  仍是 tool_calls 时，content 常为空串——四条路径现写入明确标记文案
+  「（未产出最终回答：已达 max_iterations=N 上限…）」，不再产生空 assistant 消息。
+- **RAG embeddings 分批**（`nanoagent/rag/retriever.py`）：`_embed` 按 `EMBED_BATCH=64`
+  分批调用 /embeddings，大文件入库不再受服务端单请求批量/token 上限限制。
+
+### 工程
+
+- 索引分片（mcp.py / agent.py / retriever.py 条目）已同步并重建 `FILE_INDEX.md`；
+  nanoagent 328 条测试全绿。
+
+## [未发布] —— 2026-09-28 第三十五批：审计遗留缺陷修复（nanoagent 联动）
+
+### 修复
+
+- **热重载拿到旧代码**（`harness/loader.py`）：`run_register` 改为直接 `exec(compile(源码))`，
+  不再走 `spec.loader.exec_module` 的 `__pycache__` 字节码缓存——其有效性按「mtime 秒级 +
+  文件大小」判断，同一秒内改写 `register.py`（大小不变）会命中旧缓存，`sha plugin reload`
+  与重装执行的是旧代码（`test_reload_picks_up_new_code` 实测复现）。
+
+### 变更
+
+- 索引同步：`parts/01-nanoagent-core.md`（server.py 惰性化 / agent.py 流式护栏 / multi.py 续跑）
+  与 `parts/05-sahou-harness.md`（loader.py 直 exec）已更新并重建 `FILE_INDEX.md`。
+- 同批 nanoagent 修复（引擎仓库）：`server.py` 模块级 `app = create_app()` 改 PEP 562 惰性属性
+  （N-10d）；输出护栏开启时流式事件先缓冲、护栏通过后再放行（N-05）；Workflow resume 遇
+  `passed=True` 的 checkpoint 直接进汇总，不再多跑一轮（N-07）。nanoagent 328 条测试全绿。
+
+## [未发布] —— 2026-09-28 第三十四批：模型输出样式美化（更改卡片 / 轻量思考行）
+
+### 变更
+
+**工具调用改成「更改卡片」分组折叠样式**
+
+- 收尾时按类别分组渲染成可折叠卡片（默认折叠，点标题展开）：
+  - `✏️ 更改 · N 个文件` —— 每行：动作（写入/编辑）· **文件名**（主题色）·
+    相对目录（灰）· **`+N -M`**（绿增红减）· 失败时红字「执行失败」
+  - `⌨ 运行命令 · N 条` —— 每行显示命令原文 + 失败标记
+  - `🔧 工具调用 · N 次` —— 读取/搜索等其他工具
+- 失败计数汇总在标题行（「N 个执行失败」），一眼看出哪批操作有问题
+- 流式过程里的步骤行同步美化：图标按工具类别（✏️/⌨/🔍/🔧）+ 简述 + 耗时，
+  失败步骤标红
+
+**思考行改为轻量样式**
+
+- 从「🧠 已深度思考（N 轮）· 展开查看」改为参考样式的 **「深度思考（N 轮）›」**
+  一行灰字 + 尾部箭头（展开时箭头旋转）；展开内容改为左侧竖线缩进
+- 流式步骤里的「思考 · 第 N 轮」→「💭 深度思考 · 第 N 轮」
+
+### 变更（后端配套）
+
+- 工具事件新增 `args` 摘要（path / command / pattern / 行数 / old-new 片段），
+  界面才能显示命令原文与文件名（不把整篇文件内容推给前端）
+- `write_file` / `edit_file` 结果追加增删行统计：
+  `已写入 a.py（28 行，+12 -0）`、`已修改 a.py（替换 1 处，行数 40 → 40，+1 -1）`
+
+### 工程
+
+- jsdom 验证：分组计数与失败汇总、折叠开合、文件名/目录/`+N -M` 渲染、
+  思考行文案与箭头、旧类（.tool-log）零残留
+- 全量 192 条测试通过；ruff / mypy 双清零
+
+## [未发布] —— 2026-09-28 第三十三批（P0）：权限审批弹窗 + 写前 diff 与一键撤销
+
+### 新增
+
+**权限审批弹窗（ask 真正会问人）**
+
+- 新增统一审批通道 `harness/approvals.py`：工具线程 → 界面弹窗 →
+  「允许一次 / 一直允许 / 拒绝」（fail-closed：无通道或超时一律拒绝）
+- 桌面端升级旧的单按钮确认框：命令审批显示命令与工作目录；
+  **写入审批直接显示 unified diff**（增/删行着色）
+- 「一直允许」：shell 命令写入 `permissions.shell_allow` 白名单；
+  写入则把 `permissions.fs` 置为 allow（用户显式选择，落盘可查）
+- 审批不依赖 live block、也不受会话过滤影响：后台会话/子 agent 的请求照常弹出；
+  多个请求排队展示，标题栏提示「另有 N 个待确认」
+
+**写文件前 diff 确认 + 文件改动检查点/一键撤销**
+
+- 每次 `write_file`/`edit_file` 前**自动留底**（`<profile>/checkpoints/`，
+  只备份被改文件，按批成检查点，最多保留 40 个）
+- 右侧「📁 工作区」新增 **「↶ 撤销」**：回滚最近一次改动
+  （原文件恢复、新建文件删除），带文件清单确认
+- 设置 → 通用 新增「文件改动与回滚」：**写文件前显示 diff 确认**开关
+  （`permissions.confirm_write`，默认关，保持流畅）+ 最近改动的可撤销列表
+- 撤销为一次性消费：同一检查点不会被重复回滚
+
+### 修复
+
+- `permissions.confirm_write` / `approval_timeout` 会被权限归一化**静默丢弃**
+  （H-07 同类问题）——已加入 `_normalize_permissions` 白名单
+
+### 工程
+
+- 新增 test_safety.py（8 条：ask 放行/拒绝/一直允许写白名单、无通道 fail-closed、
+  diff 传给审批者、confirm_write 强制确认、检查点撤销与恢复）
+- jsdom 验证审批弹窗（diff 着色、后台会话不过滤、三种决定回填、排队）与撤销入口
+- 全量测试通过；ruff / mypy 双清零（32 个源文件）
+
 ## [未发布] —— 2026-09-28 第三十二批：工具参数别名兼容 + 子 agent 空转根治
 
 ### 修复

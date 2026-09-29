@@ -600,7 +600,8 @@ class EndToEndTests(unittest.TestCase):
                 LLMResponse(content="写好了"),
             ]
             result = ask("写个文件", session_id="t2")
-            self.assertEqual(result["tool_calls"][0]["result"], "已写入 demo.txt（1 行）")
+            self.assertEqual(result["tool_calls"][0]["result"],
+                             "已写入 demo.txt（1 行，+1 -0）")
             self.assertEqual(result["reply"], "写好了")
             self.assertTrue((Path(tmp) / "demo.txt").is_file())
 

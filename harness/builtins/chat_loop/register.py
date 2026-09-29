@@ -94,6 +94,42 @@ def _recovery_context(host) -> str:
     return "\n".join(parts)
 
 
+def _attach_reasoning(history: list, reasoning) -> None:
+    """把本轮思考过程附到最后一条 assistant 消息上（就地修改传入副本）。
+
+    ``Memory.history`` 返回的是全新字典副本，附加 ``reasoning`` 键不会污染
+    内存里的记忆；会话文件原样保存该键，桌面端回放会话时据此重建
+    「深度思考」折叠块——否则二次进入会话就看不到思考过程了。
+    """
+    text = str(reasoning or "").strip()
+    if not text:
+        return
+    for item in reversed(history):
+        if item.get("role") == "assistant":
+            item["reasoning"] = text[:20000]
+            return
+
+
+def _summarize_args(arguments: Any) -> dict:
+    """把工具入参压成界面用的小摘要（不把整篇文件内容推给前端）。"""
+    if not isinstance(arguments, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("path", "command", "pattern", "cwd", "task", "name", "subdir"):
+        val = arguments.get(key)
+        if val:
+            out[key] = str(val)[:200]
+    if "content" in arguments:
+        try:
+            out["lines"] = str(arguments["content"]).count("\n") + 1
+        except Exception:  # noqa: BLE001
+            pass
+    for key, cap in (("old", 120), ("new", 120)):
+        if arguments.get(key):
+            out[key] = str(arguments[key])[:cap]
+    return out
+
+
 class _EventTracer:
     """包装 nanoagent tracer：把思考/工具步骤实时推送给桌面端界面。"""
 
@@ -128,6 +164,7 @@ class _EventTracer:
                     "tool": str(data.get("tool") or ""),
                     "elapsed_ms": data.get("elapsed_ms") or 0,
                     "result": str(data.get("result") or "")[:300],
+                    "args": _summarize_args(data.get("arguments")),
                 })
         except Exception:  # noqa: BLE001 —— 事件推送失败不影响对话
             pass
@@ -229,12 +266,52 @@ def register(ctx) -> None:
             counter += 1
         return f"{base}-{counter}"
 
+    def _compose_instructions() -> str:
+        """主系统提示词装配（get_agent 与 build_agent_with 共用，单一事实来源）。"""
+        from pathlib import Path
+
+        config = host.profile.load_config()
+        instructions = INSTRUCTIONS
+        # 长期记忆（profile/memory.md，桌面端 🧠 面板维护）：跨会话注入
+        memory_path = Path(host.profile.root) / "memory.md"
+        if memory_path.is_file():
+            try:
+                memory_text = memory_path.read_text(encoding="utf-8").strip()[:4000]
+            except OSError:
+                memory_text = ""
+            if memory_text:
+                instructions += "\n\n## 长期记忆（用户维护，跨会话生效）\n" + memory_text
+        # F2/F3：长程执行准则 + 跨会话状态恢复（config.longrun.* 可分别关闭）
+        longrun = config.get("longrun") if isinstance(config.get("longrun"), dict) else {}
+        if longrun.get("guidelines") is not False:
+            instructions += LONGRUN_GUIDELINES
+        if longrun.get("recovery") is not False:
+            recovery = _recovery_context(host)
+            if recovery:
+                instructions += ("\n\n## 当前工程状态（跨会话自动恢复；"
+                                 "继续任务前先复核 TODO.md）\n" + recovery)
+        if config.get("plan_mode"):
+            instructions += PLAN_MODE_INSTRUCTIONS
+        # 当前工作区显式声明：桌面端支持热切换，模型必须知道自己被问的是哪个目录
+        instructions += f"\n\n当前工作区：{host.workspace}"
+        return instructions
+
+    def _build_skills_registry():
+        from pathlib import Path
+
+        from nanoagent.skills import SkillRegistry
+
+        registry = SkillRegistry()
+        for skill_dir in host.collect_skill_dirs():
+            registry.add_dir(skill_dir)
+        profile_skills = Path(host.profile.root) / "skills"  # 用户安装的技能
+        if profile_skills.is_dir():
+            registry.add_dir(profile_skills)
+        return registry
+
     def get_agent():
         if state["agent"] is None:
-            from pathlib import Path
-
             from nanoagent import Agent
-            from nanoagent.skills import SkillRegistry
 
             runtime = host.service("models_runtime") or {}
             pool = runtime.get("pool") or {}
@@ -242,28 +319,8 @@ def register(ctx) -> None:
                 raise RuntimeError("没有可用模型：请在 .harness/profiles/<名>/config.json 的 models 里配置")
             llm = pool[runtime["current"]]
 
-            registry = SkillRegistry()
-            for skill_dir in host.collect_skill_dirs():
-                registry.add_dir(skill_dir)
-            profile_skills = Path(host.profile.root) / "skills"  # 用户安装的技能
-            if profile_skills.is_dir():
-                registry.add_dir(profile_skills)
-
             config = host.profile.load_config()
-            instructions = INSTRUCTIONS
-            # F2/F3：长程执行准则 + 跨会话状态恢复（config.longrun.* 可分别关闭）
-            longrun = config.get("longrun") if isinstance(config.get("longrun"), dict) else {}
-            if longrun.get("guidelines") is not False:
-                instructions += LONGRUN_GUIDELINES
-            if longrun.get("recovery") is not False:
-                recovery = _recovery_context(host)
-                if recovery:
-                    instructions += ("\n\n## 当前工程状态（跨会话自动恢复；"
-                                     "继续任务前先复核 TODO.md）\n" + recovery)
-            if config.get("plan_mode"):
-                instructions += PLAN_MODE_INSTRUCTIONS
-            # 当前工作区显式声明：桌面端支持热切换，模型必须知道自己被问的是哪个目录
-            instructions += f"\n\n当前工作区：{host.workspace}"
+            instructions = _compose_instructions()
             memory = _build_memory(config.get("memory") or {}, llm)
             session_id = state["session_id"]
             for item in host.profile.load_session(session_id):
@@ -280,10 +337,65 @@ def register(ctx) -> None:
                           output_guardrails=rules.get("output") or None,
                           tracer=make_tracer() if callable(make_tracer) else None)
             agent.tracer = _EventTracer(agent.tracer, host)
+            registry = _build_skills_registry()
             if len(registry):
                 agent.enable_skills(registry)
             state["agent"] = agent
         return state["agent"]
+
+    def build_agent_with(llm, session_id: str, tools=None):
+        """构建一个使用**指定 llm** 的独立 agent（并答对比等一次性场景）。
+
+        复用主指令装配与技能注册；tools 缺省=主工具集，传 [] 得到纯对话 agent。
+        不绑定主 agent 状态（state），也不挂事件 tracer——调用方自管生命周期。
+        """
+        from nanoagent import Agent
+
+        memory = _build_memory(host.profile.load_config().get("memory") or {}, llm)
+        for item in host.profile.load_session(session_id):
+            if item.get("role") in ("user", "assistant"):
+                memory.add(session_id, item["role"], item.get("content", ""))
+        rules = host.service("guardrails") or {}
+        agent = Agent(name="卅助手", instructions=_compose_instructions(), llm=llm,
+                      tools=host.collect_tools() if tools is None else list(tools),
+                      memory=memory,
+                      input_guardrails=rules.get("input") or None,
+                      output_guardrails=rules.get("output") or None,
+                      tracer=None)
+        registry = _build_skills_registry()
+        if len(registry):
+            agent.enable_skills(registry)
+        return agent
+
+    def ask_with(message: str, session_id: str | None = None, images: list | None = None,
+                 model_name: str | None = None):
+        """指定模型执行一轮对话（辅助对话选模型用）。
+
+        模型为空/等于当前模型 → 直接走全局 agent（与 ask 完全同路径）；
+        其他模型 → 经 build_agent_with 按会话回放构建一次性 agent（不缓存、
+        不动全局 state），会话照常落盘与计用量。
+        """
+        runtime = host.service("models_runtime") or {}
+        name = str(model_name or "").strip()
+        if not name or name == str(runtime.get("current") or ""):
+            return ask(message, session_id=session_id, images=images)
+        pool = runtime.get("pool") or {}
+        if name not in pool:
+            raise RuntimeError(f"模型不存在或不可用: {name}（可用: {', '.join(sorted(pool))}）")
+        sid = session_id or state["session_id"]
+        agent = build_agent_with(pool[name], sid)
+        result = agent.run(message, session_id=sid, images=_validate_images(images))
+        history = agent.memory.history(sid)
+        _attach_reasoning(history, getattr(result, "reasoning", ""))
+        host.profile.save_session(sid, history)
+        _record_usage(host, sid, name, result.usage,
+                      fallback=_estimate_usage(agent, sid, message, result.content or ""))
+        hook_text = run_hooks()
+        reply = result.content or ""
+        if hook_text:
+            reply += hook_text
+        return {"reply": reply, "reasoning": getattr(result, "reasoning", ""),
+                "tool_calls": result.tool_calls, "model": name, "usage": result.usage}
 
     def can_stream() -> bool:
         """当前模型是否支持流式（自建/自定义 LLM 可能只有 chat）。
@@ -297,14 +409,18 @@ def register(ctx) -> None:
             return False
         return callable(getattr(llm, "chat_stream", None))
 
-    def _stream_events(agent, message: str, session_id: str, images: list | None = None):
+    def _stream_events(agent, message: str, session_id: str, images: list | None = None,
+                       should_stop=None):
         """同步流式：直接透传 ``run_stream`` 的事件（delta / tool_call / done）。
 
         工具是同步执行的（MCP 已包装为同步闭包，其余协程工具由 nanoagent
         单独起循环跑完），因此不存在「异步工具要走 arun_stream」的分支——
         那条路径需要 AsyncLLM，而 models 只构建同步 LLM（H-02 的流式面）。
+
+        should_stop: 可选中止钩子，透传给 nanoagent——桌面端「停止」按钮的底座。
         """
-        yield from agent.run_stream(message, session_id=session_id, images=images)
+        yield from agent.run_stream(message, session_id=session_id, images=images,
+                                    should_stop=should_stop)
 
     def _bind_session(session_id: str | None) -> str:
         """确定本轮会话；跨会话时必须丢掉 agent，否则记忆里仍是上一个会话的历史。"""
@@ -346,19 +462,29 @@ def register(ctx) -> None:
         session_id = _bind_session(session_id)
         agent = get_agent()
         result = agent.run(message, session_id=session_id, images=_validate_images(images))
-        host.profile.save_session(session_id, agent.memory.history(session_id))
+        history = agent.memory.history(session_id)
+        _attach_reasoning(history, getattr(result, "reasoning", ""))
+        host.profile.save_session(session_id, history)
         runtime = host.service("models_runtime") or {}
         _record_usage(host, session_id, runtime.get("current", ""), result.usage,
                       fallback=_estimate_usage(agent, session_id, message,
                                                result.content or ""))
-        return {"reply": result.content, "reasoning": getattr(result, "reasoning", ""),
+        hook_text = run_hooks()
+        reply = result.content or ""
+        if hook_text:
+            reply += hook_text
+        return {"reply": reply, "reasoning": getattr(result, "reasoning", ""),
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
 
-    def ask_stream(message: str, session_id: str | None = None, images: list | None = None):
+    def ask_stream(message: str, session_id: str | None = None, images: list | None = None,
+                   should_stop=None):
         """流式对话：依次产出 ``delta`` / ``tool_call`` / ``done`` 事件。
 
         ``done`` 事件里的 ``result`` 与 :func:`ask` 同源（完整 AgentResult）。
+
+        should_stop: 可选中止钩子（如桌面端「停止」按钮），透传给 nanoagent；
+        中止后生成器不再产出 done，消费方按「未完成」处理（不落盘，与中断一致）。
 
         会话落盘**由本函数在流结束时补上**：nanoagent 的 ``run_stream`` 只把回合
         记进内存里的 agent.memory，并不写 profile 的会话文件（那是 harness 的职责，
@@ -372,12 +498,15 @@ def register(ctx) -> None:
         session_id = _bind_session(session_id)
         agent = get_agent()
         final_result = None
-        for event in _stream_events(agent, message, session_id, _validate_images(images)):
+        for event in _stream_events(agent, message, session_id, _validate_images(images),
+                                    should_stop=should_stop):
             if event.get("type") == "done":
                 final_result = event.get("result")
             yield event
         # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
-        host.profile.save_session(session_id, agent.memory.history(session_id))
+        history = agent.memory.history(session_id)
+        _attach_reasoning(history, getattr(final_result, "reasoning", "") if final_result else "")
+        host.profile.save_session(session_id, history)
         if final_result is not None:
             runtime = host.service("models_runtime") or {}
             _record_usage(host, session_id, runtime.get("current", ""),
@@ -412,7 +541,64 @@ def register(ctx) -> None:
                     "确认后自动写入 TODO.md 再动手")
         return "计划模式已关闭"
 
+    def reset_agent() -> None:
+        """丢弃当前 agent（下轮 ask 重建）：MCP/插件/工具集变更后刷新用。
+
+        只清 agent 不动会话 id——记忆按会话回放，上下文不丢。
+        """
+        state["agent"] = None
+
+    def run_hooks() -> str:
+        """执行 config.hooks.reply_end 命令（每轮回复结束后），返回附在回复后的文本。
+
+        形如 {"hooks": {"reply_end": ["pytest -q", "git status --short"]}}；
+        命令在工作区目录 shell 执行，超时 180s，输出取尾部。hooks 是用户写进
+        自己配置的受信命令（与 CI 脚本同性质），不走 shell 权限门；执行失败
+        只附说明，绝不影响本轮回复。
+        """
+        import subprocess
+
+        from harness.procutil import CREATE_NO_WINDOW
+
+        try:
+            hooks = host.profile.load_config().get("hooks")
+        except Exception:  # noqa: BLE001
+            return ""
+        cmds = hooks.get("reply_end") if isinstance(hooks, dict) else None
+        if not cmds:
+            return ""
+        if isinstance(cmds, str):
+            cmds = [cmds]
+        parts: list[str] = []
+        for cmd in cmds:
+            cmd = str(cmd or "").strip()
+            if not cmd:
+                continue
+            try:
+                proc = subprocess.run(cmd, shell=True, cwd=str(host.workspace),
+                                      capture_output=True, timeout=180, check=False,
+                                      creationflags=CREATE_NO_WINDOW)
+                raw = (proc.stdout or b"") + (proc.stderr or b"")
+                text = raw.decode("utf-8", "replace")
+                if "\ufffd" in text:  # Windows 中文输出常为 GBK，兜一次
+                    try:
+                        text = raw.decode("gbk", "replace")
+                    except LookupError:
+                        pass
+                tail = "\n".join(text.strip().splitlines()[-40:])[:2000]
+                parts.append(f"$ {cmd} → 退出码 {proc.returncode}"
+                             + (f"\n{tail}" if tail else ""))
+            except Exception as exc:  # noqa: BLE001
+                parts.append(f"$ {cmd} → 执行失败: {type(exc).__name__}: {exc}")
+        if not parts:
+            return ""
+        return "\n\n---\n[自动钩子]\n" + "\n\n".join(parts)
+
     ctx.provide("set_plan_mode", set_plan_mode)
+    ctx.provide("reset_agent", reset_agent)
+    ctx.provide("build_agent_with", build_agent_with)
+    ctx.provide("run_hooks", run_hooks)
+    ctx.provide("ask_with", ask_with)
 
     ctx.provide("agent_factory", get_agent)
     ctx.provide("ask", ask)

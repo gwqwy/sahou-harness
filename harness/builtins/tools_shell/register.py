@@ -41,6 +41,7 @@ import threading
 import time
 from pathlib import Path
 
+from harness.approvals import remember_shell_allow, request_approval
 from harness.config import (
     audit_enabled,
     collapse_whitespace,
@@ -127,14 +128,26 @@ def register(ctx) -> None:
             _audit(config, command, "allow", f"allowlist:{hit}", mode, cwd)
             return None
 
-        confirm = getattr(host, "confirm", None)
-        if not callable(confirm):
-            # 非交互环境没有确认通道 —— 不能默认放行
+        has_channel = (callable(getattr(host, "request_approval", None))
+                       or callable(getattr(host, "confirm", None)))
+        if not has_channel:
+            # 非交互环境没有确认通道 —— 不能默认放行（审计单列，便于排查）
             _audit(config, command, "deny", "no-confirmer", mode, cwd)
             return "错误：命令未获人工确认，已拒绝执行"
-        if not confirm(f"执行命令: {command}"):
+        decision = request_approval(host, {
+            "kind": "shell",
+            "title": "执行命令",
+            "command": command,
+            "cwd": str(cwd or ""),
+        })
+        if decision == "deny":
             _audit(config, command, "deny", "user-denied", mode, cwd)
             return "错误：命令未获人工确认，已拒绝执行"
+        if decision == "allow_always":
+            remember_shell_allow(host, command)
+            approved.add(text)
+            _audit(config, command, "allow", "user-always", mode, cwd)
+            return None
         approved.add(text)
         _audit(config, command, "allow", "user-approved", mode, cwd)
         return None

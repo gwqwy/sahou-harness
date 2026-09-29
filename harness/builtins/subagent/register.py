@@ -86,10 +86,15 @@ def register(ctx) -> None:
                 pass
 
     def _record(entry: dict) -> None:
-        """把一次子 agent 调用追加到 profile/subagents.jsonl（右侧面板数据源）。"""
+        """把一次子 agent 调用追加到 profile/subagents.jsonl（右侧面板数据源）。
+
+        带 ``id``（uuid 短哈希）：桌面端「移除单条记录」按它定位；
+        旧版记录没有 id，只能整表清空。
+        """
         try:
             import json
 
+            entry = {"id": uuid.uuid4().hex[:8], **entry}
             path = host.profile.root / "subagents.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:

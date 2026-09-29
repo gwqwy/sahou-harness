@@ -194,6 +194,8 @@ class DesktopApiTests(unittest.TestCase):
             self.assertIn("t1", [s["id"] for s in sessions["sessions"]])
             history = app.session_history("t1")
             self.assertEqual(len(history["history"]), 2)
+            # 思考过程随 assistant 消息落盘：二次进入会话（回放）能重建思考块
+            self.assertEqual(history["history"][1].get("reasoning"), "想一想")
 
     def test_chat_error_returned_not_raised(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -797,6 +799,141 @@ class DesktopStreamTests(unittest.TestCase):
             self.assertTrue(done and not done[0]["ok"])
             self.assertIn("模型", done[0].get("error", ""))
 
+    def test_ask_stream_should_stop_truncates(self):
+        """should_stop 透传 nanoagent：命中后只放行已收的 delta，无 done，不落盘。"""
+        from test_harness import StreamingFakeLLM
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, _app, _window = self._stream_app(Path(tmp))
+            ask_stream = host.service("ask_stream")
+            calls = {"n": 0}
+
+            def stop():
+                calls["n"] += 1
+                return calls["n"] > 2   # 循环开始 + 首个 delta 前放行，之后停
+
+            events = list(ask_stream("你好", "s-stop", should_stop=stop))
+            self.assertEqual([e["type"] for e in events], ["delta"])
+            self.assertEqual(events[0]["text"], StreamingFakeLLM.chunks[0])
+            # 中断的回合不落盘（与 ask 中断即不落盘一致）
+            self.assertEqual(host.profile.load_session("s-stop"), [])
+
+    def test_stop_stream_sets_cancel_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            res = app.stop_stream("sx")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["session"], "sx")
+            self.assertIn("sx", app._cancel_sessions)
+
+
+class AutoTitleTests(unittest.TestCase):
+    """会话自动起名：首轮回复后给默认命名的会话起标题（config.auto_title=false 关）。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def _meta_name(self, host, sid: str) -> str:
+        return str((host.profile.load_config().get("sessions_meta") or {})
+                   .get(sid, {}).get("name") or "")
+
+    def test_first_reply_titles_default_named_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from nanoagent.llm import LLMResponse
+
+            host, app = self._app(Path(tmp))
+            agent = host.service("agent_factory")()
+            # 第 1 个响应给对话，第 2 个给起名调用
+            agent.llm.script = [LLMResponse(content="答案"),
+                                LLMResponse(content=" 爬虫开发实战 ")]
+            app.chat("帮我写爬虫", "t9")
+            self.assertEqual(self._meta_name(host, "t9"), "爬虫开发实战")
+
+    def test_renamed_session_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.rename_session("t10", "我的专属会话")
+            app.chat("你好", "t10")   # 起名调用不会被触发（FakeLLM 无需脚本）
+            self.assertEqual(self._meta_name(host, "t10"), "我的专属会话")
+
+    def test_auto_title_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from nanoagent.llm import LLMResponse
+
+            host, app = self._app(Path(tmp))
+            host.profile.update_config(auto_title=False)
+            agent = host.service("agent_factory")()
+            agent.llm.script = [LLMResponse(content="答案"),
+                                LLMResponse(content="不该出现的标题")]
+            app.chat("帮我写爬虫", "t11")
+            name = self._meta_name(host, "t11")
+            self.assertTrue(name.startswith("会话 "))
+            self.assertNotEqual(name, "不该出现的标题")
+
+
+class McpSettingsTests(unittest.TestCase):
+    """MCP 服务器可视化管理：保存校验 / 掩码回显与原值还原 / 热重连副作用。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def test_save_list_and_mask_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            res = app.save_mcp([
+                {"name": "fs", "type": "stdio", "command": "no-such-cmd-xyz",
+                 "args": "-y demo", "env": {"API_KEY": "sk-secret-key-1"}},
+                {"name": "remote", "type": "http", "url": "https://example.com/mcp",
+                 "headers": {"Authorization": "Bearer tok-12345678"}},
+            ])
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["count"], 2)
+            cfg = host.profile.load_config()["mcpServers"]
+            self.assertEqual(cfg["fs"]["command"], "no-such-cmd-xyz")
+            self.assertEqual(cfg["fs"]["args"], ["-y", "demo"])
+            self.assertEqual(cfg["fs"]["env"]["API_KEY"], "sk-secret-key-1")
+            self.assertEqual(cfg["remote"]["url"], "https://example.com/mcp")
+            # 列表回显掩码；保存时回传掩码 → 还原原值（保存即全量替换，remote 消失）
+            listed = {s["name"]: s for s in app.mcp_servers()["servers"]}
+            self.assertIn("***", listed["fs"]["env"]["API_KEY"])
+            self.assertIn("***", listed["remote"]["headers"]["Authorization"])
+            res2 = app.save_mcp([
+                {"name": "fs", "type": "stdio", "command": "no-such-cmd-xyz",
+                 "env": {"API_KEY": listed["fs"]["env"]["API_KEY"]}},
+            ])
+            self.assertTrue(res2["ok"])
+            self.assertEqual(res2["count"], 1)
+            cfg2 = host.profile.load_config()["mcpServers"]
+            self.assertEqual(cfg2["fs"]["env"]["API_KEY"], "sk-secret-key-1")
+            self.assertNotIn("remote", cfg2)
+            # 保存后 agent 被丢弃（reset_agent 服务生效，下轮 ask 重建工具集）
+            self.assertIsNotNone(host.service("reset_agent"))
+
+    def test_save_mcp_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertFalse(app.save_mcp(
+                [{"name": "a", "type": "stdio", "command": ""}])["ok"])
+            bad_url = app.save_mcp([{"name": "b", "type": "http", "url": "ftp://x"}])
+            self.assertFalse(bad_url["ok"])
+            self.assertIn("http", bad_url["error"])
+            dup = app.save_mcp([
+                {"name": "dup", "type": "stdio", "command": "x"},
+                {"name": "dup", "type": "stdio", "command": "y"},
+            ])
+            self.assertFalse(dup["ok"])
+            self.assertIn("重名", dup["error"])
+            # 校验失败不写配置
+            self.assertIsNone(host.profile.load_config().get("mcpServers"))
+
 
 class Batch11FeatureTests(unittest.TestCase):
     """第六批十一项功能：搜索/置顶/重新生成/编辑重发/导出全部/用量图表/快捷指令/知识库来源。"""
@@ -849,6 +986,7 @@ class Batch11FeatureTests(unittest.TestCase):
             from nanoagent.llm import LLMResponse
 
             _host, app = self._app(Path(tmp))
+            _host.profile.update_config(auto_title=False)  # 隔离起名功能：脚本按位消费
             agent = _host.service("agent_factory")()
             agent.llm.script = [LLMResponse(content="第一版"), LLMResponse(content="第二版")]
             app.chat("问题", "t1")
@@ -866,6 +1004,7 @@ class Batch11FeatureTests(unittest.TestCase):
             from nanoagent.llm import LLMResponse
 
             _host, app = self._app(Path(tmp))
+            _host.profile.update_config(auto_title=False)  # 隔离起名功能：脚本按位消费
             agent = _host.service("agent_factory")()
             agent.llm.script = [LLMResponse(content="回答1"), LLMResponse(content="回答2")]
             app.chat("原始问题", "t2")
@@ -1080,6 +1219,7 @@ class LongrunResetTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             _host, app = self._app(Path(tmp))
+            _host.profile.update_config(auto_title=False)  # 隔离起名功能：脚本按位消费
             agent = _host.service("agent_factory")()
             agent.llm.script = [LLMResponse(content="收到"),
                                 LLMResponse(content="已写入 TODO.md")]
@@ -1168,7 +1308,7 @@ class ParallelStreamTests(unittest.TestCase):
             release: dict[str, threading.Event] = {}
             done_marker: dict[str, bool] = {}
 
-            def fake_ask_stream(message, session_id=None, images=None):
+            def fake_ask_stream(message, session_id=None, images=None, should_stop=None):
                 ev = release.setdefault(session_id, threading.Event())
                 yield {"type": "delta", "text": "hi"}
                 ev.wait(2)  # 保持流不结束，便于断言并行/互斥状态
@@ -1385,6 +1525,391 @@ class SubagentLogTests(unittest.TestCase):
             # 无文件时返回空列表而不是报错
             path.unlink()
             self.assertEqual(app.subagents()["items"], [])
+
+    def test_remove_subagents_by_ids_and_clear(self):
+        """按 id 移除单条 / 清空全部；坏行与无 id 旧记录在按 id 删除时保留。"""
+        import json
+
+        from harness.desktop import DesktopApp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            app = DesktopApp(host)
+            path = host.profile.root / "subagents.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"id": "aaa", "ts": 1, "task": "A", "ok": True}, ensure_ascii=False) + "\n" +
+                "{坏行\n" +
+                json.dumps({"id": "bbb", "ts": 2, "task": "B", "ok": True}, ensure_ascii=False) + "\n" +
+                json.dumps({"ts": 3, "task": "旧记录无id", "ok": True}, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            r = app.remove_subagents(["bbb"])
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["removed"], 1)
+            kept_lines = [line for line in
+                          path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(json.loads(kept_lines[0])["task"], "A")
+            self.assertEqual(kept_lines[1], "{坏行")           # 坏行原样保留
+            self.assertEqual(json.loads(kept_lines[2])["task"], "旧记录无id")
+            self.assertFalse((path.parent / "subagents.jsonl.tmp").exists())
+            # 未命中任何 id → 文件原样
+            r = app.remove_subagents(["nope"])
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["removed"], 0)
+            self.assertEqual(len(kept_lines), 3)           # 4 行删 1 行
+            # 清空：整文件删除；再清一次（文件已不存在）也 ok
+            self.assertTrue(app.remove_subagents(None)["ok"])
+            self.assertFalse(path.exists())
+            self.assertTrue(app.remove_subagents([])["ok"])
+            self.assertEqual(app.subagents()["items"], [])
+
+
+class ReasoningReplayTests(unittest.TestCase):
+    """chat_loop._attach_reasoning：思考过程附到最后一条 assistant 消息（回放用）。"""
+
+    @staticmethod
+    def _load_chat_loop():
+        import types
+
+        path = (Path(__file__).resolve().parent.parent
+                / "harness" / "builtins" / "chat_loop" / "register.py")
+        # 与 loader 同款：直接 exec 源码，绕开 __pycache__ 旧缓存
+        mod = types.ModuleType("chat_loop_replay_test")
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), mod.__dict__)
+        return mod
+
+    def test_attach_reasoning_marks_last_assistant(self):
+        mod = self._load_chat_loop()
+        history = [{"role": "user", "content": "问题"},
+                   {"role": "assistant", "content": "回答"}]
+        mod._attach_reasoning(history, "先查文件再回答")
+        self.assertEqual(history[-1]["reasoning"], "先查文件再回答")
+        # 空 reasoning 不动历史
+        history2 = [{"role": "assistant", "content": "答"}]
+        mod._attach_reasoning(history2, "")
+        self.assertNotIn("reasoning", history2[0])
+        mod._attach_reasoning(history2, None)
+        self.assertNotIn("reasoning", history2[0])
+        # 没有 assistant 消息（异常轮）不崩
+        history3 = [{"role": "user", "content": "问"}]
+        mod._attach_reasoning(history3, "思考")
+        self.assertNotIn("reasoning", history3[0])
+
+
+class Batch39ApisTests(unittest.TestCase):
+    """第二批功能 API：代码应用 / @引用 / 知识库试检索 / 定时任务面板。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        return host, DesktopApp(host)
+
+    def test_ws_files_flat_list_and_text_jail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            ws = Path(host.workspace)
+            (ws / "src").mkdir()
+            (ws / "src" / "app.js").write_text("console.log(1)\n", encoding="utf-8")
+            (ws / "README.md").write_text("hello\n", encoding="utf-8")
+            junk = ws / "node_modules"
+            junk.mkdir()
+            (junk / "lib.js").write_text("x\n", encoding="utf-8")
+            files = app.ws_files()["files"]
+            self.assertIn("src/app.js", files)
+            self.assertIn("README.md", files)
+            self.assertNotIn("node_modules/lib.js", files)   # 忽略目录被跳过
+            # 原文读取 + 截断
+            r = app.ws_file_text("src/app.js")
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["text"].replace("\r\n", "\n"), "console.log(1)\n")
+            big = app.ws_file_text("README.md", max_chars=2)
+            self.assertTrue(big["text"].endswith("字符）"))
+            # 路径监狱：越界拒绝
+            self.assertFalse(app.ws_file_text("../outside.txt")["ok"])
+            self.assertFalse(app.ws_file_text("missing.md")["ok"])
+
+    def test_apply_code_uses_write_gate_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            # 默认 fs=ask 且无窗口 → fail-closed 拒绝
+            denied = app.apply_code("new.py", "print(1)\n")
+            self.assertFalse(denied["ok"])
+            self.assertFalse((Path(host.workspace) / "new.py").exists())
+            # 放行后可写（含自动建父目录）
+            allow_fs(host)
+            ok = app.apply_code("src/gen/app.py", "print('hi')\n")
+            self.assertTrue(ok["ok"], ok)
+            self.assertEqual((Path(host.workspace) / "src" / "gen" / "app.py")
+                             .read_text(encoding="utf-8"), "print('hi')\n")
+            # 越界路径被 write_file 门拒绝
+            outside = app.apply_code("../escape.py", "x")
+            self.assertFalse(outside["ok"])
+
+    def test_knowledge_query_smoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertFalse(app.knowledge_query("")["ok"])   # 空查询
+            r = app.knowledge_query("任何问题")
+            self.assertTrue(r["ok"])
+            self.assertIsInstance(r["output"], str)
+
+    def test_schedules_list_toggle_remove(self):
+        from harness.schedule_store import add_task, load_tasks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            add_task(host.profile, "日报", 3600, "总结今天的进展")
+            tasks = app.schedules()["tasks"]
+            self.assertEqual(len(tasks), 1)
+            self.assertTrue(tasks[0]["enabled"])
+            # 暂停 / 启用
+            self.assertTrue(app.schedule_toggle("日报", False)["ok"])
+            self.assertFalse(load_tasks(host.profile)[0]["enabled"])
+            self.assertTrue(app.schedule_toggle("日报", True)["ok"])
+            self.assertTrue(load_tasks(host.profile)[0]["enabled"])
+            # 移除与缺失名
+            self.assertTrue(app.schedule_remove("日报")["ok"])
+            self.assertEqual(app.schedules()["tasks"], [])
+            self.assertFalse(app.schedule_remove("日报")["ok"])
+            self.assertFalse(app.schedule_toggle("不存在", True)["ok"])
+
+
+class Batch40ApisTests(unittest.TestCase):
+    """多模型并答对比 + 会话分支。"""
+
+    def test_build_agent_with_isolated_no_tools(self):
+        from nanoagent.llm import LLMResponse
+
+        from test_harness import FakeLLM
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))
+            build = host.service("build_agent_with")
+            self.assertTrue(callable(build))
+            agent = build(FakeLLM(), "cmp-x", tools=[])
+            self.assertEqual(agent.tools.names(), [])   # 纯对话：无工具
+            self.assertIn("当前工作区", agent.instructions)   # 复用主指令装配
+            agent.llm.script = [LLMResponse(content="独立回答")]
+            result = agent.run("问题", session_id="cmp-x")
+            self.assertEqual(result.content, "独立回答")
+
+    def test_compare_models_runs_both(self):
+        from nanoagent.llm import LLMResponse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                profile = make_profile(Path(tmp), models=[
+                    {"name": "m1", "provider": "openai", "model": "x", "api_key": "k"},
+                    {"name": "m2", "provider": "openai", "model": "y", "api_key": "k"},
+                ])
+                from harness.cli import build_runtime
+
+                host = build_runtime(profile, str(tmp))
+            from harness.desktop import DesktopApp
+
+            app = DesktopApp(host)
+            runtime = host.service("models_runtime")
+            runtime["pool"]["m1"].script = [LLMResponse(content="甲答")]
+            runtime["pool"]["m2"].script = [LLMResponse(content="乙答")]
+            res = app.compare_models("同一个问题")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(res["a"]["name"], "m1")
+            self.assertEqual(res["a"]["reply"], "甲答")
+            self.assertEqual(res["b"]["name"], "m2")
+            self.assertEqual(res["b"]["reply"], "乙答")
+            # 对比不落会话：profile 里没有 cmp-* 会话文件
+            self.assertEqual([s for s in host.profile.session_ids() if s.startswith("cmp-")], [])
+            # 单边脚本用尽走 FakeLLM 兜底，不会失败——这里只验证异常路径：
+            bad = app.compare_models("问题", "m1", "ghost")
+            self.assertFalse(bad["ok"])
+
+    def test_compare_models_needs_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                host = build_host(Path(tmp))   # 只有 m1
+            from harness.desktop import DesktopApp
+
+            app = DesktopApp(host)
+            res = app.compare_models("问题")
+            self.assertFalse(res["ok"])
+            self.assertIn("两个", res["error"])
+            self.assertFalse(app.compare_models("")["ok"])   # 空消息
+
+    def test_branch_session_copies_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app_titled_off(Path(tmp))
+            app.chat("一", "t1")
+            app.chat("二", "t1")
+            self.assertEqual(len(app.session_history("t1")["history"]), 4)
+            r = app.branch_session("t1", 1)   # 从第 2 条可见消息处（含）分叉
+            self.assertTrue(r["ok"], r.get("error"))
+            branched = app.session_history(r["session"])["history"]
+            self.assertTrue(str(branched[-1]["content"]).endswith("假回答"))
+            self.assertEqual(len(branched), 2)
+            # 原会话不动；新会话命名 = 原名 + ⎇
+            self.assertEqual(len(app.session_history("t1")["history"]), 4)
+            meta = host.profile.load_config()["sessions_meta"]
+            self.assertTrue(meta[r["session"]]["name"].endswith("⎇"))
+            # 越界
+            self.assertFalse(app.branch_session("t1", 99)["ok"])
+
+    @staticmethod
+    def _app_titled_off(tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        host.profile.update_config(auto_title=False)
+        return host, DesktopApp(host)
+
+
+class Batch41ApisTests(unittest.TestCase):
+    """第三批：长期记忆 / 改动时间线 diff / hooks / 预算 / 备份恢复。"""
+
+    def _app(self, tmp: Path, titled_off: bool = True):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        if titled_off:
+            host.profile.update_config(auto_title=False)   # 隔离起名，避免干扰断言
+        return host, DesktopApp(host)
+
+    def test_memory_roundtrip_and_injection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertEqual(app.agent_memory()["text"], "")
+            app.save_agent_memory("本项目用 pytest，提交信息用中文")
+            self.assertTrue((Path(host.profile.root) / "memory.md").is_file())
+            # 注入：重建的 agent 指令里带记忆文本
+            agent = host.service("agent_factory")()
+            self.assertIn("本项目用 pytest，提交信息用中文", agent.instructions)
+            self.assertIn("长期记忆", agent.instructions)
+
+    def test_checkpoint_diff_shows_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            allow_fs(host)
+            ws = Path(host.workspace)
+            (ws / "note.txt").write_text("v1\n", encoding="utf-8")
+            app.apply_code("note.txt", "v2\n")          # 留底：v1
+            r = app.checkpoints(5)
+            items = r["items"]
+            self.assertTrue(items, "apply_code 应产生检查点")
+            d = app.checkpoint_diff(items[0]["id"])
+            self.assertTrue(d["ok"])
+            self.assertIn("改动前", d["diff"])
+            self.assertIn("+v2", d["diff"])
+            self.assertIn("note.txt", d["diff"])
+
+    def test_hooks_appended_to_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            host.profile.update_config(hooks={"reply_end": ["echo hook-ok"]})
+            res = app.chat("你好", "t1")
+            self.assertTrue(res["ok"])
+            self.assertIn("[自动钩子]", res["reply"])
+            self.assertIn("hook-ok", res["reply"])
+            # 无 hooks 配置 → 不附加
+            host.profile.update_config(hooks={})
+            res2 = app.chat("再来", "t1")
+            self.assertNotIn("[自动钩子]", res2["reply"])
+
+    def test_usage_budget_warning(self):
+        import json as _json
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            host.profile.update_config(usage_budget=100)
+            rec = {"ts": _time.time(), "session": "t1", "model": "m1",
+                   "prompt_tokens": 90, "completion_tokens": 20}
+            path = host.profile.root / "usage.jsonl"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(rec) + "\n")
+            res = app.chat("你好", "t1")
+            self.assertIn("budget_warning", res)
+            self.assertIn("超预算", res["budget_warning"])
+            # 无预算配置 → 无告警
+            host.profile.update_config(usage_budget=0)
+            res2 = app.chat("再来", "t1")
+            self.assertNotIn("budget_warning", res2)
+
+    def test_export_import_profile_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("历史消息", "keep-me")
+            app.save_agent_memory("记住这件事")
+            exported = app.export_profile("")
+            self.assertTrue(exported["ok"])
+            self.assertTrue(Path(exported["path"]).is_file())
+            # 恢复到一个全新的 profile
+            other_root = Path(tmp) / "other-profile"
+            from harness.config import Profile
+            from harness.desktop import DesktopApp
+            from harness.kernel import Harness
+
+            other = Profile(other_root)
+            host2 = Harness()
+            host2.profile = other
+            host2.workspace = str(tmp)
+            app2 = DesktopApp(host2)
+            r = app2.import_profile(exported["path"])
+            self.assertTrue(r["ok"], r.get("error"))
+            self.assertGreater(r["restored"], 0)
+            self.assertTrue((other_root / "sessions" / "keep-me.json").is_file())
+            self.assertEqual((other_root / "memory.md").read_text(encoding="utf-8"),
+                             "记住这件事")
+            self.assertTrue((other_root / "config.pre-import.json").is_file())
+            # 路径穿越成员被跳过
+            import zipfile
+
+            evil = Path(tmp) / "evil.zip"
+            with zipfile.ZipFile(evil, "w") as zf:
+                zf.writestr("../../evil.txt", "x")
+                zf.writestr("unknown/thing.bin", "y")
+            r2 = app2.import_profile(str(evil))
+            self.assertTrue(r2["ok"])
+            self.assertEqual(r2["restored"], 0)
+            self.assertFalse((other_root.parent / "evil.txt").exists())
+
+
+class Batch43ApisTests(unittest.TestCase):
+    """辅助对话选模型：ask_with 指定模型跑单轮，会话照常落盘。"""
+
+    def test_ask_with_custom_model(self):
+        from nanoagent.llm import LLMResponse
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch_model_build():
+                profile = make_profile(Path(tmp), models=[
+                    {"name": "m1", "provider": "openai", "model": "x", "api_key": "k"},
+                    {"name": "m2", "provider": "openai", "model": "y", "api_key": "k"},
+                ])
+                from harness.cli import build_runtime
+
+                host = build_runtime(profile, str(tmp))
+            from harness.desktop import DesktopApp
+
+            app = DesktopApp(host)
+            host.service("models_runtime")["pool"]["m2"].script = [
+                LLMResponse(content="乙答")]
+            # 指定 m2（≠当前 m1）→ 一次性 agent，回复与模型名来自 m2
+            res = app.chat("问题", "aux", None, "m2")
+            self.assertTrue(res["ok"], res.get("error"))
+            self.assertEqual(res["reply"], "乙答")
+            self.assertEqual(res["model"], "m2")
+            # 会话照常落盘（含本轮问答）
+            history = app.session_history("aux")["history"]
+            self.assertEqual(history[-1]["content"], "乙答")
+            # 不存在的模型 → 可读错误
+            bad = app.chat("问题", "aux", None, "ghost")
+            self.assertFalse(bad["ok"])
+            self.assertIn("ghost", bad["error"])
 
 
 if __name__ == "__main__":

@@ -110,9 +110,14 @@ class DesktopApp:
         self._lock = threading.RLock()  # js_api 每次调用一个线程，对话需串行
         self._current_session = "default"
         self._busy_sessions: set = set()  # 正在回答的会话（允许多会话并行）
+        self._cancel_sessions: set = set()  # 请求中断流式回复的会话（stop_stream 置位）
         self._market_cache = None       # (时间戳, items, categories)，10 分钟 TTL
         self._market_lock = threading.Lock()
-        host.confirm = self._confirm  # shell/文件写入权限 ask → 窗口内确认对话框
+        self._approvals: dict[str, tuple[threading.Event, dict]] = {}  # 待确认请求
+        self._approval_lock = threading.Lock()
+        host.confirm = self._confirm  # 兼容旧通道：单一「允许/拒绝」
+        # 新版审批通道：允许一次 / 一直允许 / 拒绝（写入类还带 diff）
+        host.request_approval = self._request_approval
 
     # -- 内部工具 -----------------------------------------------------------
     @staticmethod
@@ -151,6 +156,38 @@ class DesktopApp:
         meta[session_id] = info
         self.host.profile.update_config(sessions_meta=meta)
 
+    def _maybe_auto_title(self, session_id: str, user_text: str, reply_text: str) -> None:
+        """首轮回复后给「还没命名」的会话自动起标题（config.auto_title=false 关闭）。
+
+        只覆盖默认名（「会话 月-日 时:分」或空）——用户或新会话向导起过的名字不动。
+        标题用当前模型一次廉价调用生成；任何失败都静默保留默认名（起名是锦上添花，
+        不能影响对话主链路）。
+        """
+        try:
+            config = self._config()
+            if config.get("auto_title") is False:
+                return
+            meta = config.get("sessions_meta") or {}
+            name = str((meta.get(session_id) or {}).get("name") or "")
+            if name and not name.startswith("会话 "):
+                return
+            runtime = self.host.service("models_runtime") or {}
+            pool = runtime.get("pool") or {}
+            llm = pool.get(runtime.get("current") or "")
+            if llm is None or not callable(getattr(llm, "chat", None)):
+                return
+            prompt = ("为下面的对话起一个不超过12个字的中文标题。"
+                      "只输出标题本身：不要引号、句号、前缀或任何解释。\n\n"
+                      f"用户：{str(user_text or '')[:300]}\n"
+                      f"助手：{str(reply_text or '')[:300]}")
+            response = llm.chat([{"role": "user", "content": prompt}])
+            lines = str(getattr(response, "content", "") or "").strip().splitlines()
+            title = lines[0].strip().strip("「」\"'《》。．.。")[:24] if lines else ""
+            if title:
+                self.rename_session(session_id, title)
+        except Exception:  # noqa: BLE001 —— 起名失败不影响对话
+            pass
+
     # -- 权限确认（窗口内同步对话框；无窗口 fail-closed） ---------------------
     def _confirm(self, prompt: str) -> bool:
         if self._window is None:
@@ -184,6 +221,71 @@ class DesktopApp:
             interval = min(interval * 1.5, 1.0)
         return False
 
+    # -- 审批通道（allow_once / allow_always / deny） ------------------------
+    def _request_approval(self, payload: dict) -> str:
+        """工具线程发起的人工确认：弹窗 → 等用户选择（超时或窗口关闭即拒绝）。"""
+        if self._window is None:
+            return "deny"
+        req_id = hashlib.md5(
+            f"{time.time()}-{threading.get_ident()}".encode()).hexdigest()[:10]
+        event = threading.Event()
+        slot: dict = {"decision": "deny"}
+        with self._approval_lock:
+            self._approvals[req_id] = (event, slot)
+        try:
+            self._push_event({"kind": "approval", "id": req_id,
+                              **{k: v for k, v in payload.items() if k != "kind"},
+                              "approval_kind": payload.get("kind") or "shell"})
+            timeout = CONFIRM_TIMEOUT
+            try:
+                cfg = self._config().get("permissions")
+                if isinstance(cfg, dict) and cfg.get("approval_timeout"):
+                    timeout = float(cfg["approval_timeout"])
+            except Exception:  # noqa: BLE001 —— 配置读失败用默认超时
+                timeout = CONFIRM_TIMEOUT
+            if not event.wait(max(5.0, timeout)):
+                return "deny"
+            return str(slot.get("decision") or "deny")
+        finally:
+            with self._approval_lock:
+                self._approvals.pop(req_id, None)
+
+    def resolve_approval(self, req_id: str, decision: str) -> dict[str, Any]:
+        """界面回填审批结果（js_api）。"""
+        with self._approval_lock:
+            entry = self._approvals.get(str(req_id or ""))
+        if entry is None:
+            return {"ok": False, "error": "该确认请求已失效"}
+        event, slot = entry
+        slot["decision"] = decision if decision in ("allow_once", "allow_always", "deny") \
+            else "deny"
+        event.set()
+        return {"ok": True, "decision": slot["decision"]}
+
+    # -- 文件改动检查点 -----------------------------------------------------
+    def checkpoints(self, limit: int = 20) -> dict[str, Any]:
+        """列出文件改动检查点（最新在前）。"""
+        from harness.checkpoints import list_checkpoints
+
+        return {"ok": True, "items": list_checkpoints(self.host.profile, limit=limit)}
+
+    def undo_checkpoint(self, cid: str = "") -> dict[str, Any]:
+        """回滚最近一次（或指定）检查点。"""
+        from harness.checkpoints import undo
+
+        result = undo(self.host.profile, cid or None)
+        if result.get("ok"):
+            result["workspace"] = str(getattr(self.host, "workspace", "") or "")
+        return result
+
+    def set_confirm_write(self, enabled: bool) -> dict[str, Any]:
+        """开关「写文件前显示 diff 确认」（permissions.confirm_write）。"""
+        config = self._config()
+        permissions = dict(config.get("permissions") or {})
+        permissions["confirm_write"] = bool(enabled)
+        self.host.profile.update_config(permissions=permissions)
+        return {"ok": True, "confirm_write": bool(enabled)}
+
     # -- 状态 ---------------------------------------------------------------
     def status(self) -> dict[str, Any]:
         runtime = self.host.service("models_runtime") or {}
@@ -211,6 +313,8 @@ class DesktopApp:
             "shell_permission": permission_mode(config, "shell"),
             "fs_permission": permission_mode(config, "fs"),
             "git_permission": permission_mode(config, "git"),
+            "confirm_write": bool((config.get("permissions") or {}).get("confirm_write")
+                                  if isinstance(config.get("permissions"), dict) else False),
             "thinking_level": config.get("thinking_level") or "off",
             "plan_mode": bool(config.get("plan_mode")),
             "theme": config.get("theme") if config.get("theme") in THEME_MODES else "light",
@@ -689,7 +793,8 @@ class DesktopApp:
         if path and Path(path).is_dir():
             self.set_workspace(path)
 
-    def chat(self, message: str, session_id: str = "", images: list | None = None) -> dict[str, Any]:
+    def chat(self, message: str, session_id: str = "", images: list | None = None,
+             model: str = "") -> dict[str, Any]:
         session_id = session_id or self._current_session
         self._ensure_session_workspace(session_id)
         with self._lock:
@@ -704,8 +809,15 @@ class DesktopApp:
             self.host.emit_agent_event = self._push_event  # 实时步骤 → 界面
             try:
                 # images（功能7）：前端附加的图片源（http(s) URL 或本地路径），
-                # 路径校验在 chat_loop.ask 内做（工作区路径监狱），越界回 ok=False
-                result = ask(message, session_id=session_id, images=images or None)
+                # 路径校验在 chat_loop.ask 内做（工作区路径监狱），越界回 ok=False。
+                # model 非空且≠当前模型时走 ask_with（辅助对话选模型）。
+                model_name = str(model or "").strip()
+                ask_with = self.host.service("ask_with")
+                if model_name and callable(ask_with):
+                    result = ask_with(message, session_id=session_id,
+                                      images=images or None, model_name=model_name)
+                else:
+                    result = ask(message, session_id=session_id, images=images or None)
             except Exception as exc:  # noqa: BLE001 —— 错误回到界面而不是崩窗口
                 return {"ok": False, "error": str(exc)}
             finally:
@@ -713,7 +825,12 @@ class DesktopApp:
             result["ok"] = True
             result["session"] = session_id
             self._touch_session(session_id)
-            return result
+        # 锁外起名：标题生成的 LLM 调用可能要几秒，不能占着全局锁挡其他会话
+        self._maybe_auto_title(session_id, message, str(result.get("reply") or ""))
+        warn = self._usage_budget_warning()
+        if warn:
+            result["budget_warning"] = warn
+        return result
 
     def can_stream(self) -> dict[str, Any]:
         """当前模型是否支持流式（前端据此选择流式或整段路径）。"""
@@ -723,6 +840,252 @@ class DesktopApp:
         except Exception:  # noqa: BLE001 —— 模型未配置等
             stream = False
         return {"ok": True, "stream": stream}
+
+    def compare_models(self, message: str, model_a: str = "", model_b: str = "") -> dict[str, Any]:
+        """多模型并答对比：同一问题并行问池子里两个模型（纯对话、无工具、不落会话）。
+
+        对比是「选模型」不是「干活」：临时 agent 内存里跑完即弃，不写会话文件、
+        不记 usage.jsonl、不带工具（避免两边的工具副作用互相干扰计时与答案）。
+        model_a 省略=当前模型；model_b 省略=池子里下一个不同的模型。
+        """
+        message = str(message or "").strip()
+        if not message:
+            return {"ok": False, "error": "消息不能为空"}
+        runtime = self.host.service("models_runtime") or {}
+        pool = runtime.get("pool") or {}
+        build = self.host.service("build_agent_with")
+        if not callable(build):
+            return {"ok": False, "error": "对话插件未激活"}
+        if not pool:
+            return {"ok": False, "error": "没有可用模型"}
+        name_a = str(model_a or "").strip() or str(runtime.get("current") or "")
+        name_b = str(model_b or "").strip()
+        if not name_b:
+            order = runtime.get("order") or []
+            name_b = next((n for n in order if n != name_a), "")
+        if not name_b:
+            return {"ok": False, "error": "池子里只有一个可用模型——对比至少需要两个不同的模型（先在设置里再加一个）"}
+        for name in (name_a, name_b):
+            if not name or name not in pool:
+                return {"ok": False, "error": f"模型不存在或不可用: {name or '（空）'}"}
+        if name_a == name_b:
+            return {"ok": False, "error": "对比需要两个不同的模型（先在设置里再加一个）"}
+
+        results: dict[str, dict[str, Any]] = {}
+
+        def run_one(name: str) -> None:
+            started = time.time()
+            try:
+                agent = build(pool[name], f"cmp-{name}", tools=[])
+                result = agent.run(message, session_id=f"cmp-{name}")
+                results[name] = {
+                    "ok": True,
+                    "reply": result.content or "",
+                    "reasoning": getattr(result, "reasoning", "") or "",
+                    "usage": getattr(result, "usage", {}) or {},
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                }
+            except Exception as exc:  # noqa: BLE001 —— 单边失败不拖垮另一边
+                results[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                                 "elapsed_ms": int((time.time() - started) * 1000)}
+
+        threads = [threading.Thread(target=run_one, args=(n,), name=f"sha-cmp-{n}")
+                   for n in (name_a, name_b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return {"ok": True, "message": message,
+                "a": {"name": name_a, **results.get(name_a, {"ok": False, "error": "无结果"})},
+                "b": {"name": name_b, **results.get(name_b, {"ok": False, "error": "无结果"})}}
+
+    def branch_session(self, session_id: str, index: int) -> dict[str, Any]:
+        """从第 index 条可见消息（0 起）分叉新会话：复制该条及之前的历史，原会话不动。
+
+        index 用「可见消息序号」（与界面渲染一致：user/assistant 且内容非空），
+        后端按同一过滤规则换算回原始下标，避免空消息造成的错位。
+        """
+        sid = str(session_id or "").strip() or self._current_session
+        history = self.host.profile.load_session(sid)
+        visible = [i for i, m in enumerate(history) if str(m.get("content") or "").strip()]
+        try:
+            pos = int(index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"序号非法: {index}"}
+        if pos < 0 or pos >= len(visible):
+            return {"ok": False, "error": f"序号越界: {index}（共 {len(visible)} 条可见消息）"}
+        base = time.strftime("s-%Y%m%d-%H%M%S")
+        existing = set(self.host.profile.session_ids())
+        new_id = base
+        counter = 2
+        while new_id in existing:
+            new_id = f"{base}-{counter}"
+            counter += 1
+        self.host.profile.save_session(new_id, history[: visible[pos] + 1])
+        meta = dict(self._config().get("sessions_meta") or {})
+        info = dict(meta.get(sid) or {})
+        name = str(info.get("name") or "会话")
+        meta[new_id] = {"name": name + " ⎇", "ws": info.get("ws") or self._current_ws(),
+                        "updated": time.time()}
+        self.host.profile.update_config(sessions_meta=meta)
+        return {"ok": True, "session": new_id, "messages": pos + 1}
+
+    # -- 长期记忆 / 改动时间线 / 预算 / 备份恢复 -----------------------------------
+    def agent_memory(self) -> dict[str, Any]:
+        """长期记忆（profile/memory.md）：构建 agent 时注入 system prompt，此处读写。"""
+        path = Path(self.host.profile.root) / "memory.md"
+        try:
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "text": text, "path": str(path)}
+
+    def save_agent_memory(self, text: str) -> dict[str, Any]:
+        from .config import atomic_write_text
+
+        path = Path(self.host.profile.root) / "memory.md"
+        try:
+            atomic_write_text(path, str(text or ""))
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        reset = self.host.service("reset_agent")
+        if callable(reset):
+            reset()   # 下一轮对话立刻带上新记忆
+        return {"ok": True, "chars": len(str(text or ""))}
+
+    def checkpoint_diff(self, cid: str, max_chars: int = 8000) -> dict[str, Any]:
+        """改动时间线的 diff 预览：检查点里的旧内容 vs 磁盘当前内容（unified diff）。"""
+        import difflib
+
+        base = Path(self.host.profile.root) / "checkpoints" / str(cid or "")
+        try:
+            manifest = json.loads((base / "manifest.json").read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"检查点不可读: {exc}"}
+        parts: list[str] = []
+        for entry in manifest.get("files") or []:
+            rel = str(entry.get("rel") or "")
+            target = Path(entry.get("abs") or "")
+            new = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
+            if not entry.get("existed"):
+                preview = "\n".join(new.splitlines()[:60])
+                parts.append(f"### {rel}（当时新建）\n{preview or '（当时不存在）'}")
+                continue
+            backup = base / "files" / str(entry.get("backup") or "")
+            old = backup.read_text(encoding="utf-8", errors="replace") if backup.is_file() else ""
+            diff = difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                        fromfile="改动前", tofile=f"当前 · {rel}",
+                                        lineterm="", n=2)
+            text = "\n".join(diff)
+            parts.append(f"### {rel}\n" + (text[:3000] or "（与当前无差异）"))
+        out = "\n\n".join(parts) or "（无文件）"
+        if len(out) > max_chars:
+            out = out[:max_chars] + "\n…（截断）"
+        return {"ok": True, "diff": out}
+
+    def _usage_budget_warning(self) -> str:
+        """今日 token 用量相对预算（config.usage_budget，0/缺省=不限）的提示文案。"""
+        try:
+            budget = int(self._config().get("usage_budget") or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        if budget <= 0:
+            return ""
+        from .exporter import usage_records
+
+        today = time.strftime("%Y-%m-%d")
+        total = 0
+        for rec in usage_records(self.host.profile):
+            ts = rec.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            if time.strftime("%Y-%m-%d", time.localtime(ts)) != today:
+                continue
+            total += int(rec.get("prompt_tokens") or 0) + int(rec.get("completion_tokens") or 0)
+        if total < budget:
+            return ""
+        pct = int(total * 100 / budget)
+        if pct >= 100:
+            return f"⚠ 今日 token 用量已超预算：{total} / {budget}（{pct}%）"
+        return f"今日 token 用量已达预算 {pct}%（{total} / {budget}）"
+
+    def export_profile(self, dest: str = "") -> dict[str, Any]:
+        """把 profile 关键数据（配置/会话/记忆/定时任务/知识库索引/用量）打包为 zip。
+
+        dest 省略时落到 <工作区>/exports/profile-backup-<时间>.zip。
+        不包含 plugins/（外部插件用 `sha plugin add` 重装即可，避免大 zip）。
+        """
+        import zipfile
+
+        root = Path(self.host.profile.root)
+        dest = str(dest or "").strip()
+        if dest:
+            target = Path(dest)
+        else:
+            out_dir = Path(self.host.workspace or ".") / "exports"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            target = out_dir / f"profile-backup-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        entries: list[tuple[Path, str]] = []
+        for name in ("config.json", "memory.md", "usage.jsonl", "subagents.jsonl"):
+            p = root / name
+            if p.is_file():
+                entries.append((p, name))
+        for sub, arc in ((self.host.profile.sessions_dir, "sessions"),
+                         (root / "scheduled", "scheduled"),
+                         (root / "knowledge", "knowledge")):
+            if Path(sub).is_dir():
+                for f in Path(sub).rglob("*"):
+                    if f.is_file():
+                        entries.append((f, f"{arc}/{f.relative_to(Path(sub)).as_posix()}"))
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+            for src, arcname in entries:
+                zf.write(src, arcname)
+        return {"ok": True, "path": str(target), "files": len(entries)}
+
+    def import_profile(self, src: str) -> dict[str, Any]:
+        """从备份 zip 恢复 profile（覆盖同名文件；当前 config 先备份为 config.pre-import.json）。
+
+        只接受白名单成员（config.json / memory.md / usage.jsonl / subagents.jsonl /
+        sessions/ / scheduled/ / knowledge/ 前缀），路径成分含 .. 或绝对路径的一律跳过。
+        """
+        import shutil
+        import zipfile
+
+        path = Path(str(src or "").strip())
+        if not path.is_file():
+            return {"ok": False, "error": f"文件不存在: {src}"}
+        root = Path(self.host.profile.root)
+        allowed_prefixes = ("sessions/", "scheduled/", "knowledge/")
+        restored = skipped = 0
+        try:
+            with zipfile.ZipFile(path) as zf:
+                cfg_backup = root / "config.pre-import.json"
+                if (root / "config.json").is_file():
+                    shutil.copy2(root / "config.json", cfg_backup)
+                for name in zf.namelist():
+                    if name.endswith("/"):
+                        continue
+                    norm = name.replace("\\", "/")
+                    if norm.startswith(("/", "~")) or ".." in Path(norm).parts:
+                        skipped += 1
+                        continue
+                    top = norm.split("/", 1)[0]
+                    if norm not in ("config.json", "memory.md", "usage.jsonl", "subagents.jsonl") \
+                            and f"{top}/" not in allowed_prefixes:
+                        skipped += 1
+                        continue
+                    dest = root / norm
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(zf.read(name))
+                    restored += 1
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"导入失败: {type(exc).__name__}: {exc}"}
+        reset = self.host.service("reset_agent")
+        if callable(reset):
+            reset()
+        return {"ok": True, "restored": restored, "skipped": skipped,
+                "note": "下一轮对话生效；如异常可用 config.pre-import.json 还原"}
 
     def chat_stream(self, message: str, session_id: str = "",
                     images: list | None = None) -> dict[str, Any]:
@@ -751,15 +1114,22 @@ class DesktopApp:
 
         def worker() -> None:
             self._busy_sessions.add(session_id)
+            self._cancel_sessions.discard(session_id)  # 清掉上次残留的中断请求
+
+            def _should_stop() -> bool:
+                return session_id in self._cancel_sessions
+
             # 思考/工具步骤 → 界面（带会话 id：多会话并行时前端按会话过滤）
             self.host.emit_agent_event = (
                 lambda payload, _sid=session_id:
                 self._push_event({**payload, "session": _sid}))
+            partial: list[str] = []   # 中断时已收到的部分回复（回给界面收尾）
             try:
                 final_payload = None
                 for event in ask_stream(message, session_id=session_id,
-                                        images=images or None):
+                                        images=images or None, should_stop=_should_stop):
                     if event.get("type") == "delta":
+                        partial.append(event.get("text") or "")
                         self._push_stream_event({"kind": "delta", "text": event.get("text") or "",
                                                  "session": session_id})
                     elif event.get("type") == "done":
@@ -777,17 +1147,52 @@ class DesktopApp:
                             "session": session_id,
                         }
                 if final_payload is not None:
+                    # 自动钩子（config.hooks.reply_end）：流式路径在推送前补跑并附到回复尾
+                    hook_svc = self.host.service("run_hooks")
+                    if callable(hook_svc):
+                        try:
+                            hook_text = hook_svc()
+                            if hook_text:
+                                final_payload["reply"] = (final_payload.get("reply") or "") + hook_text
+                        except Exception:  # noqa: BLE001 —— 钩子失败不影响回复
+                            pass
+                    warn = self._usage_budget_warning()
+                    if warn:
+                        final_payload["budget_warning"] = warn
                     self._push_stream_event(final_payload)
+                    # 正常收尾后顺手给默认命名的会话起标题（锁外线程，不挡其他会话）
+                    self._maybe_auto_title(session_id, message,
+                                           str(final_payload.get("reply") or ""))
+                elif _should_stop():
+                    # 用户点了停止：nanoagent 不产出 done，这里补一个 cancelled 收尾——
+                    # 部分内容不落盘（与 ask 中断即不落盘一致），只回给界面展示
+                    self._push_stream_event({
+                        "kind": "done", "ok": True, "cancelled": True,
+                        "reply": "".join(partial), "reasoning": "",
+                        "tool_calls": [], "model": "", "usage": {},
+                        "session": session_id,
+                    })
             except Exception as exc:  # noqa: BLE001 —— 错误回到界面而不是崩窗口
                 self._push_stream_event({"kind": "done", "ok": False,
                                          "error": str(exc), "session": session_id})
             finally:
                 self.host.emit_agent_event = None
                 self._busy_sessions.discard(session_id)
+                self._cancel_sessions.discard(session_id)
 
         threading.Thread(target=worker, daemon=True, name="sha-chat-stream").start()
         self._touch_session(session_id)
         return {"ok": True, "stream": True, "session": session_id}
+
+    def stop_stream(self, session_id: str = "") -> dict[str, Any]:
+        """请求中断某会话正在进行的流式回复。
+
+        nanoagent 在每轮开始与每个 delta 之间检查取消标志——当前这一个
+        LLM/工具步骤会先跑完，随后停止产出（部分内容不落盘）。
+        """
+        sid = str(session_id or "").strip() or self._current_session
+        self._cancel_sessions.add(sid)
+        return {"ok": True, "session": sid}
 
     def _push_event(self, payload: dict[str, Any]) -> None:
         if self._window is None:
@@ -1563,6 +1968,132 @@ class DesktopApp:
         items.reverse()
         return {"ok": True, "items": items[: max(1, int(limit or 50))]}
 
+    def remove_subagents(self, ids: list | None = None) -> dict[str, Any]:
+        """移除子 agent 调用记录：ids 为空 → 清空全部；否则只删指定 id 的行。
+
+        按 id 删时用「过滤 + 原子替换」重写 jsonl；坏行保留不丢数据。
+        旧版记录没有 id 字段，只能走整表清空（前端对无 id 的行不渲染删除按钮）。
+        """
+        import json
+
+        path = self.host.profile.root / "subagents.jsonl"
+        if not path.is_file():
+            return {"ok": True, "removed": 0}
+        wanted = {str(i) for i in (ids or []) if str(i).strip()}
+        try:
+            if not wanted:
+                path.unlink()
+                return {"ok": True, "removed": "all"}
+            kept: list[str] = []
+            removed = 0
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)
+                    continue
+                if str(item.get("id") or "") in wanted:
+                    removed += 1
+                    continue
+                kept.append(line)
+            if removed:
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+                tmp.replace(path)
+            return {"ok": True, "removed": removed}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # -- 工作区文件引用 / 代码应用 -----------------------------------------------
+    def ws_files(self, limit: int = 800) -> dict[str, Any]:
+        """工作区文件扁平清单（@ 引用补全的数据源）：相对 posix 路径，跳过忽略目录。"""
+        from .workspace import iter_files, relative
+
+        items: list[str] = []
+        try:
+            for path in iter_files(self.host, "**/*",
+                                   limit=max(1, min(int(limit or 800), 2000))):
+                items.append(relative(self.host, path))
+        except (ValueError, OSError):
+            pass   # glob 模式异常 / 工作区不可达 → 空清单（补全功能不致命）
+        return {"ok": True, "files": items}
+
+    def ws_file_text(self, path: str, max_chars: int = 12000) -> dict[str, Any]:
+        """读取工作区内文本文件原文（@ 引用展开用；路径监狱 + 大小双上限）。"""
+        from .workspace import read_text_file, safe_path
+
+        try:
+            resolved = safe_path(self.host, str(path or ""), must_exist=True)
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        text = read_text_file(resolved)
+        if text is None:
+            return {"ok": False, "error": f"不是可读文本或超过大小上限: {path}"}
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n…（已截断，原文共 {len(text)} 字符）"
+        return {"ok": True, "path": str(path), "text": text}
+
+    def apply_code(self, path: str, content: str) -> dict[str, Any]:
+        """把代码块写入工作区文件——复用 write_file 工具（权限门 + checkpoint 留底）。
+
+        走同一条门意味着：fs=ask 照常弹确认、confirm_write 照常看 diff、
+        写前照常留底（右侧 ↶ 撤销可用）。
+        """
+        tool = next((t for t in self.host.collect_tools() if t.name == "write_file"), None)
+        if tool is None:
+            return {"ok": False, "error": "文件工具未激活"}
+        try:
+            output = tool.invoke({"path": str(path or ""), "content": str(content or "")})
+        except Exception as exc:  # noqa: BLE001 —— 不让异常越过 js_api 边界
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        text = str(output)
+        return {"ok": not text.startswith("错误"), "output": text}
+
+    def knowledge_query(self, query: str, k: int = 5) -> dict[str, Any]:
+        """知识库试检索：直接调 search_knowledge 工具看命中（不进对话、不算用量）。"""
+        if not str(query or "").strip():
+            return {"ok": False, "error": "查询不能为空"}
+        tool = next((t for t in self.host.collect_tools() if t.name == "search_knowledge"), None)
+        if tool is None:
+            return {"ok": False, "error": "知识库插件未激活"}
+        try:
+            output = tool.invoke({"query": str(query).strip(),
+                                  "k": max(1, min(int(k or 5), 20))})
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        text = str(output)
+        return {"ok": not text.startswith("错误"), "output": text}
+
+    # -- 定时任务面板 -------------------------------------------------------------
+    def schedules(self) -> dict[str, Any]:
+        """列出定时任务（与 scheduler 插件 / `sha schedule` 共用 tasks.json）。"""
+        from .schedule_store import load_tasks
+
+        try:
+            return {"ok": True, "tasks": load_tasks(self.host.profile)}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def schedule_toggle(self, name: str, enabled: bool) -> dict[str, Any]:
+        from .schedule_store import ScheduleError, set_task_enabled
+
+        try:
+            if not set_task_enabled(self.host.profile, str(name or ""), bool(enabled)):
+                return {"ok": False, "error": f"没有任务: {name}"}
+        except ScheduleError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "name": name, "enabled": bool(enabled)}
+
+    def schedule_remove(self, name: str) -> dict[str, Any]:
+        from .schedule_store import remove_task
+
+        if remove_task(self.host.profile, str(name or "")):
+            return {"ok": True, "name": name}
+        return {"ok": False, "error": f"没有任务: {name}"}
+
     def ws_tree(self, subpath: str = "") -> dict[str, Any]:
         """列出工作区目录内容（锁定在工作区内部，隐藏点开头条目）。"""
         ws = str(getattr(self.host, "workspace", "") or "")
@@ -1759,6 +2290,100 @@ class DesktopApp:
         self.host.plugins.pop(name, None)
         return {"ok": True, "name": name}
 
+    # -- MCP 服务器管理 -----------------------------------------------------------
+    def mcp_servers(self) -> dict[str, Any]:
+        """列出配置的 MCP 服务器（headers/env 值掩码——回传掩码即保持原值）。"""
+        servers = self._config().get("mcpServers") or {}
+        items: list[dict[str, Any]] = []
+        for name in sorted(servers):
+            entry = dict(servers.get(name) or {})
+            items.append({
+                "name": name,
+                "type": str(entry.get("type") or ("http" if entry.get("url") else "stdio")).lower(),
+                "url": str(entry.get("url") or ""),
+                "command": str(entry.get("command") or ""),
+                "args": [str(a) for a in (entry.get("args") or [])],
+                "headers": {k: _mask_key(v) for k, v in (entry.get("headers") or {}).items()},
+                "env": {k: _mask_key(v) for k, v in (entry.get("env") or {}).items()},
+            })
+        return {"ok": True, "servers": items}
+
+    def save_mcp(self, servers: list) -> dict[str, Any]:
+        """保存 MCP 服务器声明并热重连（重载 mcp_client 插件 + 丢弃 agent 重建工具集）。
+
+        headers/env 里形如掩码（含 ***）的值回传时替换回旧配置中的原值，
+        与模型 API Key 的「留空/掩码即保持」约定一致。
+        """
+        old = self._config().get("mcpServers") or {}
+        problems: list[str] = []
+        cleaned: dict[str, dict[str, Any]] = {}
+
+        def merge_secret(mapping: Any, prev: Any) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for key, value in dict(mapping or {}).items():
+                value = str(value or "").strip()
+                if not value:
+                    continue
+                if "***" in value and str(key) in dict(prev or {}):
+                    out[str(key)] = str(dict(prev or {})[str(key)])  # 掩码 → 原值
+                else:
+                    out[str(key)] = value
+            return out
+
+        for entry in servers or []:
+            entry = entry or {}
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                problems.append("服务器名不能为空")
+                continue
+            if name in cleaned:
+                problems.append(f"服务器重名: {name}")
+                continue
+            typ = str(entry.get("type") or "").strip().lower()
+            url = str(entry.get("url") or "").strip()
+            command = str(entry.get("command") or "").strip()
+            if typ not in ("stdio", "http", "sse"):
+                typ = "http" if url else "stdio"
+            prev = dict(old.get(name) or {})
+            if typ in ("http", "sse"):
+                if not url.startswith(("http://", "https://")):
+                    problems.append(f"{name}: URL 必须以 http(s):// 开头")
+                    continue
+                item: dict[str, Any] = {"url": url, "type": typ}
+                headers = merge_secret(entry.get("headers"), prev.get("headers"))
+                if headers:
+                    item["headers"] = headers
+            else:
+                if not command:
+                    problems.append(f"{name}: stdio 传输需要填写启动命令")
+                    continue
+                item = {"command": command}
+                raw_args = entry.get("args")
+                if isinstance(raw_args, str):
+                    args = [a for a in raw_args.split() if a.strip()]
+                else:
+                    args = [str(a).strip() for a in (raw_args or []) if str(a).strip()]
+                if args:
+                    item["args"] = args
+            env = merge_secret(entry.get("env"), prev.get("env"))
+            if env:
+                item["env"] = env
+            cleaned[name] = item
+        if problems:
+            return {"ok": False, "error": "；".join(problems[:3])}
+
+        self.host.profile.update_config(mcpServers=cleaned)
+        reload_error = ""
+        if "mcp_client" in self.host.plugins:
+            try:
+                self.host.reload("mcp_client")   # 按新配置断开重连（disposer 先回收旧连接）
+            except Exception as exc:  # noqa: BLE001 —— 重连失败如实回给界面
+                reload_error = f"{type(exc).__name__}: {exc}"
+        reset = self.host.service("reset_agent")
+        if callable(reset):
+            reset()   # 丢弃 agent：下一轮 ask 聚合到新的 MCP 工具集
+        return {"ok": True, "count": len(cleaned), "reload_error": reload_error}
+
 
 # ---------------------------------------------------------------------------
 # 渲染层（仅 UI；所有能力走 window.pywebview.api）
@@ -1885,7 +2510,8 @@ body.sess-dragging, body.sess-dragging * { cursor:grabbing !important; }
 .side-hint { color:var(--faint); font-size:11px; padding:6px 10px 0; line-height:1.5; }
 
 /* ---------- 主区 ---------- */
-main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
+main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0;
+       background:var(--panel); }  /* 会话区与两侧同底色（此前露出 body 的 --bg，色阶更深） */
 #hero { display:none; flex:1; flex-direction:column; align-items:center;
         justify-content:center; text-align:center; padding-bottom:8px; min-height:0; }
 #hero .glyph { font-family:Georgia,'Times New Roman',serif; font-size:52px; font-weight:800;
@@ -1911,21 +2537,47 @@ main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
             border-radius:16px 16px 4px 16px; padding:10px 16px;
             max-width:78%; margin-left:auto; width:fit-content; white-space:pre-wrap; }
 html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
-.msg.bot { white-space:pre-wrap; }
+/* ---------- 回答排版 v2（模型输出样式） ---------- */
+.msg.bot { white-space:pre-wrap; line-height:1.7; }
 .msg.bot code { background:var(--elev); border:1px solid var(--line); border-radius:5px;
-                padding:1px 6px; font-family:Consolas,monospace; font-size:12.5px; }
+                padding:1px 6px; font-family:Consolas,monospace; font-size:12.5px;
+                color:var(--accent); }
 .msg.bot .bold { font-weight:700; }
-.msg.bot .md-h { font-weight:700; line-height:1.4; margin:8px 0 3px; }
+/* 标题：层级拉开——h1 底部分隔线、h2 强调色竖条、h3 强调色 */
+.msg.bot .md-h { font-weight:700; line-height:1.45; margin:14px 0 5px; }
 .msg.bot .md-h:first-child { margin-top:0; }
-.msg.bot .md-h1 { font-size:16px; }
-.msg.bot .md-h2 { font-size:15px; }
-.msg.bot .md-h3, .msg.bot .md-h4 { font-size:14px; }
+.msg.bot .md-h1 { font-size:17px; padding-bottom:3px; border-bottom:1px solid var(--line-soft); }
+.msg.bot .md-h2 { font-size:15.5px; padding-left:9px; border-left:3px solid var(--accent); }
+.msg.bot .md-h3 { font-size:14px; color:var(--accent); }
+.msg.bot .md-h4 { font-size:14px; }
+/* 列表：强调色项目符 + 行距；容器恢复正常空白（父级 pre-wrap 会把块间换行渲染成空行） */
+.msg.bot ul, .msg.bot ol { margin:6px 0; padding-left:1.5em; white-space:normal; }
+.msg.bot li { margin:3px 0; }
+.msg.bot li::marker { color:var(--accent); }
+/* 任务清单（- [ ] / - [x]） */
+.msg.bot .task { color:var(--faint); font-weight:700; margin-right:2px; }
+.msg.bot .task.done { color:var(--ok); }
+/* 引用块：强调色竖条 + 微底色 */
+.msg.bot blockquote { margin:8px 0; padding:6px 12px; border-left:3px solid var(--accent);
+                      background:var(--elev); border-radius:0 8px 8px 0; white-space:normal; }
+.msg.bot blockquote div { color:var(--dim); }
+/* 链接 / 分隔线 */
+.msg.bot a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; }
+.msg.bot a:hover { filter:brightness(1.15); }
+.msg.bot hr { border:0; border-top:1px solid var(--line-soft); margin:12px 0; }
+/* md 表格（模型结构化回答）：pre-wrap 上下文里必须恢复正常空白处理 */
+.msg.bot .md-table { border-collapse:collapse; margin:8px 0; font-size:13px; white-space:normal; }
+.msg.bot .md-table th, .msg.bot .md-table td { border:1px solid var(--line); padding:5px 10px; text-align:left; }
+.msg.bot .md-table th { background:var(--elev); font-weight:700; border-bottom:2px solid var(--line); }
+.msg.bot .md-table tbody tr:nth-child(even) td { background:var(--elev); }
 /* 子 agent 调用记录（右侧「🤖 子agent」面板） */
 .sub-row { border:1px solid var(--line-soft); border-radius:10px; margin:6px 0;
            overflow:hidden; background:var(--elev); }
 .sub-head { display:flex; align-items:center; gap:7px; padding:7px 10px;
             cursor:pointer; }
 .sub-head:hover { background:var(--hover); }
+.sub-rm { margin-left:auto; flex:none; opacity:.55; line-height:1; padding:2px 7px; }
+.sub-rm:hover { opacity:1; color:var(--err); }
 .sub-badge { flex:none; width:16px; height:16px; border-radius:50%;
              display:flex; align-items:center; justify-content:center;
              font-size:10px; color:#fff; background:var(--ok); }
@@ -1947,15 +2599,59 @@ html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
 /* 排队徽标：本轮回答中还允许输入，点发送即排队 */
 .q-badge { flex:none; font-size:11px; color:var(--accent); background:var(--accent-soft);
            border-radius:10px; padding:3px 8px; white-space:nowrap; }
-/* 工具调用区块：显示在正式回复正文里（写文件等操作直接可见） */
-.tool-log { background:var(--elev); border:1px solid var(--line-soft);
-            border-radius:10px; padding:6px 10px; margin:0 0 8px; }
-.tool-row { display:flex; align-items:baseline; gap:8px; padding:3px 0;
-            font-size:11.5px; line-height:1.5; }
-.tool-row + .tool-row { border-top:1px dashed var(--line-soft); }
-.tl-name { color:var(--accent); font-family:Consolas,monospace; flex:none; }
-.tl-detail { color:var(--dim); overflow:hidden; text-overflow:ellipsis;
-             white-space:nowrap; }
+/* ---------- 权限审批弹窗（shell=ask / 写前确认） ---------- */
+.ap-mask { display:none; position:fixed; inset:0; background:rgba(15,18,28,.42);
+           z-index:80; align-items:center; justify-content:center; }
+.ap-mask.open { display:flex; }
+.ap-card { width:min(760px, 92vw); max-height:80vh; display:flex; flex-direction:column;
+           background:var(--panel); border:1px solid var(--line); border-radius:16px;
+           box-shadow:0 18px 60px var(--shadow); padding:16px 18px; }
+.ap-head { display:flex; align-items:center; gap:10px; font-size:14px;
+           font-weight:600; color:var(--fg); margin-bottom:10px; }
+.ap-head .sp { flex:1; }
+.ap-count { color:var(--faint); font-size:11.5px; font-weight:400; }
+.ap-detail { flex:1; min-height:0; overflow:auto; margin-bottom:12px; }
+.ap-detail .ap-cmd { background:var(--bg); border:1px solid var(--line-soft);
+                     border-radius:10px; padding:10px 12px; font-size:12.5px;
+                     font-family:Consolas,monospace; color:var(--fg);
+                     white-space:pre-wrap; word-break:break-all; }
+.ap-detail .ap-note { color:var(--dim); font-size:12px; margin:6px 0; }
+.ap-detail .ap-diff { background:var(--bg); border:1px solid var(--line-soft);
+                      border-radius:10px; padding:8px 10px; font-size:11.5px;
+                      font-family:Consolas,monospace; line-height:1.5;
+                      white-space:pre; overflow:auto; max-height:46vh; }
+.ap-diff .d-add { color:var(--ok); }
+.ap-diff .d-del { color:var(--err); }
+.ap-diff .d-meta { color:var(--faint); }
+.ap-foot { display:flex; align-items:center; gap:8px; }
+/* 工具调用卡片的样式（.tgroups / .tgroup / .trow，JS 在 script 里生成） */
+.tgroups { margin:0 0 8px; }
+.tgroup { border:1px solid var(--line-soft); border-radius:10px;
+          background:var(--elev); margin:4px 0; overflow:hidden; }
+.tgroup-head { display:flex; align-items:center; gap:7px; padding:6px 10px;
+               cursor:pointer; font-size:12.5px; color:var(--dim); }
+.tgroup-head:hover { background:var(--hover); }
+.tg-caret { color:var(--faint); font-size:10px; transition:transform .15s; }
+.tgroup.open .tg-caret { transform:rotate(90deg); }
+.tg-title { color:var(--fg); }
+.tg-bad { color:var(--err); font-size:11.5px; }
+.tgroup-head .sp { flex:1; }
+.tgroup-body { display:none; padding:2px 10px 8px; }
+.tgroup.open .tgroup-body { display:block; }
+.trow { display:flex; align-items:baseline; gap:8px; padding:3px 0;
+        font-size:12px; line-height:1.6; }
+.trow + .trow { border-top:1px dashed var(--line-soft); }
+.tverb { flex:none; color:var(--faint); font-size:11px; min-width:26px; }
+.tfile { color:var(--accent); font-family:Consolas,monospace; flex:none; }
+.tdir { color:var(--faint); font-size:11px; flex:1; min-width:0;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tplus { color:var(--ok); font-size:11.5px; flex:none; }
+.tminus { color:var(--err); font-size:11.5px; flex:none; }
+.tbadge { flex:none; color:var(--err); font-size:11px; }
+.tcmd { color:var(--fg); font-family:Consolas,monospace; font-size:11.5px;
+        flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; }
+.trow.bad .tfile, .trow.bad .tcmd { color:var(--err); }
 /* Markdown 正文容器：关闭 pre-wrap——md() 输出的 HTML 源码里带换行，
    pre-wrap 会把它们显示成空行，与段落 margin 叠加成「间距过长」。
    代码块 .fence 自己是 white-space:pre，不受影响 */
@@ -1980,22 +2676,22 @@ html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
                   overflow-x:auto; white-space:pre; color:var(--fg);
                   user-select:text; -webkit-user-select:text; }
 .msg.error { color:var(--err); }
-.meta { color:var(--faint); font-size:11.5px; margin-top:6px; }
+.meta { color:var(--faint); font-size:11px; margin-top:7px; letter-spacing:.01em; }
+.msg.bot .meta { padding-top:5px; border-top:1px dashed var(--line-soft); }
 .meta .toolchip { background:var(--elev); border:1px solid var(--line); border-radius:999px;
                   padding:2px 9px; margin-right:5px; display:inline-block; font-size:11px; }
-.reasoning { border:1px solid var(--line-soft); border-radius:12px; margin-bottom:10px;
-             background:var(--elev); overflow:hidden; transition:border-color .15s; }
-.reasoning:hover, .reasoning.open { border-color:var(--line); }
-.r-head { display:flex; align-items:center; gap:8px; padding:7px 12px; color:var(--dim);
-          font-size:12px; cursor:pointer; user-select:none;
-          transition:color .12s, background .12s; }
-.r-head:hover { color:var(--accent); background:var(--accent-soft); }
-.r-caret { font-size:9px; color:var(--faint); transition:transform .18s; flex:none; }
-.reasoning.open .r-caret { transform:rotate(90deg); }
-.r-title { flex:1; }
-.r-body { display:none; padding:8px 14px 10px; color:var(--dim); font-size:12.5px;
-          line-height:1.7; white-space:pre-wrap; background:var(--panel);
-          border-top:1px dashed var(--line-soft); }
+/* 思考块：参考「深度思考 ›」的轻量一行样式（无卡片边框，悬停变亮） */
+.reasoning { margin:0 0 8px; }
+.r-head { display:inline-flex; align-items:center; gap:6px; padding:2px 4px 2px 0;
+          color:var(--faint); font-size:12.5px; cursor:pointer; user-select:none;
+          border-radius:8px; transition:color .12s; }
+.r-head:hover { color:var(--accent); }
+.r-caret-end { font-size:13px; transition:transform .18s; }
+.reasoning.open .r-caret-end { transform:rotate(90deg); }
+.r-title { }
+.r-body { display:none; margin:6px 0 2px; padding:2px 0 2px 12px; color:var(--dim);
+          font-size:12px; line-height:1.7; white-space:pre-wrap;
+          border-left:2px solid var(--line-soft); }
 .reasoning.open .r-body { display:block; animation:rIn .18s ease; }
 @keyframes rIn { from { opacity:0; transform:translateY(-3px); }
                  to { opacity:1; transform:none; } }
@@ -2047,6 +2743,44 @@ html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
 .composer-row { display:flex; align-items:center; gap:7px; margin-top:10px;
                 flex-wrap:nowrap; }
 .composer-row > * { flex:none; }
+/* @文件引用补全弹窗（锚定在 composer 内） */
+#atMenu { display:none; position:absolute; left:14px; right:14px; bottom:calc(100% + 6px);
+          background:var(--elev); border:1px solid var(--line); border-radius:12px;
+          box-shadow:var(--shadow-lg); z-index:25; overflow:hidden; }
+.at-item { padding:7px 12px; font-size:12.5px; color:var(--fg); cursor:pointer;
+           font-family:Consolas,monospace; white-space:nowrap;
+           overflow:hidden; text-overflow:ellipsis; }
+.at-item.active, .at-item:hover { background:var(--accent-soft); color:var(--accent); }
+/* 代码块工具条（复制 / 应用到文件） */
+.fence-wrap { margin:8px 0; border:1px solid var(--line); border-radius:10px;
+              overflow:hidden; background:var(--bg); }
+.msg.bot .fence-wrap .fence { margin:0; border:none; border-radius:0; }
+.fence-bar { display:flex; align-items:center; gap:6px; padding:4px 8px;
+             background:var(--elev); border-bottom:1px solid var(--line-soft); }
+.fence-lang { color:var(--accent); font-size:11px; font-family:Consolas,monospace;
+              font-weight:600; letter-spacing:.03em; }
+.flex1 { flex:1; }
+.fence-btn { border:1px solid var(--line); background:transparent; color:var(--dim);
+             border-radius:7px; padding:2px 9px; font-size:11px; cursor:pointer; }
+.fence-btn:hover { color:var(--accent); border-color:var(--accent); }
+/* 知识库试检索 */
+.kbq-out { margin:8px 10px; padding:8px 10px; background:var(--elev);
+           border:1px solid var(--line-soft); border-radius:10px;
+           font-size:12px; color:var(--fg); white-space:pre-wrap;
+           max-height:200px; overflow-y:auto; font-family:Consolas,monospace; }
+/* 定时任务操作行 */
+.sched-acts { display:flex; gap:8px; padding:6px 10px 8px; }
+/* 多模型并答对比卡片 */
+.cmp-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0; }
+@media (max-width: 980px) { .cmp-grid { grid-template-columns:1fr; } }
+.cmp-pane { border:1px solid var(--line); border-radius:12px; overflow:hidden;
+            background:var(--panel); }
+.cmp-head { padding:6px 12px; background:var(--elev); font-size:12px;
+            color:var(--accent); font-weight:600;
+            border-bottom:1px solid var(--line-soft); }
+.cmp-body { padding:8px 12px; font-size:13.5px; line-height:1.6;
+            white-space:pre-wrap; word-break:break-word; }
+.cmp-err { color:var(--err); }
 /* 统一控件外观：等高胶囊、elev 底、悬停上浮—— badges / 图标按钮 / 下拉 */
 .badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #planBtn {
   background:var(--elev); border:1px solid var(--line-soft); color:var(--dim);
@@ -2097,6 +2831,9 @@ html[data-theme="light"] .img-chip { border-color:rgba(77,107,254,.24); }
 .send.busy { background:transparent; border:2px solid var(--line);
              border-top-color:var(--accent); animation:spin .8s linear infinite;
              color:transparent; box-shadow:none; }
+.send.stop { background:var(--panel); border:2px solid var(--err);
+             color:var(--err); box-shadow:none; font-size:11px; }
+.send.stop:hover { background:var(--err); color:#fff; filter:none; }
 @keyframes spin { to { transform:rotate(360deg); } }
 #usageLine { display:table; margin:7px auto 0; background:var(--elev);
              border:1px solid var(--line-soft); border-radius:999px;
@@ -2301,6 +3038,10 @@ body.panel-hidden aside.right { display:none; }
 #auxThread { flex:1; overflow-y:auto; padding:12px; }
 #auxThread .msg { font-size:13px; margin-bottom:12px; }
 #auxThread .msg.user { font-size:13px; padding:8px 13px; }
+.aux-top { display:flex; align-items:center; gap:8px; padding:8px 12px 0; }
+.aux-top select { flex:1; min-width:0; background:var(--elev); color:var(--fg);
+                  border:1px solid var(--line); border-radius:8px;
+                  padding:4px 8px; font-size:12px; outline:none; }
 .aux-row { display:flex; align-items:center; gap:8px; padding:8px 12px;
            border-top:1px solid var(--line-soft); }
 .aux-row input { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line);
@@ -2606,8 +3347,9 @@ body.dragging #dropMask { display:flex; }
         <div id="wsMenu"></div>
       </div>
       <div class="composer">
+        <div id="atMenu"></div>
         <textarea id="input" rows="1"
-          placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行，可粘贴图片路径附加）"></textarea>
+          placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行，@ 可引用工作区文件）"></textarea>
         <div id="imgChips" style="display:none;flex-wrap:wrap;gap:6px;padding:0 10px;"></div>
         <div class="composer-row">
           <button id="sideBtn" title="显示/隐藏左侧栏" onclick="toggleSide()">◧ 侧栏</button>
@@ -2620,6 +3362,8 @@ body.dragging #dropMask { display:flex; }
           <select id="thinkSel" title="思考级别（映射 reasoning_effort）"></select>
           <select id="modelSel" title="当前模型"></select>
           <span id="queueBadge" class="q-badge" style="display:none" title="本轮回答完成后将自动依次发送这些消息"></span>
+          <button id="cmpBtn" title="与另一个模型并答对比（当前输入的问题，纯对话不带工具）" onclick="compareFlow()">⚖</button>
+          <button id="stopBtn" class="send stop" style="display:none" title="停止生成（部分内容不保留）" onclick="stopStream()">■</button>
           <button id="send" class="send" onclick="send()">↑</button>
         </div>
         <div id="permMenu" class="perm-menu">
@@ -2650,18 +3394,23 @@ body.dragging #dropMask { display:flex; }
     </div>
 
     <div class="rp-body active" id="rp-aux">
+      <div class="aux-top">
+        <span class="hint">模型</span>
+        <select id="auxModelSel" title="辅助对话使用的模型（不影响主会话的当前模型）"></select>
+      </div>
       <div id="auxThread"></div>
       <div class="aux-row">
         <input id="auxInput" placeholder="提出后续修改要求…（Enter 发送）">
         <button id="auxSend" class="send" onclick="auxSend()">↑</button>
       </div>
-      <div class="aux-hint">独立辅助对话 —— 与左侧主会话互不影响，共用当前模型与工具。</div>
+      <div class="aux-hint">独立辅助对话 —— 与左侧主会话互不影响，可单独选模型；共用工具与工作区。</div>
     </div>
 
     <div class="rp-body" id="rp-ws">
       <div class="ws-nav">
         <button class="mini-btn" onclick="wsUp()">⬆ 上级</button>
         <span class="crumb" id="wsCrumb">/</span>
+        <button class="mini-btn" title="撤销上一次文件改动（写文件前自动留底）" onclick="undoLastChange()">↶ 撤销</button>
         <button class="mini-btn" onclick="loadWsTree()">⟳</button>
       </div>
       <div class="rp-pane" id="wsTreePane"></div>
@@ -2670,6 +3419,11 @@ body.dragging #dropMask { display:flex; }
 
     <div class="rp-body" id="rp-kb">
       <div class="rp-pane" id="kbPane"><div class="hint">加载中…</div></div>
+      <div class="term-row kbq-row">
+        <input id="kbqInput" placeholder="试检索：直接问知识库，看命中片段（不进对话）">
+        <button class="mini-btn" onclick="kbQuery()">🔍</button>
+      </div>
+      <pre class="kbq-out" id="kbqOut" style="display:none"></pre>
       <div class="term-row">
         <button class="mini-btn" onclick="kbPickIndex()" title="选择一个文件夹，把其中的文本文件索引进知识库">📂 索引文件夹…</button>
         <button class="mini-btn" onclick="kbClear()">🗑 清空</button>
@@ -2687,9 +3441,35 @@ body.dragging #dropMask { display:flex; }
       <div class="term-row"><span class="hint" style="padding:0 12px">由 agent 的 todo_write 维护；你也可以直接编辑 TODO.md。</span></div>
     </div>
 
+    <div class="rp-body" id="rp-sched">
+      <div class="ws-nav">
+        <span class="crumb">定时任务（scheduler 插件到点执行）</span>
+        <button class="mini-btn" onclick="loadSchedules()">⟳</button>
+      </div>
+      <div class="rp-pane" id="schedPane"><div class="hint">切换到此标签页时自动加载。</div></div>
+      <div class="term-row"><span class="hint" style="padding:0 12px">新建任务：sha schedule add &lt;名&gt; --every &lt;秒&gt; --prompt &lt;提示词&gt;，或直接让 agent 帮你创建。</span></div>
+    </div>
+
+    <div class="rp-body" id="rp-mem">
+      <div class="ws-nav">
+        <span class="crumb">长期记忆（每轮对话自动注入，跨会话生效）</span>
+        <button class="mini-btn" onclick="loadMemory()">⟳</button>
+      </div>
+      <div class="rp-pane" style="display:flex;flex-direction:column;padding:8px 10px;min-height:0;">
+        <textarea id="memText" style="flex:1;min-height:200px;resize:none;border:1px solid var(--line);border-radius:10px;background:var(--elev);color:var(--fg);padding:10px;font-size:12.5px;line-height:1.6;font-family:Consolas,monospace;"
+          placeholder="写点让 agent 永远记住的事，例如：&#10;- 本项目用 pytest，测试命令：python -m pytest -q&#10;- 提交信息用中文，格式：类型: 摘要&#10;- 不要动 legacy/ 目录"></textarea>
+        <div class="term-row" style="padding:8px 0 0">
+          <span class="hint" style="padding:0 6px">保存到 profile/memory.md，下一轮对话生效。</span>
+          <span class="flex1"></span>
+          <button class="mini-btn" onclick="saveMemory()">💾 保存</button>
+        </div>
+      </div>
+    </div>
+
     <div class="rp-body" id="rp-sub">
       <div class="ws-nav">
         <span class="crumb">子 agent 调用记录（最新在前）</span>
+        <button class="mini-btn" onclick="clearSubagents()" title="清空全部子 agent 记录">🗑</button>
         <button class="mini-btn" onclick="loadSubagents()">⟳</button>
       </div>
       <div class="rp-pane" id="subPane"><div class="hint">切换到此标签页时自动加载。</div></div>
@@ -2763,6 +3543,7 @@ body.dragging #dropMask { display:flex; }
       <button class="set-nav-item" data-set="plugins" onclick="switchTab('plugins')"><span class="ic">🔌</span>插件</button>
       <button class="set-nav-item" data-set="skills" onclick="switchTab('skills')"><span class="ic">📚</span>技能</button>
       <button class="set-nav-item" data-set="market" onclick="switchTab('market')"><span class="ic">🛒</span>市场</button>
+      <button class="set-nav-item" data-set="mcp" onclick="switchTab('mcp')"><span class="ic">🔗</span>MCP</button>
       <div class="set-group">界面</div>
       <button class="set-nav-item" data-set="appearance" onclick="switchTab('appearance')"><span class="ic">🎨</span>外观</button>
       <button class="set-nav-item" data-set="general" onclick="switchTab('general')"><span class="ic">⚙</span>通用</button>
@@ -2814,6 +3595,19 @@ body.dragging #dropMask { display:flex; }
         <div id="marketList" style="max-height:46vh; overflow-y:auto;"></div>
         <div class="modal-footer"><span id="marketNote"></span></div>
       </div>
+      <div id="tab-mcp" style="display:none">
+        <div class="set-title">MCP 服务器</div>
+        <div class="hint">stdio 填启动命令（参数用空格分隔，含空格的路径建议写进命令行引号内或改用 http）；
+          http / sse 填 URL。Headers 与 Env 用 JSON 对象（如 {"Authorization": "Bearer sk-..."}），
+          值以掩码显示，保存时回传掩码即保持原值。保存后自动断开重连，下一轮对话生效。</div>
+        <div id="mcpCards"></div>
+        <div class="modal-footer">
+          <button class="ghost" onclick="addMcpCard()">＋ 添加服务器</button>
+          <span class="flex1"></span>
+          <span id="mcpSaveNote"></span>
+          <button class="primary" onclick="saveMcp()">保存并重连</button>
+        </div>
+      </div>
       <div id="tab-appearance" style="display:none">
         <div class="set-title">外观</div>
         <div class="hint">主题、强调色与字体，更改即时生效并自动保存到当前 profile。</div>
@@ -2851,6 +3645,15 @@ body.dragging #dropMask { display:flex; }
         <div class="set-title">通用</div>
         <div class="hint">界面开关与数据管理；更改即时生效。</div>
         <div class="set-card"><div id="generalToggles"></div></div>
+        <div class="set-h">文件改动与回滚</div>
+        <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">写文件前显示 diff 确认</div>
+              <div class="desc">开启后每次写入都先看一眼差异再决定；关闭时只自动留底（可随时撤销）</div></div>
+            <button class="msg-act" id="confirmWriteBtn" onclick="toggleConfirmWrite()">已关闭</button>
+          </div>
+        </div>
+        <div class="set-card"><div id="ckptList"></div></div>
         <div class="set-h">快捷键</div>
         <div class="set-card">
           <div class="set-row"><div class="set-main"><div class="name">新会话</div></div><span class="kbd">Ctrl+N</span></div>
@@ -2861,6 +3664,16 @@ body.dragging #dropMask { display:flex; }
         </div>
         <div class="set-h">数据</div>
         <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">备份 profile</div>
+              <div class="desc">配置 + 会话 + 记忆 + 定时任务 + 知识库索引 → 工作区 exports/ 下的 zip</div></div>
+            <button class="msg-act" onclick="backupProfile()">📦 备份</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">从备份恢复</div>
+              <div class="desc">覆盖同名文件；当前配置先存为 config.pre-import.json</div></div>
+            <button class="msg-act" onclick="restoreProfile()">📂 恢复</button>
+          </div>
           <div class="set-row">
             <div class="set-main"><div class="name">搜索会话</div>
               <div class="desc">按关键词搜索全部历史并跳转高亮</div></div>
@@ -2944,12 +3757,53 @@ function mdInline(text) {
     '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return text;
 }
+function isMdTableSep(row) {
+  // 分隔行（|---|---| / | :---: | ---: |）：只含 | : - 空格，且至少一段 ---
+  const inner = row.replace(/^\|/, '').replace(/\|$/, '');
+  return row.includes('-') && /-{3,}/.test(inner) && /^[ :|-]+$/.test(inner);
+}
+function renderMdTable(rows) {
+  // 输入是已转义、行内代码已占位的行；单元格里的 \| 是字面竖线（md 转义），
+  // 先换占位符再按 | 切分，切完还原
+  const cellsOf = (row) => row.replace(/\\\|/g, '\u0003')
+    .replace(/^\|/, '').replace(/\|$/, '')
+    .split('|').map(c => c.trim().replace(/\u0003/g, '|'));
+  let head = null, aligns = null;
+  let bodyRows = rows;
+  if (rows.length >= 2 && isMdTableSep(rows[1])) {
+    head = cellsOf(rows[0]);
+    aligns = cellsOf(rows[1]).map(c =>
+      c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : 'left');
+    bodyRows = rows.slice(2);
+  }
+  const n = head ? head.length : 0;
+  const alignAttr = (i) =>
+    (aligns && aligns[i] && aligns[i] !== 'left') ? ' style="text-align:' + aligns[i] + '"' : '';
+  let html = '<table class="md-table">';
+  if (head) {
+    html += '<thead><tr>' + head.map((c, i) => '<th' + alignAttr(i) + '>' + mdInline(c) + '</th>').join('') + '</tr></thead>';
+  }
+  html += '<tbody>' + bodyRows.map(r => {
+    let cells = cellsOf(r);
+    if (n) cells = cells.concat(Array(Math.max(0, n - cells.length)).fill('')).slice(0, n);
+    return '<tr>' + cells.map((c, i) => '<td' + alignAttr(i) + '>' + mdInline(c) + '</td>').join('') + '</tr>';
+  }).join('') + '</tbody></table>';
+  return html;
+}
 function md(text) {
   let src = String(text == null ? '' : text);
-  // 1. 围栏代码块（```lang ... ```）先摘出来，避免其内容被行级规则波及
+  // 1. 围栏代码块（```lang ... ```）先摘出来，避免其内容被行级规则波及；
+  //    原文存进 data-code（esc 后属性安全），工具条按钮从 DOM 读回——
+  //    流式期间每帧重渲染，注册表式存储会无限膨胀，挂在元素上则天然自愈
   const fences = [];
   src = src.replace(/```([^\n]*)\n?([\s\S]*?)(?:```|$)/g, (m, lang, code) => {
-    fences.push('<pre class="fence">' + esc(code.replace(/\n$/, '')) + '</pre>');
+    const body = code.replace(/\n$/, '');
+    fences.push('<div class="fence-wrap" data-code="' + esc(body) + '">' +
+      '<div class="fence-bar"><span class="fence-lang">' + esc((lang || '').trim()) + '</span>' +
+      '<span class="flex1"></span>' +
+      '<button class="fence-btn" onclick="copyFence(this)">复制</button>' +
+      '<button class="fence-btn" onclick="applyFence(this)">应用到文件</button>' +
+      '</div><pre class="fence">' + esc(body) + '</pre></div>');
     return '\u0001' + (fences.length - 1) + '\u0001';
   });
   // 2. 行内代码占位（P2 #6）
@@ -2974,19 +3828,42 @@ function md(text) {
     }
   };
   const closeAll = () => { closePara(); closeList(); closeQuote(); };
-  for (const raw of src.split('\n')) {
-    const line = raw;        // 已转义；&gt; 即原文的 >
+  const linesArr = src.split('\n');
+  for (let li = 0; li < linesArr.length; li++) {
+    const line = linesArr[li];   // 已转义；&gt; 即原文的 >
     const fence = line.trim().match(/^\u0001(\d+)\u0001$/);
     if (fence) { closeAll(); out.push(fenceHtml(fences, fence[1])); continue; }
     if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { closeAll(); out.push('<hr>'); continue; }
     const h = line.match(/^(#{1,4})\s+(.+?)\s*#*$/);
     if (h) { closeAll(); out.push('<div class="md-h md-h' + h[1].length + '">' + mdInline(h[2]) + '</div>'); continue; }
+    // 表格（模型回答结构化结果的常用形态）：连续 | 行 + 第二行 |---|---| 分隔行；
+    // 不成表格的散落 | 行回落到普通段落
+    if (/^\s*\|/.test(line)) {
+      const rows = [];
+      let j = li;
+      while (j < linesArr.length && /^\s*\|/.test(linesArr[j])) { rows.push(linesArr[j].trim()); j++; }
+      if (rows.length >= 2 && isMdTableSep(rows[1])) {
+        li = j - 1;
+        closeAll();
+        out.push(renderMdTable(rows));
+        continue;
+      }
+    }
     const ul = line.match(/^\s*[-*•]\s+(.*)$/);
     const ol = line.match(/^\s*(\d+)[.)]\s+(.*)$/);
     if (ul) {
       closePara(); closeQuote();
       if (list !== 'ul') { closeList(); out.push('<ul>'); list = 'ul'; }
-      out.push('<li>' + mdInline(ul[1]) + '</li>');
+      // 任务清单：- [ ] / - [x] → ☐ / ☑（展示用，不可交互）
+      let item = ul[1];
+      const tk = item.match(/^\[( |x|X)\]\s+/);
+      let box = '';
+      if (tk) {
+        item = item.slice(tk[0].length);
+        box = tk[1].toLowerCase() === 'x' ? '<span class="task done">☑</span> '
+                                          : '<span class="task">☐</span> ';
+      }
+      out.push('<li>' + box + mdInline(item) + '</li>');
       continue;
     }
     if (ol) {
@@ -3016,6 +3893,42 @@ function md(text) {
 }
 function fenceHtml(fences, idx) {
   return fences[Number(idx)] || '';
+}
+
+/* ---------- 代码块工具（复制 / 应用到文件） ---------- */
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast('已复制'),
+      () => fallbackCopy(text));
+  } else fallbackCopy(text);
+}
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); toast('已复制'); }
+  catch (e) { toast('复制失败', true); }
+  ta.remove();
+}
+function copyFence(btn) {
+  const wrap = btn.closest('.fence-wrap');
+  copyText(wrap ? (wrap.dataset.code || '') : '');
+}
+async function applyFence(btn) {
+  const wrap = btn.closest('.fence-wrap');
+  const code = wrap ? (wrap.dataset.code || '') : '';
+  const path = await dialogPrompt('应用到文件 —— 保存到工作区路径（相对路径，如 src/app.js）', '');
+  if (path === null || !String(path).trim()) return;   // 取消 / 空路径
+  const r = await api().apply_code(String(path).trim(), code);
+  if (r.ok) {
+    toast('已写入 ' + path + '（可 ⬆ 上级旁的 ↶ 撤销）');
+    if (curPanel === 'ws') loadWsTree();
+  } else {
+    toast(r.output || r.error || '写入失败', true);
+  }
 }
 function fmtTokens(n) {
   n = Number(n) || 0;
@@ -3119,6 +4032,65 @@ function dialogChoose(title, options) {
   });
 }
 
+/* ---------- 多模型并答对比（⚖）：同一问题并行问两个模型，不进会话历史 ---------- */
+function addCompareCard() {
+  const div = document.createElement('div');
+  div.className = 'msg bot';
+  div.innerHTML = '<div class="cmp-grid">' +
+    '<div class="cmp-pane"><div class="cmp-head">…</div><div class="cmp-body hint">生成中…</div></div>' +
+    '<div class="cmp-pane"><div class="cmp-head">…</div><div class="cmp-body hint">生成中…</div></div>' +
+    '</div>';
+  $('thread').appendChild(div);
+  $('log').scrollTop = $('log').scrollHeight;
+  return div;
+}
+function fillCompareCard(div, res) {
+  const sides = [res.a, res.b];
+  div.querySelectorAll('.cmp-pane').forEach((pane, i) => {
+    const s = sides[i] || { ok: false, error: '无结果' };
+    pane.querySelector('.cmp-head').textContent =
+      (s.name || '?') + (s.elapsed_ms ? ' · ' + (s.elapsed_ms / 1000).toFixed(1) + 's' : '');
+    const body = pane.querySelector('.cmp-body');
+    body.classList.remove('hint');
+    body.innerHTML = s.ok
+      ? md(s.reply || '（空回复）')
+      : '<span class="cmp-err">' + esc(s.error || '失败') + '</span>';
+  });
+  $('log').scrollTop = $('log').scrollHeight;
+}
+async function compareFlow() {
+  const input = $('input');
+  const text = input.value.trim();
+  if (!text) { toast('先输入要对比的问题', true); return; }
+  const s = await api().get_models();
+  const names = (s.models || []).map(m => m.name).filter(n => n && n !== currentModel);
+  if (!names.length) { toast('池子里只有一个模型——先在设置里加第二个模型才能对比', true); return; }
+  const pick = await dialogChoose('与哪个模型对比？（当前：' + (currentModel || '?') + '）',
+    names.map(n => ({ value: n, label: n, sub: '' })));
+  if (!pick) return;
+  input.value = '';
+  input.style.height = 'auto';
+  add(text, 'user');
+  atClose();
+  const card = addCompareCard();
+  setBusy(true);
+  const res = await api().compare_models(text, currentModel || '', pick);
+  setBusy(false);
+  fillCompareCard(card, res);
+  refreshStatus();
+}
+
+/* ---------- 会话分支（⎇）：从某条回复处分叉出新会话，原会话不动 ---------- */
+async function branchFrom(sid, hi) {
+  const r = await api().branch_session(sid, hi);
+  if (r && r.ok) {
+    toast('已分叉新会话（含该条及之前的 ' + r.messages + ' 条），在侧栏查看');
+    refreshSidebar();
+  } else {
+    toast((r && r.error) || '分支失败', true);
+  }
+}
+
 /* ---------- 主题 ---------- */
 let theme = 'system';
 const THEME_TEXT = { dark: '深色', light: '浅色', system: '跟随系统' };
@@ -3143,25 +4115,16 @@ function add(text, cls, meta, reasoning, hi, tools) {
       const rd = document.createElement('div');
       rd.className = 'reasoning';
       const rounds = lastRounds > 1 ? '（' + lastRounds + ' 轮）' : '';
-      rd.innerHTML = '<div class="r-head"><span class="r-caret">▶</span><span>🧠</span>' +
-        '<span class="r-title">已深度思考' + rounds + ' · 展开查看</span></div>' +
+      rd.innerHTML = '<div class="r-head"><span class="r-title">深度思考' + rounds +
+        '</span><span class="r-caret-end">›</span></div>' +
         '<div class="r-body"></div>';
       rd.querySelector('.r-body').textContent = reasoning;
       rd.querySelector('.r-head').onclick = () => rd.classList.toggle('open');
       div.appendChild(rd);
     }
-    // 工具调用区块：写在正式回复正文里（不再只藏在思考块中）
+    // 工具调用卡片：按「更改 / 运行命令 / 其他」分组，可折叠（写文件等操作直接可见）
     if (tools && tools.length) {
-      const log = document.createElement('div');
-      log.className = 'tool-log';
-      for (const t of tools) {
-        const row = document.createElement('div');
-        row.className = 'tool-row';
-        row.innerHTML = '<span class="tl-name">🔧 ' + esc(t.name || '?') + '</span>' +
-          (t.detail ? '<span class="tl-detail">' + esc(t.detail) + '</span>' : '');
-        log.appendChild(row);
-      }
-      div.appendChild(log);
+      div.appendChild(renderToolGroups(tools));
     }
     const body = document.createElement('div');
     body.className = 'md-body';
@@ -3179,7 +4142,7 @@ function add(text, cls, meta, reasoning, hi, tools) {
     }
     div.appendChild(m);
   }
-  // 消息操作条：bot 消息可重新生成（仅最后一条可见）；用户消息无操作按钮
+  // 消息操作条：bot 消息可重新生成（仅最后一条可见）；回放消息可 ⎇ 分支
   // （原「复制」「✎ 编辑」按钮已按用户要求先后移除——选中文本即可复制）
   if (cls !== 'user') {
     const acts = document.createElement('div');
@@ -3188,6 +4151,14 @@ function add(text, cls, meta, reasoning, hi, tools) {
     rg.className = 'msg-act msg-regen'; rg.textContent = '↻ 重新生成';
     rg.onclick = regenerateLast;
     acts.appendChild(rg);
+    // 分支仅在回放消息上出现（有 hi 序号）：把该条及之前的历史复制成新会话
+    if (typeof hi === 'number') {
+      const br = document.createElement('button');
+      br.className = 'msg-act';
+      br.textContent = '⎇ 分支';
+      br.onclick = () => branchFrom(currentSession, hi);
+      acts.appendChild(br);
+    }
     div.appendChild(acts);
   }
   $('thread').appendChild(div);
@@ -3366,6 +4337,7 @@ async function refreshStatus() {
   currentModel = s.model || '';
   perms = { shell: s.shell_permission || 'ask', fs: s.fs_permission || 'allow',
             git: s.git_permission || 'ask' };
+  confirmWriteOn = !!s.confirm_write;
   renderPerm();
   const sel = $('modelSel');
   sel.innerHTML = '';
@@ -3675,8 +4647,9 @@ async function selectSession(id) {
   const s = await api().session_history(id);
   currentSession = id;
   $('thread').innerHTML = '';
+  // 思考过程随 assistant 消息落盘（chat_loop._attach_reasoning），回放时重建折叠块
   (s.history || []).filter(m => (m.content || '').trim()).forEach((m, i) =>
-    add(m.content, m.role === 'user' ? 'user' : 'bot', null, null, i));
+    add(m.content, m.role === 'user' ? 'user' : 'bot', null, m.reasoning || '', i));
   showHeroIfEmpty();
   updateSendState();  // 发送按钮按新会话的忙状态恢复
   refreshSidebar();
@@ -3745,7 +4718,236 @@ function nearBottom(el, margin) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < (margin || 90);
 }
 
+/* ---------- 权限审批（allow_once / allow_always / deny） ---------- */
+let approvalQueue = [];   // 同时到来的多个确认请求排队展示
+let approvalCur = null;
+
+function showApproval(evt) {
+  approvalQueue.push(evt);
+  if (!approvalCur) renderApproval();
+}
+
+function renderApproval() {
+  const mask = $('approveMask');
+  if (!approvalCur && approvalQueue.length) {
+    approvalCur = approvalQueue.shift();
+  }
+  if (!approvalCur) { mask.classList.remove('open'); return; }
+  const evt = approvalCur;
+  const isWrite = (evt.approval_kind || evt.kind) === 'write';
+  $('apTitle').textContent = isWrite ? '写入文件确认' : '执行命令确认';
+  $('apCount').textContent = approvalQueue.length ? ('另有 ' + approvalQueue.length + ' 个待确认') : '';
+  const box = $('apDetail');
+  box.innerHTML = '';
+  if (isWrite) {
+    const p = document.createElement('div');
+    p.className = 'ap-note';
+    p.textContent = '📄 ' + (evt.path || '') + ' · ' + (evt.detail || '');
+    box.appendChild(p);
+    const pre = document.createElement('div');
+    pre.className = 'ap-diff';
+    pre.innerHTML = renderDiff(evt.diff || '');
+    box.appendChild(pre);
+  } else {
+    const pre = document.createElement('div');
+    pre.className = 'ap-cmd';
+    pre.textContent = evt.command || '';
+    box.appendChild(pre);
+    const p = document.createElement('div');
+    p.className = 'ap-note';
+    p.textContent = '工作目录：' + (evt.cwd ? evt.cwd : '（工作区根）') +
+      '　·　「一直允许」会把该命令加入白名单';
+    box.appendChild(p);
+  }
+  $('apAlways').style.display = isWrite ? '' : '';
+  mask.classList.add('open');
+}
+
+function renderDiff(text) {
+  return text.split('\n').map(line => {
+    let color = '';
+    if (line.startsWith('+') && !line.startsWith('+++')) color = 'd-add';
+    else if (line.startsWith('-') && !line.startsWith('---')) color = 'd-del';
+    else if (line.startsWith('@@') || line.startsWith('+++') || line.startsWith('---')) color = 'd-meta';
+    return color ? '<span class="' + color + '">' + esc(line) + '</span>' : esc(line);
+  }).join('\n');
+}
+
+async function approveReply(decision) {
+  if (!approvalCur) return;
+  const id = approvalCur.id;
+  approvalCur = null;
+  $('approveMask').classList.remove('open');
+  await api().resolve_approval(id, decision);
+  if (approvalQueue.length) renderApproval();
+}
+
+/* ---------- 文件改动检查点：撤销 ---------- */
+async function undoLastChange() {
+  const r = await api().checkpoints(1);
+  const item = (r.items || [])[0];
+  if (!item) { toast('没有可撤销的改动记录'); return; }
+  const names = (item.files || []).map(f => f.rel).slice(0, 6).join('\n');
+  const ok = await dialogConfirm('撤销上一次文件改动',
+    '将回滚以下文件到改动前状态（原样恢复，新建的文件会被删除）：\n\n' + names +
+    (item.files.length > 6 ? '\n…共 ' + item.files.length + ' 个文件' : ''));
+  if (!ok) return;
+  const res = await api().undo_checkpoint(item.id);
+  if (!res.ok) { toast(res.error || '撤销失败', true); return; }
+  toast('已撤销：恢复 ' + (res.restored || 0) + ' 个文件，删除 ' + (res.deleted || 0) + ' 个新建文件');
+  loadWsTree();
+  refreshSidebar();
+  if (curPanel === 'sub') loadSubagents();
+}
+
+async function loadCheckpoints() {
+  const box = $('ckptList');
+  if (!box) return;
+  box.innerHTML = '<div class="hint">加载中…</div>';
+  const r = await api().checkpoints(8);
+  const items = r.items || [];
+  box.innerHTML = '';
+  if (!items.length) {
+    box.innerHTML = '<div class="hint">还没有改动记录。每次写文件前会自动留底，' +
+      '改错了一键回滚。</div>';
+    return;
+  }
+  for (const it of items) {
+    const row = document.createElement('div');
+    row.className = 'set-row';
+    const main = document.createElement('div');
+    main.className = 'set-main';
+    const when = it.ts ? new Date(it.ts * 1000).toLocaleString('zh-CN') : '';
+    main.innerHTML = '<div class="name">' + esc(it.label || '文件改动') + '</div>' +
+      '<div class="desc">' + esc(when) + ' · ' +
+      esc((it.files || []).map(f => f.rel).slice(0, 3).join('、')) +
+      ((it.files || []).length > 3 ? ' 等 ' + it.files.length + ' 个文件' : '') + '</div>';
+    const btn = document.createElement('button');
+    btn.className = 'msg-act';
+    btn.textContent = '🔍 diff';
+    btn.onclick = async () => {
+      const d = await api().checkpoint_diff(it.id);
+      showDialog({ title: '改动对照 · ' + (it.label || it.id),
+                   message: (d.ok ? d.diff : (d.error || '读取失败')) || '（空）',
+                   confirmText: '关闭', cancelText: '关闭' });
+    };
+    const undo = document.createElement('button');
+    undo.className = 'msg-act';
+    undo.textContent = '↶ 撤销';
+    undo.onclick = async () => {
+      const res = await api().undo_checkpoint(it.id);
+      if (!res.ok) { toast(res.error || '撤销失败', true); return; }
+      toast('已撤销：恢复 ' + (res.restored || 0) + ' 个文件，删除 ' + (res.deleted || 0) + ' 个');
+      loadCheckpoints();
+      loadWsTree();
+    };
+    row.append(main, btn, undo);
+    box.appendChild(row);
+  }
+}
+
+/* ---------- 工具调用的展示：图标 / 文案 / 分组卡片 ---------- */
+function toolIcon(name) {
+  const n = String(name || '');
+  if (n === 'write_file' || n === 'edit_file') return '✏️';
+  if (n === 'run_command') return '⌨';
+  if (n === 'read_file' || n === 'list_files' || n === 'search_code') return '🔍';
+  return '🔧';
+}
+
+function toolGroupKey(name) {
+  const n = String(name || '');
+  if (n === 'write_file' || n === 'edit_file') return 'edit';
+  if (n === 'run_command') return 'cmd';
+  return 'other';
+}
+
+function fileFromToolDetail(detail) {
+  // 「已写入 a/b.py（…）」/「已修改 a/b.py（…）」→ a/b.py
+  const m = String(detail || '').match(/^(?:已写入|已修改|已删除|已移动)\s+(\S+?)[（(]/);
+  return m ? m[1] : '';
+}
+
+function splitPath(path) {
+  const p = String(path || '');
+  const idx = p.lastIndexOf('/');
+  if (idx < 0) return { name: p, dir: '' };
+  return { name: p.slice(idx + 1), dir: p.slice(0, idx + 1) };
+}
+
+function toolLabel(name, args, detail) {
+  const n = String(name || '');
+  const path = (args && args.path) || fileFromToolDetail(detail);
+  if (n === 'run_command') return '运行命令 · ' + String((args && args.command) || '').slice(0, 60);
+  if (n === 'write_file' || n === 'edit_file') return (n === 'write_file' ? '写入 ' : '编辑 ') + String(path || '');
+  if (n === 'read_file') return '读取 ' + String(path || '');
+  if (n === 'list_files') return '列出文件 · ' + String((args && args.pattern) || '').slice(0, 40);
+  if (n === 'search_code') return '搜索 · ' + String((args && args.pattern) || '').slice(0, 40);
+  return n + (path ? ' · ' + path : '');
+}
+
+function renderToolGroups(tools) {
+  const wrap = document.createElement('div');
+  wrap.className = 'tgroups';
+  const defs = [
+    { key: 'edit', title: '✏️ 更改', unit: '个文件' },
+    { key: 'cmd', title: '⌨ 运行命令', unit: '条' },
+    { key: 'other', title: '🔧 工具调用', unit: '次' },
+  ];
+  for (const def of defs) {
+    const items = tools.filter(t => toolGroupKey(t.name) === def.key);
+    if (!items.length) continue;
+    wrap.appendChild(renderToolGroup(def, items));
+  }
+  return wrap;
+}
+
+function renderToolGroup(def, items) {
+  const box = document.createElement('div');
+  box.className = 'tgroup' + (def.key === 'cmd' ? ' tgroup-cmd' : '');
+  const failed = items.filter(t => !t.ok).length;
+  const head = document.createElement('div');
+  head.className = 'tgroup-head';
+  head.innerHTML = '<span class="tg-caret">▸</span><span class="tg-title">' + def.title +
+    ' · ' + items.length + ' ' + def.unit + '</span>' +
+    (failed ? '<span class="tg-bad">' + failed + ' 个执行失败</span>' : '') +
+    '<span class="sp"></span>';
+  head.onclick = () => box.classList.toggle('open');
+  const body = document.createElement('div');
+  body.className = 'tgroup-body';
+  for (const t of items) body.appendChild(renderToolRow(def.key, t));
+  box.append(head, body);
+  return box;
+}
+
+function renderToolRow(kind, t) {
+  const row = document.createElement('div');
+  row.className = 'trow' + (t.ok ? '' : ' bad');
+  row.title = t.detail || '';
+  if (kind === 'edit') {
+    const { name, dir } = splitPath(t.file);
+    const verb = t.name === 'write_file' ? '写入' : '编辑';
+    const plus = t.plus === null ? '' :
+      '<span class="tplus">+' + t.plus + '</span><span class="tminus">-' + t.minus + '</span>';
+    row.innerHTML = '<span class="tverb">' + verb + '</span>' +
+      '<span class="tfile">' + esc(name || t.file || '?') + '</span>' +
+      (dir ? '<span class="tdir">' + esc(dir) + '</span>' : '') +
+      plus + (!t.ok ? '<span class="tbadge">执行失败</span>' : '');
+  } else if (kind === 'cmd') {
+    const cmd = String((t.args && t.args.command) || '');
+    row.innerHTML = '<span class="tverb">运行</span>' +
+      '<span class="tcmd">' + esc(cmd || '(未知命令)') + '</span>' +
+      (!t.ok ? '<span class="tbadge">执行失败</span>' : '');
+  } else {
+    row.innerHTML = '<span class="tverb">' + esc(t.name) + '</span>' +
+      '<span class="tdir">' + esc((t.detail || '').slice(0, 60)) + '</span>';
+  }
+  return row;
+}
+
 function onAgentEvent(evt) {
+  // 权限确认最先处理：它可能属于后台会话（并行/子 agent），不能被会话过滤挡掉
+  if (evt.kind === 'approval') { showApproval(evt); return; }
   // 多会话并行：非当前会话的思考/工具步骤不渲染到当前线程
   if (evt.session && evt.session !== currentSession) return;
   if (!liveBlock) return;
@@ -3756,25 +4958,29 @@ function onAgentEvent(evt) {
     const div = document.createElement('div');
     div.className = 'step pending';
     const reasoning = (evt.reasoning || '').trim();
-    div.innerHTML = '<span class="s-icon">🧠</span><span class="s-text">思考 · 第 ' +
+    div.innerHTML = '<span class="s-icon">💭</span><span class="s-text">深度思考 · 第 ' +
       liveLlmCount + ' 轮' + (evt.tools && evt.tools.length ? ' · 准备调用 ' + evt.tools.join(', ') : '') + '</span>';
     if (reasoning) div.title = reasoning;
     steps.appendChild(div);
   } else if (evt.kind === 'tool') {
-    const firstLine = (evt.result || '').split('\n')[0].slice(0, 80);
-    // 收集到本轮工具列表：收尾时作为「工具调用」区块写入正式回复正文
-    liveTools.push({ name: evt.tool || '?', detail: firstLine });
+    const detail = (evt.result || '').split('\n')[0].slice(0, 120);
+    const args = evt.args || {};
+    const ok = !/^错误/.test(detail);
+    const stat = detail.match(/\+(\d+)\s+-(\d+)/) || [];
+    // 收集到本轮工具列表：收尾时按「更改 / 运行命令 / 其他」分组渲染成卡片
+    liveTools.push({
+      name: evt.tool || '?', detail, ok, args,
+      file: args.path || fileFromToolDetail(detail),
+      plus: stat[1] ? Number(stat[1]) : null,
+      minus: stat[2] ? Number(stat[2]) : null,
+      ms: evt.elapsed_ms || 0,
+    });
     const div = document.createElement('div');
-    div.className = 'step';
-    div.innerHTML = '<span class="s-icon">🔧</span><span class="s-text">' +
-      esc(evt.tool) + '</span><span class="s-time">' + ((evt.elapsed_ms || 0) / 1000).toFixed(1) + 's</span>';
-    if (firstLine) {
-      const res = document.createElement('div');
-      res.className = 'step result';
-      res.textContent = '↳ ' + firstLine;
-      steps.appendChild(div);
-      steps.appendChild(res);
-    } else steps.appendChild(div);
+    div.className = 'step' + (ok ? '' : ' bad');
+    div.innerHTML = '<span class="s-icon">' + toolIcon(evt.tool) + '</span>' +
+      '<span class="s-text">' + esc(toolLabel(evt.tool, args, detail)) + '</span>' +
+      '<span class="s-time">' + ((evt.elapsed_ms || 0) / 1000).toFixed(1) + 's</span>';
+    steps.appendChild(div);
   } else if (evt.kind === 'subagent') {
     // 子 agent 动态：在 live 区显示开始/内部工具/完成（右侧面板另有完整记录）
     const div = document.createElement('div');
@@ -3837,6 +5043,7 @@ window.onStreamEvent = function (evt) {
   if (evt.session && evt.session !== currentSession && evt.kind !== 'done') return;
   if (evt.kind === 'delta') {
     if (!liveBlock) return;
+    if (stopReq.has(evt.session)) return;   // 用户已停止：丢弃残余 delta
     if (!streamEl) {
       streamEl = document.createElement('div');
       streamEl.className = 'stream-body live';
@@ -3873,6 +5080,7 @@ function roundSpeed(usage) {
 
 function finishStream(evt) {
   busySessions.delete(evt.session);
+  stopReq.delete(evt.session);
   // 非当前会话的完成：不渲染到当前线程，只提示 + 刷新侧栏
   if (evt.session && evt.session !== currentSession) {
     updateSendState();
@@ -3891,7 +5099,10 @@ function finishStream(evt) {
   for (const call of (evt.tool_calls || [])) meta.push(call.name);
   // 空回复兜底：模型多轮工具后没给文字总结时，明确说明而不是显示「（空回复）」
   let reply = (evt.reply || '').trim();
-  if (!reply) {
+  if (evt.cancelled) {
+    // 用户主动停止：保留已生成的部分内容 + 明确标记；后台会话照常续跑队列
+    reply = (reply || '') + '\n\n（已停止生成。内容未保存到会话历史，可重新提问。）';
+  } else if (!reply) {
     reply = liveTools.length
       ? '（本轮模型未返回文字总结。以下是执行的 ' + liveTools.length +
         ' 步操作；需要说明可再发一句「总结一下刚才做的事」。）'
@@ -3902,6 +5113,7 @@ function finishStream(evt) {
   currentSession = evt.session || currentSession;
   refreshSidebar();
   refreshStatus();
+  if (evt.budget_warning) toast(evt.budget_warning, true);
   notifyDone();
   if (curPanel === 'sub') loadSubagents();  // 子 agent 面板开着时刷新记录
   flushQueue(evt.session);  // 本轮结束 → 自动发送排队消息
@@ -3926,7 +5138,17 @@ function updateSendState() {
   // 忙时按钮保持可点：此时发送 = 排队（本轮完成后自动发出）
   $('send').disabled = false;
   $('send').classList.toggle('busy', busy);
+  // 回答中显示停止按钮（仅流式可真中断；整段路径点了也只在步骤间生效）
+  $('stopBtn').style.display = busy ? '' : 'none';
   renderQueueBadge();
+}
+/* ---------- 停止生成 ---------- */
+const stopReq = new Set();   // 已请求停止的会话（前端丢弃停止后的残余 delta）
+async function stopStream() {
+  const sid = currentSession;
+  if (!busySessions.has(sid)) return;
+  stopReq.add(sid);
+  try { await api().stop_stream(sid); } catch (e) { /* 后端会在收尾时兜底 */ }
 }
 function setBusy(busy) {
   if (busy) busySessions.add(currentSession);
@@ -3962,6 +5184,8 @@ async function send(opts) {
     pendingImages = []; renderImgChips();
     if (isCurrent) { input.value = ''; input.style.height = 'auto'; }
   }
+  // @引用展开：消息里的 @路径 替换为原文内容块（排队入队的也展开，保证语义一致）
+  if (text) text = await expandAtRefs(text);
   // 该会话正在回答 → 入队，等本轮结束自动发出
   if (busySessions.has(targetSession)) {
     const q = queueBySession.get(targetSession) || [];
@@ -4016,6 +5240,7 @@ async function send(opts) {
       : '（模型没有返回内容。可能是请求被中断，重发一次即可。）';
   }
   if (isCurrent) add(reply, 'bot', meta, res.reasoning || '');
+  if (res.budget_warning) toast(res.budget_warning, true);
   if (isCurrent) currentSession = res.session || currentSession;
   refreshSidebar();
   refreshStatus();
@@ -4102,7 +5327,97 @@ $('input').addEventListener('paste', async (e) => {
   if (chk.ok) { e.preventDefault(); addImagePath(chk.path); }
 });
 
+/* ---------- @文件引用：输入 @ 触发工作区文件补全，发送时把引用文件内容附进消息 ---------- */
+const atState = { active: false, items: [], index: 0, query: '', tokenStart: -1 };
+let wsFileCache = { ts: 0, files: [] };
+
+async function wsFilesFresh() {
+  if (Date.now() - wsFileCache.ts > 30000) {
+    try {
+      const r = await api().ws_files(800);
+      wsFileCache = { ts: Date.now(), files: (r && r.files) || [] };
+    } catch (e) { wsFileCache = { ts: Date.now(), files: [] }; }
+  }
+  return wsFileCache.files;
+}
+function atOnInput() {
+  const el = $('input');
+  const upto = el.value.slice(0, el.selectionStart || 0);
+  const m = upto.match(/(^|[\s（(【"])@([^\s@]*)$/);
+  if (!m) { atClose(); return; }
+  atState.query = m[2];
+  atState.tokenStart = (el.selectionStart || 0) - m[2].length;
+  atOpen();
+}
+async function atOpen() {
+  const files = await wsFilesFresh();
+  const q = (atState.query || '').toLowerCase();
+  atState.items = files.filter(f => f.toLowerCase().includes(q)).slice(0, 8);
+  if (!atState.items.length) { atClose(); return; }
+  atState.active = true;
+  atState.index = Math.min(atState.index, atState.items.length - 1);
+  renderAtMenu();
+}
+function renderAtMenu() {
+  const menu = $('atMenu');
+  if (!menu) return;
+  menu.innerHTML = '';
+  atState.items.forEach((f, i) => {
+    const b = document.createElement('div');
+    b.className = 'at-item' + (i === atState.index ? ' active' : '');
+    b.textContent = '@' + f;
+    b.title = f;
+    b.onmousedown = (e) => { e.preventDefault(); atPick(i); };
+    menu.appendChild(b);
+  });
+  menu.style.display = 'block';
+}
+function atClose() {
+  atState.active = false;
+  const menu = $('atMenu');
+  if (menu) { menu.style.display = 'none'; menu.innerHTML = ''; }
+}
+function atPick(i) {
+  const el = $('input');
+  const f = atState.items[i];
+  if (!f) { atClose(); return; }
+  const pos = el.selectionStart || 0;
+  const before = el.value.slice(0, atState.tokenStart);
+  const after = el.value.slice(pos).replace(/^\s+/, '');
+  const ins = '@' + f + ' ';
+  el.value = before + ins + after;
+  atClose();
+  el.focus();
+  const caret = (before + ins).length;
+  el.setSelectionRange(caret, caret);
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+}
+/* 发送前把 @路径 展开成文件内容块（最多 3 个、单个 12k 字符，后端有监狱） */
+async function expandAtRefs(text) {
+  const refs = [...new Set((String(text).match(/@([^\s@,，。;；)）\]]+)/g) || [])
+    .map(s => s.slice(1)))];
+  if (!refs.length) return text;
+  let extra = '';
+  let used = 0;
+  for (const ref of refs) {
+    if (used >= 3) break;
+    try {
+      const r = await api().ws_file_text(ref, 12000);
+      if (r && r.ok) { used++; extra += '\n\n[引用文件 ' + ref + ']\n```\n' + r.text + '\n```'; }
+    } catch (e) { /* 引用失效就跳过，消息照发 */ }
+  }
+  return used ? (text + extra) : text;
+}
+
+$('input').addEventListener('input', () => { atOnInput(); });
 $('input').addEventListener('keydown', (e) => {
+  if (atState.active) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); atState.index = (atState.index + 1) % atState.items.length; renderAtMenu(); return; }
+    if (e.key === 'ArrowUp') { e.preventDefault(); atState.index = (atState.index - 1 + atState.items.length) % atState.items.length; renderAtMenu(); return; }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); atPick(atState.index); return; }
+    if (e.key === 'Escape') { e.preventDefault(); atClose(); return; }
+  }
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 
@@ -4158,13 +5473,14 @@ function closeSettings() { $('overlay').style.display = 'none'; }
 function switchTab(name) {
   document.querySelectorAll('.set-nav-item').forEach(b =>
     b.classList.toggle('active', b.dataset.set === name));
-  ['models', 'plugins', 'skills', 'market', 'appearance', 'general', 'usage']
+  ['models', 'plugins', 'skills', 'market', 'mcp', 'appearance', 'general', 'usage']
     .forEach(n => {
       const el = $('tab-' + n);
       if (el) el.style.display = n === name ? '' : 'none';
     });
   if (name === 'market' && !marketLoaded) loadMarket();
   if (name === 'skills') loadSkills();
+  if (name === 'mcp') loadMcp();
   if (name === 'appearance') renderAppearance();
   if (name === 'general') renderGeneral();
   if (name === 'usage') loadUsageTab();
@@ -4263,6 +5579,95 @@ async function saveSettings() {
   note.className = res.ok ? 'note-ok' : 'note-err';
   note.textContent = res.ok ? (res.rebuild_error || '已保存，立即生效') : res.error;
   if (res.ok) refreshStatus();
+}
+
+/* ---------- MCP 服务器 ---------- */
+let editingMcp = [];
+
+async function loadMcp() {
+  const s = await api().mcp_servers();
+  editingMcp = (s.servers || []).map(x => ({
+    name: x.name || '', type: x.type || 'stdio', url: x.url || '',
+    command: x.command || '', args: (x.args || []).join(' '),
+    headers: Object.keys(x.headers || {}).length ? JSON.stringify(x.headers) : '',
+    env: Object.keys(x.env || {}).length ? JSON.stringify(x.env) : '',
+  }));
+  if (!editingMcp.length) addMcpEntry();
+  renderMcpCards();
+  $('mcpSaveNote').textContent = '';
+}
+function addMcpEntry() {
+  editingMcp.push({ name: '', type: 'stdio', url: '', command: '', args: '', headers: '', env: '' });
+}
+function addMcpCard() { addMcpEntry(); renderMcpCards(); }
+
+function renderMcpCards() {
+  const box = $('mcpCards');
+  box.innerHTML = '';
+  editingMcp.forEach((m, i) => {
+    const card = document.createElement('div');
+    card.className = 'model-card';
+    const remote = m.type !== 'stdio';
+    card.innerHTML = `
+      <div class="model-grid">
+        <div class="field"><label>名称</label>
+          <input value="${esc(m.name)}" oninput="editingMcp[${i}].name=this.value"></div>
+        <div class="field"><label>传输类型</label>
+          <select onchange="editingMcp[${i}].type=this.value;renderMcpCards()">
+            <option value="stdio"${!remote ? ' selected' : ''}>stdio（本地命令）</option>
+            <option value="http"${m.type === 'http' ? ' selected' : ''}>http（远程）</option>
+            <option value="sse"${m.type === 'sse' ? ' selected' : ''}>sse（远程）</option>
+          </select></div>
+        ${remote
+          ? `<div class="field"><label>URL</label>
+               <input value="${esc(m.url)}" oninput="editingMcp[${i}].url=this.value"></div>`
+          : `<div class="field"><label>启动命令</label>
+               <input value="${esc(m.command)}" oninput="editingMcp[${i}].command=this.value"></div>`}
+      </div>
+      <div class="model-grid2">
+        ${remote ? '' : `<div class="field"><label>参数（空格分隔）</label>
+          <input value="${esc(m.args)}" oninput="editingMcp[${i}].args=this.value"></div>`}
+        <div class="field"><label>HEADERS（JSON，可选）</label>
+          <input type="password" value="${esc(m.headers)}" oninput="editingMcp[${i}].headers=this.value"></div>
+        <div class="field"><label>ENV（JSON，可选）</label>
+          <input type="password" value="${esc(m.env)}" oninput="editingMcp[${i}].env=this.value"></div>
+        <button class="icon-btn" onclick="editingMcp.splice(${i},1);renderMcpCards()">移除</button>
+      </div>`;
+    box.appendChild(card);
+  });
+}
+
+function parseJsonField(text, label, problems) {
+  const t = (text || '').trim();
+  if (!t) return {};
+  try {
+    const v = JSON.parse(t);
+    if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+    problems.push(label + ' 必须是 JSON 对象');
+  } catch (e) { problems.push(label + ' 不是合法 JSON'); }
+  return {};
+}
+
+async function saveMcp() {
+  const problems = [];
+  const servers = editingMcp.map(m => ({
+    name: m.name, type: m.type, url: m.url, command: m.command, args: m.args,
+    headers: parseJsonField(m.headers, (m.name || '未命名') + ' 的 HEADERS', problems),
+    env: parseJsonField(m.env, (m.name || '未命名') + ' 的 ENV', problems),
+  }));
+  const note = $('mcpSaveNote');
+  if (problems.length) {
+    note.className = 'note-err';
+    note.textContent = problems[0];
+    return;
+  }
+  const res = await api().save_mcp(servers);
+  note.className = res.ok ? 'note-ok' : 'note-err';
+  note.textContent = res.ok
+    ? ('已保存 ' + res.count + ' 个服务器' +
+       (res.reload_error ? '；重连失败: ' + res.reload_error : '；已重连'))
+    : ('保存失败: ' + (res.error || '未知错误'));
+  if (res.ok) loadMcp();
 }
 
 /* ---------- 插件 ---------- */
@@ -4462,6 +5867,19 @@ function togglePanel() {
   document.body.classList.toggle('panel-hidden');
 }
 
+/* ---------- 标签栏滚轮横滚：标签多放不下时，滚轮直接左右移动标签条 ---------- */
+(function initTabsWheel() {
+  const bar = document.querySelector('.rp-tabs');
+  if (!bar) return;
+  bar.addEventListener('wheel', (e) => {
+    // 纵向滚轮转成横向滚动（按住 Shift 时浏览器原生横滚，去重避免双倍）
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      e.preventDefault();
+      bar.scrollLeft += e.deltaY;
+    }
+  }, { passive: false });
+})();
+
 /* ---------- 导出当前会话 ---------- */
 async function exportCurrent() {
   const res = await api().export_session(currentSession);
@@ -4480,6 +5898,8 @@ function switchPanel(name) {
   if (name === 'ws') loadWsTree();
   if (name === 'kb') loadKnowledge();
   if (name === 'todo') loadTodoPanel();
+  if (name === 'sched') loadSchedules();
+  if (name === 'mem') loadMemory();
   if (name === 'usage') loadUsageChart();
   if (name === 'review') loadReview();
   if (name === 'sub') loadSubagents();
@@ -4488,8 +5908,8 @@ function switchPanel(name) {
 /* ---------- 右侧标签页显隐（点 ✕ 隐藏，「＋」处找回） ---------- */
 let rpHidden = [];
 const TAB_LABELS = { aux: '💬 辅助', ws: '📁 工作区', sub: '🤖 子agent', kb: '📚 知识库',
-                     todo: '✅ 任务', usage: '📈 用量', term: '⌨ 终端',
-                     browser: '🌐 浏览器', review: '🔍 审查' };
+                     todo: '✅ 任务', sched: '⏰ 定时', mem: '🧠 记忆', usage: '📈 用量',
+                     term: '⌨ 终端', browser: '🌐 浏览器', review: '🔍 审查' };
 
 function applyTabVisibility() {
   document.querySelectorAll('.rp-tab[data-rp]').forEach(t => {
@@ -4540,7 +5960,7 @@ async function showTabMenu() {
   menu.classList.add('open');
 }
 /* 标签页顺序：支持拖拽重排 / 右键「左移 / 右移 / 隐藏」，随界面偏好持久化 */
-const RP_TAB_ORDER_DEFAULT = ['aux', 'ws', 'sub', 'todo', 'usage', 'kb', 'term', 'browser', 'review'];
+const RP_TAB_ORDER_DEFAULT = ['aux', 'ws', 'sub', 'todo', 'sched', 'mem', 'usage', 'kb', 'term', 'browser', 'review'];
 let rpTabOrder = RP_TAB_ORDER_DEFAULT.slice();
 let curPanel = 'aux';
 
@@ -4706,6 +6126,95 @@ async function statelessReset() {
   await selectSession(r.session);
 }
 
+/* ---------- 长期记忆（🧠 记忆；profile/memory.md，构建 agent 时注入） ---------- */
+async function loadMemory() {
+  const r = await api().agent_memory();
+  $('memText').value = r.ok ? (r.text || '') : ('读取失败: ' + (r.error || ''));
+}
+async function saveMemory() {
+  const r = await api().save_agent_memory($('memText').value);
+  if (r && r.ok) toast('记忆已保存，下一轮对话生效');
+  else toast((r && r.error) || '保存失败', true);
+}
+
+/* ---------- profile 备份 / 恢复（通用 → 数据） ---------- */
+async function backupProfile() {
+  const r = await api().export_profile('');
+  if (r && r.ok) toast('已备份 ' + r.files + ' 个文件 → ' + r.path);
+  else toast((r && r.error) || '备份失败', true);
+}
+async function restoreProfile() {
+  const path = await dialogPrompt('从备份恢复 —— 输入备份 zip 的完整路径', '');
+  if (path === null || !String(path).trim()) return;
+  const ok = await dialogConfirm('确认恢复',
+    '将用备份覆盖当前 profile 的同名文件（配置先存为 config.pre-import.json）。继续？');
+  if (!ok) return;
+  const r = await api().import_profile(String(path).trim());
+  if (r && r.ok) toast('已恢复 ' + r.restored + ' 个文件' + (r.skipped ? '，跳过 ' + r.skipped : ''));
+  else toast((r && r.error) || '恢复失败', true);
+}
+
+/* ---------- 定时任务面板（⏰ 定时；与 scheduler 插件 / sha schedule 共用 tasks.json） ---------- */
+async function loadSchedules() {
+  const pane = $('schedPane');
+  if (!pane) return;
+  pane.innerHTML = '<div class="hint">加载中…</div>';
+  const r = await api().schedules();
+  pane.innerHTML = '';
+  const tasks = (r && r.tasks) || [];
+  if (!tasks.length) {
+    pane.innerHTML = '<div class="hint">还没有定时任务。<br>' +
+      '用 <b>sha schedule add &lt;名&gt; --every &lt;秒&gt; --prompt &lt;提示词&gt;</b> 创建，' +
+      '或直接让 agent 帮你安排。到点会用独立 agent 执行提示词，结果写进 profile 的 scheduled/ 目录。</div>';
+    return;
+  }
+  for (const t of tasks) {
+    const row = document.createElement('div');
+    row.className = 'sub-row open';
+    const head = document.createElement('div');
+    head.className = 'sub-head';
+    const last = t.last_run ? new Date(t.last_run * 1000).toLocaleString('zh-CN') : '从未';
+    head.innerHTML = '<span class="sub-badge ' + (t.enabled !== false ? 'ok' : 'bad') + '">' +
+      (t.enabled !== false ? '▶' : '⏸') + '</span>' +
+      '<span class="sub-task">' + esc(t.name || '') + '</span>' +
+      '<span class="sub-time">每 ' + esc(String(t.every ?? '?')) + 's · 上次 ' + esc(last) + '</span>';
+    head.title = t.prompt || '';
+    head.onclick = () => row.classList.toggle('open');
+    row.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'sub-body';
+    const prompt = document.createElement('div');
+    prompt.className = 'sub-out';
+    prompt.textContent = t.prompt || '';
+    const acts = document.createElement('div');
+    acts.className = 'sched-acts';
+    const toggle = document.createElement('button');
+    toggle.className = 'mini-btn';
+    toggle.textContent = t.enabled !== false ? '⏸ 暂停' : '▶ 启用';
+    toggle.onclick = async (e) => {
+      e.stopPropagation();
+      const res = await api().schedule_toggle(t.name, t.enabled === false);
+      if (res && res.ok) loadSchedules();
+      else toast((res && res.error) || '操作失败', true);
+    };
+    const del = document.createElement('button');
+    del.className = 'mini-btn';
+    del.textContent = '🗑 移除';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      const ok = await dialogConfirm('移除定时任务', '确定移除任务「' + (t.name || '') + '」？');
+      if (!ok) return;
+      const res = await api().schedule_remove(t.name);
+      if (res && res.ok) loadSchedules();
+      else toast((res && res.error) || '移除失败', true);
+    };
+    acts.append(toggle, del);
+    body.append(prompt, acts);
+    row.appendChild(body);
+    pane.appendChild(row);
+  }
+}
+
 /* ---------- 远程仓库配置与手动推送（审查面板；agent 无 push 能力） ---------- */
 async function loadGitRemote() {
   const res = await api().git_remote_get();
@@ -4774,6 +6283,18 @@ async function pushNow() {
 
 /* ---------- 知识库面板 ---------- */
 let kbNote = '';
+
+/* 知识库试检索：不走对话，直接看命中片段与来源 */
+async function kbQuery() {
+  const input = $('kbqInput');
+  const out = $('kbqOut');
+  const q = (input.value || '').trim();
+  if (!q) return;
+  out.style.display = '';
+  out.textContent = '检索中…';
+  const r = await api().knowledge_query(q, 5);
+  out.textContent = r.ok ? (r.output || '（无命中）') : ('错误: ' + (r.error || '未知错误'));
+}
 
 async function loadKnowledge() {
   const res = await api().knowledge_status();
@@ -4957,6 +6478,14 @@ async function loadSubagents() {
     head.title = it.task || '';
     head.onclick = () => row.classList.toggle('open');
     row.appendChild(head);
+    if (it.id) {   // 旧版记录没有 id，无法按行定位删除，只渲染整表清空
+      const rm = document.createElement('button');
+      rm.className = 'mini-btn sub-rm';
+      rm.textContent = '×';
+      rm.title = '移除这条记录';
+      rm.onclick = (e) => { e.stopPropagation(); removeSubagent(it.id); };
+      head.appendChild(rm);
+    }
     const body = document.createElement('div');
     body.className = 'sub-body';
     const trace = (it.trace || []);
@@ -4979,6 +6508,27 @@ async function loadSubagents() {
     row.appendChild(body);
     pane.appendChild(row);
   }
+}
+
+async function removeSubagent(id) {
+  const r = await api().remove_subagents([id]);
+  if (!r || !r.ok) {
+    toast('移除失败: ' + ((r && r.error) || '未知错误'), true);
+    return;
+  }
+  loadSubagents();
+}
+
+async function clearSubagents() {
+  const ok = await dialogConfirm('清空子 agent 记录',
+    '确定清空全部子 agent 调用记录？此操作不可恢复。');
+  if (!ok) return;
+  const r = await api().remove_subagents(null);
+  if (!r || !r.ok) {
+    toast('清空失败: ' + ((r && r.error) || '未知错误'), true);
+    return;
+  }
+  loadSubagents();
 }
 
 async function loadUsageChart() {
@@ -5213,7 +6763,20 @@ function renderGeneral() {
     row.append(main, btn);
     toggles.appendChild(row);
   }
+  const cw = $('confirmWriteBtn');
+  if (cw) cw.textContent = confirmWriteOn ? '已开启' : '已关闭';
+  loadCheckpoints();
   $('generalNote').textContent = '';
+}
+
+/* 「写文件前显示 diff 确认」开关（服务端配置 permissions.confirm_write） */
+let confirmWriteOn = false;
+async function toggleConfirmWrite() {
+  confirmWriteOn = !confirmWriteOn;
+  await api().set_confirm_write(confirmWriteOn);
+  const cw = $('confirmWriteBtn');
+  if (cw) cw.textContent = confirmWriteOn ? '已开启' : '已关闭';
+  toast(confirmWriteOn ? '写文件前会显示 diff 确认' : '已关闭写前确认（仍会自动留底）');
 }
 
 /* ---------- 设置页：用量统计 ---------- */
@@ -5755,7 +7318,8 @@ async function auxSend() {
   busy.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
   $('auxThread').appendChild(busy);
   $('auxThread').scrollTop = $('auxThread').scrollHeight;
-  const res = await api().chat(text, AUX_SESSION);
+  const model = $('auxModelSel') ? $('auxModelSel').value : '';
+  const res = await api().chat(text, AUX_SESSION, null, model);
   busy.remove();
   auxBusy = false;
   $('auxSend').classList.remove('busy');
@@ -5772,8 +7336,8 @@ function auxAdd(text, cls, reasoning) {
     if (reasoning) {
       const rd = document.createElement('div');
       rd.className = 'reasoning';
-      rd.innerHTML = '<div class="r-head"><span class="r-caret">▶</span><span>🧠</span>' +
-        '<span class="r-title">思考过程 · 展开查看</span></div><div class="r-body"></div>';
+      rd.innerHTML = '<div class="r-head"><span class="r-title">思考过程</span>' +
+        '<span class="r-caret-end">›</span></div><div class="r-body"></div>';
       rd.querySelector('.r-body').textContent = reasoning;
       rd.querySelector('.r-head').onclick = () => rd.classList.toggle('open');
       div.appendChild(rd);
@@ -5786,8 +7350,25 @@ function auxAdd(text, cls, reasoning) {
   $('auxThread').appendChild(div);
 }
 async function auxInit() {
+  // 模型下拉：辅助对话可单独选模型（不切全局当前模型）
+  try {
+    const s = await api().get_models();
+    const sel = $('auxModelSel');
+    sel.innerHTML = '';
+    for (const m of (s.models || [])) {
+      if (!m.name) continue;
+      const o = document.createElement('option');
+      o.value = m.name;
+      o.textContent = m.name + (m.name === s.default_model ? '（默认）' : '');
+      sel.appendChild(o);
+    }
+    if (s.default_model) sel.value = s.default_model;
+  } catch (e) { /* 模型列表取不到就不显示可选模型 */ }
   const res = await api().session_history(AUX_SESSION);
-  for (const m of (res.history || [])) auxAdd(m.content, m.role === 'user' ? 'user' : 'bot');
+  // 思考过程随消息落盘，回放时同样重建折叠块
+  for (const m of (res.history || [])) {
+    auxAdd(m.content, m.role === 'user' ? 'user' : 'bot', m.reasoning || '');
+  }
   $('auxThread').scrollTop = $('auxThread').scrollHeight;
   await api().rename_session(AUX_SESSION, '辅助对话');
   refreshSidebar();
@@ -5797,6 +7378,9 @@ $('auxInput').addEventListener('keydown', (e) => {
 });
 $('termInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); termRun(); }
+});
+$('kbqInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); kbQuery(); }
 });
 $('brUrl').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); brGo(); }
@@ -5840,7 +7424,20 @@ window.addEventListener('pywebviewready', async () => {
   updateSendState();
   $('input').focus();
 });
-</script></body></html>"""
+</script>    <div id="approveMask" class="ap-mask">
+      <div class="ap-card">
+        <div class="ap-head"><span id="apTitle">确认执行</span><span class="sp"></span>
+          <span id="apCount" class="ap-count"></span></div>
+        <div id="apDetail" class="ap-detail"></div>
+        <div class="ap-foot">
+          <button class="ghost" onclick="approveReply('deny')">拒绝</button>
+          <span class="flex1"></span>
+          <button class="ghost" id="apAlways" onclick="approveReply('allow_always')">一直允许</button>
+          <button class="primary" onclick="approveReply('allow_once')">允许一次</button>
+        </div>
+      </div>
+    </div>
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
