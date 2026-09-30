@@ -110,6 +110,52 @@ def _attach_reasoning(history: list, reasoning) -> None:
             return
 
 
+# 预设模式（用户不可改，可新建自定义模式补充）：name → 附加提示词 / 是否禁用工具。
+# current_mode 为空或 "默认" 即不附加任何东西（与既往行为一致）。
+PRESET_MODES: dict[str, dict] = {
+    "默认": {},
+    "计划": {"instructions": PLAN_MODE_INSTRUCTIONS},
+    "快速回答": {
+        "instructions": ("\n\n## 快速回答模式（当前开启）\n"
+                         "直接给出简洁答案：不要调用任何工具，不要长篇展开；"
+                         "能一句话说清就不分段。"),
+        "disable_tools": True,
+    },
+    "只读分析": {
+        "instructions": ("\n\n## 只读分析模式（当前开启）\n"
+                         "只做阅读、分析与建议：不要写入/修改/删除任何文件，"
+                         "不要执行会产生副作用的命令；需要动手时先征求用户确认。"),
+    },
+    "安全研究": {
+        "instructions": (
+            "\n\n## 安全研究模式（当前开启）\n"
+            "用户是安全从业者，当前工作处于**已授权**范围内：防御性分析、有书面授权的\n"
+            "渗透测试、CTF 解题、恶意样本行为分析、安全事件研判与报告撰写。\n"
+            "- 可以：讲解漏洞原理与利用思路（教学视角）、编写加固建议、分析样本/日志、\n"
+            "  撰写测试用例与复现步骤（仅针对授权靶标）。\n"
+            "- 涉及具体 payload 时优先给教学级解释 + 防御视角，避免可直接投递的成品。\n"
+            "- 对未授权的真实目标、破坏性操作或窃取数据的请求：拒绝并说明原因。\n"
+            "- 本模式只是声明工作语境，不改变模型服务商自身的安全策略。"),
+    },
+}
+
+
+def _resolve_mode(config: dict) -> dict:
+    """按 config.current_mode 解析出模式定义（预设 + 用户自定义，查不到回默认）。"""
+    name = str(config.get("current_mode") or "默认").strip() or "默认"
+    if name in PRESET_MODES:
+        mode = dict(PRESET_MODES[name])
+        mode["name"] = name
+        return mode
+    for item in config.get("user_modes") or []:
+        if isinstance(item, dict) and str(item.get("name") or "").strip() == name:
+            return {"name": name,
+                    "instructions": "\n\n## " + name + " 模式（当前开启）\n"
+                                    + str(item.get("instructions") or ""),
+                    "disable_tools": bool(item.get("disable_tools"))}
+    return {"name": "默认", "instructions": "", "disable_tools": False}
+
+
 def _summarize_args(arguments: Any) -> dict:
     """把工具入参压成界面用的小摘要（不把整篇文件内容推给前端）。"""
     if not isinstance(arguments, dict):
@@ -170,6 +216,22 @@ class _EventTracer:
             pass
 
 
+def _max_iterations(config: dict) -> int:
+    """单轮回答允许的最大 模型↔工具 循环数（config.max_iterations，默认 10）。
+
+    这是防死循环的安全阀：模型连续请求工具而不给最终回答时，到顶即停，
+    避免无限烧 token。桌面端「通用」页可调（任务重的场景调大即可）。
+    """
+    raw = config.get("max_iterations")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = 10
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 10
+    return max(1, min(value, 200))
+
+
 def _build_memory(cfg: dict, llm):
     """按 config.json 的 ``memory`` 段构建记忆（缺省=全量 Memory，行为与既往一致）。
 
@@ -178,13 +240,20 @@ def _build_memory(cfg: dict, llm):
       长会话的 token 成本从线性增长变为近似封顶。
     - ``{"type": "sliding", "max_messages": 40}``：滑动窗口，超限丢最旧。
     - 缺省 / 其他取值：全量 Memory（不裁剪）。
+
+    summary 未写 max_tokens 时按当前模型 context_window 的 ~55% 推导
+    （给回复与系统提示词留余量），模型窗口未知则退回 24000。
     """
     from nanoagent.memory import Memory, SummaryMemory
 
     mtype = str(cfg.get("type") or "full").lower()
     if mtype == "summary":
+        max_tokens = int(cfg.get("max_tokens") or 0)
+        if max_tokens <= 0:
+            window = int(getattr(llm, "context_window", 0) or 0)
+            max_tokens = int(window * 0.55) if window > 0 else 24000
         return SummaryMemory(
-            max_tokens=int(cfg.get("max_tokens") or 24000),
+            max_tokens=max_tokens,
             keep_recent=int(cfg.get("keep_recent") or 6),
             llm=llm,
         )
@@ -267,11 +336,33 @@ def register(ctx) -> None:
         return f"{base}-{counter}"
 
     def _compose_instructions() -> str:
-        """主系统提示词装配（get_agent 与 build_agent_with 共用，单一事实来源）。"""
+        """主系统提示词装配（get_agent 与 build_agent_with 共用，单一事实来源）。
+
+        叠加顺序：内置指令 ← 全局人设（persona.md）← 工作区规则（AGENT.md，
+        跟代码走可提交 git）← 长期记忆（memory.md）← 长程准则/恢复/计划模式。
+        """
         from pathlib import Path
 
         config = host.profile.load_config()
         instructions = INSTRUCTIONS
+        # 全局人设（桌面端 🧠 面板上半区编辑）
+        persona_path = Path(host.profile.root) / "persona.md"
+        if persona_path.is_file():
+            try:
+                persona = persona_path.read_text(encoding="utf-8").strip()[:4000]
+            except OSError:
+                persona = ""
+            if persona:
+                instructions += "\n\n## 人设（用户维护，始终生效）\n" + persona
+        # 工作区级规则：AGENT.md 放在工作区根，跟项目走（git 提交后团队共享）
+        try:
+            agent_md = (Path(host.workspace) / "AGENT.md")
+            if agent_md.is_file():
+                rules = agent_md.read_text(encoding="utf-8").strip()[:6000]
+                if rules:
+                    instructions += "\n\n## 工作区规则（AGENT.md）\n" + rules
+        except OSError:
+            pass
         # 长期记忆（profile/memory.md，桌面端 🧠 面板维护）：跨会话注入
         memory_path = Path(host.profile.root) / "memory.md"
         if memory_path.is_file():
@@ -281,6 +372,8 @@ def register(ctx) -> None:
                 memory_text = ""
             if memory_text:
                 instructions += "\n\n## 长期记忆（用户维护，跨会话生效）\n" + memory_text
+        # 当前模式（预设/自定义）的附加提示词
+        instructions += str(_resolve_mode(config).get("instructions") or "")
         # F2/F3：长程执行准则 + 跨会话状态恢复（config.longrun.* 可分别关闭）
         longrun = config.get("longrun") if isinstance(config.get("longrun"), dict) else {}
         if longrun.get("guidelines") is not False:
@@ -307,7 +400,49 @@ def register(ctx) -> None:
         profile_skills = Path(host.profile.root) / "skills"  # 用户安装的技能
         if profile_skills.is_dir():
             registry.add_dir(profile_skills)
+        # 用户禁用的技能（config.disabled_skills，桌面端技能页开关）：按名移除
+        disabled = host.profile.load_config().get("disabled_skills")
+        if isinstance(disabled, list):
+            for name in disabled:
+                registry.remove(str(name))
         return registry
+
+    def _make_ask_user_tool():
+        """构造 ask_user 工具：agent 拿不准时向用户提问（桌面端弹问答卡片）。
+
+        没有交互界面（CLI 一次性执行/管道）或用户超时未答时，返回提示文本
+        让模型按最合理假设继续——工具绝不能卡死对话。
+        """
+        from nanoagent.tools import tool as tool_decorator
+
+        @tool_decorator(
+            name="ask_user",
+            description="向用户提出关键决策问题（方案选型/缺必要参数/需要拍板）并等待回答。"
+                        "问题要具体、给出你的推荐选项；仅在真正影响后续走向时使用，不要频繁打扰。",
+        )
+        def ask_user(question: str, options: str = "", timeout_seconds: int = 180) -> str:
+            """向用户提问并等待回答。
+
+            Args:
+                question: 要问的问题（一句话说清背景与选项差异）
+                options: 可选候选项，用 | 分隔（如 "A 方案|B 方案|都不对"）
+                timeout_seconds: 最长等待秒数（10~600，超时按未回答处理）
+            """
+            sink = getattr(host, "ask_user_sink", None)
+            if not callable(sink):
+                return ("（当前环境没有交互界面，无法提问）"
+                        "请按最合理假设继续，并在回复中明确说明你所做的假设。")
+            try:
+                timeout = max(10, min(int(timeout_seconds or 180), 600))
+            except (TypeError, ValueError):
+                timeout = 180
+            try:
+                return str(sink(question=str(question or ""), options=str(options or ""),
+                               timeout=timeout))
+            except Exception as exc:  # noqa: BLE001 —— 提问失败不拖垮对话
+                return f"提问失败（{type(exc).__name__}），请按最合理假设继续并说明假设。"
+
+        return ask_user
 
     def get_agent():
         if state["agent"] is None:
@@ -331,8 +466,16 @@ def register(ctx) -> None:
             rules = host.service("guardrails") or {}
             make_tracer = (host.service("tracing") or {}).get("new_tracer")
 
-            agent = Agent(name="卅助手", instructions=instructions, llm=llm,
-                          tools=host.collect_tools(), memory=memory,
+            tools = host.collect_tools()
+            # ask_user：agent 主动向用户提问（config.ask_user=false 关闭）
+            if config.get("ask_user") is not False:
+                tools = [*tools, _make_ask_user_tool()]
+
+            agent = Agent(name="卅助手", instructions=instructions,
+                          llm=llm,
+                          tools=tools if not _resolve_mode(config).get("disable_tools") else [],
+                          memory=memory,
+                          max_iterations=_max_iterations(config),
                           input_guardrails=rules.get("input") or None,
                           output_guardrails=rules.get("output") or None,
                           tracer=make_tracer() if callable(make_tracer) else None)
@@ -359,6 +502,7 @@ def register(ctx) -> None:
         agent = Agent(name="卅助手", instructions=_compose_instructions(), llm=llm,
                       tools=host.collect_tools() if tools is None else list(tools),
                       memory=memory,
+                      max_iterations=_max_iterations(host.profile.load_config()),
                       input_guardrails=rules.get("input") or None,
                       output_guardrails=rules.get("output") or None,
                       tracer=None)

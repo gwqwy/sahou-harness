@@ -82,6 +82,12 @@ def register(ctx) -> None:
             errors[name] = reason
             ctx.skipped.append(f"model:{name}: {reason}")
             continue
+        # 上下文窗口（config.models[].context_length，桌面端模型卡片可填）：
+        # 供 context_usage / 水位条 / 自动压缩推导用；0 = 用 128000 兜底
+        try:
+            pool[name].context_window = int(entry.get("context_length") or 0)
+        except (TypeError, ValueError, AttributeError):
+            pass
         order.append(name)
 
     def set_current(name: str) -> str:

@@ -1912,5 +1912,163 @@ class Batch43ApisTests(unittest.TestCase):
             self.assertIn("ghost", bad["error"])
 
 
+class Batch44HarnessTests(unittest.TestCase):
+    """第四十四批 harness 侧：人设注入 / 定时新建 / 会话手术 / HTML 导出 / 清理 / 成本。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        host.profile.update_config(auto_title=False)
+        return host, DesktopApp(host)
+
+    def test_persona_injection_layered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.save_persona("像资深同事一样直接指出问题")
+            (Path(host.workspace) / "AGENT.md").write_text(
+                "# 规则\n不要动 legacy 目录", encoding="utf-8")
+            agent = host.service("agent_factory")()
+            self.assertIn("像资深同事一样直接指出问题", agent.instructions)
+            self.assertIn("不要动 legacy 目录", agent.instructions)
+            self.assertIn("工作区规则（AGENT.md）", agent.instructions)
+
+    def test_schedule_add_via_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertTrue(app.schedule_add("巡检", 60, "检查服务")["ok"])
+            tasks = app.schedules()["tasks"]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["every"], 60)
+            self.assertFalse(app.schedule_add("坏 名/字", 60, "x")["ok"])
+
+    def test_session_surgery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("一", "sx")
+            app.chat("二", "sx")
+            self.assertEqual(len(app.session_history("sx")["history"]), 4)
+            r = app.session_truncate("sx", 1)   # 保留前 2 条
+            self.assertTrue(r["ok"])
+            self.assertEqual(len(app.session_history("sx")["history"]), 2)
+            r2 = app.session_delete_message("sx", 0)
+            self.assertTrue(r2["ok"])
+            self.assertEqual(len(app.session_history("sx")["history"]), 1)
+            self.assertFalse(app.session_truncate("sx", 99)["ok"])
+
+    def test_export_session_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("你好<script>alert(1)</script>", "he")
+            r = app.export_session_html("he")
+            self.assertTrue(r["ok"], r.get("error"))
+            text = Path(r["path"]).read_text(encoding="utf-8")
+            self.assertIn("&lt;script&gt;", text)   # 用户内容被转义
+            self.assertNotIn("<script>alert", text)  # 不得出现可执行的注入脚本
+
+    def test_cleanup_sessions(self):
+        import os as _os
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            app.chat("保留", "keep")
+            app.chat("过期", "old")
+            app.chat("现在", "now")   # 当前会话永不删
+            old_stat = Path(host.profile.sessions_dir / "old.json")
+            past = _time.time() - 40 * 86400
+            _os.utime(old_stat, (past, past))
+            host.profile.update_config(sessions_keep_days=30)
+            r = app.cleanup_sessions()
+            self.assertEqual(r["removed"], 1)
+            self.assertFalse(old_stat.exists())
+            self.assertTrue((host.profile.sessions_dir / "keep.json").exists())
+            self.assertTrue((host.profile.sessions_dir / "now.json").exists())
+
+    def test_usage_cost_from_prices(self):
+        import json as _json
+        import time as _time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            host.profile.update_config(models=[
+                {"name": "m1", "provider": "openai", "model": "x", "api_key": "k",
+                 "price_in": 2.0, "price_out": 8.0}])
+            rec = {"ts": _time.time(), "session": "t1", "model": "m1",
+                   "prompt_tokens": 1_000_000, "completion_tokens": 500_000}
+            with open(host.profile.root / "usage.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(rec) + "\n")
+            days = app.usage_daily(7)["days"]
+            total = sum(d.get("cost") or 0 for d in days)
+            self.assertAlmostEqual(total, 2.0 * 1.0 + 8.0 * 0.5, places=6)   # ¥2 + ¥4
+
+
+class ModeSystemTests(unittest.TestCase):
+    """模式系统：预设附加提示词 / 禁用工具 / 自定义模式新建与切换。"""
+
+    def _app(self, tmp: Path):
+        from harness.desktop import DesktopApp
+
+        with patch_model_build():
+            host = build_host(tmp)
+        host.profile.update_config(auto_title=False)
+        return host, DesktopApp(host)
+
+    def test_preset_mode_injects_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertTrue(app.set_mode("快速回答")["ok"])
+            agent = host.service("agent_factory")()
+            self.assertIn("快速回答模式", agent.instructions)
+            self.assertEqual(agent.tools.names(), [])   # 禁用工具 → 纯对话
+            # 回默认：工具恢复
+            self.assertTrue(app.set_mode("默认")["ok"])
+            agent2 = host.service("agent_factory")()
+            self.assertIn("write_file", agent2.tools.names())
+
+    def test_security_research_preset(self):
+        """安全研究预设：声明授权语境（不是越狱——明示不改变服务商策略）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            self.assertTrue(app.set_mode("安全研究")["ok"])
+            agent = host.service("agent_factory")()
+            self.assertIn("安全研究模式", agent.instructions)
+            self.assertIn("已授权", agent.instructions)
+            self.assertIn("不改变模型服务商自身的安全策略", agent.instructions)
+            # 工具照常可用（与默认一致）
+            self.assertIn("write_file", agent.tools.names())
+
+    def test_plan_preset_and_custom_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(Path(tmp))
+            r = app.save_user_modes([
+                {"name": "代码审查", "instructions": "逐条列出风险", "disable_tools": True},
+                {"name": "代码审查", "instructions": "重复名", "disable_tools": False},
+            ])
+            self.assertFalse(r["ok"])
+            self.assertIn("重复", r["error"])
+            # 预设名不可覆盖
+            self.assertFalse(app.save_user_modes(
+                [{"name": "计划", "instructions": "x"}])["ok"])
+            self.assertTrue(app.save_user_modes(
+                [{"name": "代码审查", "instructions": "逐条列出风险",
+                  "disable_tools": False}])["ok"])
+            cfg = host.profile.load_config()
+            self.assertEqual(cfg["user_modes"][0]["name"], "代码审查")
+            self.assertTrue(app.set_mode("代码审查")["ok"])
+            agent = host.service("agent_factory")()
+            self.assertIn("逐条列出风险", agent.instructions)
+            self.assertIn("代码审查 模式", agent.instructions)
+            # 删除当前模式 → 自动回默认
+            self.assertTrue(app.save_user_modes([])["ok"])
+            self.assertEqual(host.profile.load_config()["current_mode"], "默认")
+            # 不存在的模式拒绝切换
+            self.assertFalse(app.set_mode("不存在")["ok"])
+            self.assertTrue(app.set_mode("计划")["ok"])
+            agent3 = host.service("agent_factory")()
+            self.assertIn("计划模式", agent3.instructions)
+
+
 if __name__ == "__main__":
     unittest.main()

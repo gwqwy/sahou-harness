@@ -1,7 +1,10 @@
 r"""打包 exe：dist\sha.exe（命令行）+ dist\ShaDesktop.exe（桌面端，无控制台）。
 
 内置插件的 register.py 由 loader 按文件路径加载，必须以数据文件形式打包。
+default profile 的技能目录会一并打进 exe（bundled_skills）：skills 内置件在
+陌生环境首次启动时把缺失的技能播种进 profile，保证换机器技能不丢。
 """
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +18,22 @@ WORK = ROOT / "build_pyi"
 import nanoagent  # noqa: E402
 
 NANO_SRC = Path(nanoagent.__file__).resolve().parent.parent
+
+
+def stage_profile_skills() -> Path | None:
+    """把 default profile 的 skills 暂存到 build 目录，供 --add-data 使用。
+
+    没有该目录（干净构建机）时返回 None，exe 照常构建、只是不带内置技能。
+    """
+    src = Path.home() / ".sahou-harness" / "profiles" / "default" / "skills"
+    if not src.is_dir():
+        return None
+    stage = WORK / "bundled_skills_stage"
+    if stage.exists():
+        shutil.rmtree(stage)
+    shutil.copytree(src, stage)
+    return stage
+
 
 COMMON = [
     "--noconfirm", "--clean",
@@ -31,6 +50,13 @@ COMMON = [
     "--workpath", str(WORK),
     "--specpath", str(WORK),
 ]
+
+skills_stage = stage_profile_skills()
+if skills_stage is not None:
+    COMMON += ["--add-data", f"{skills_stage};bundled_skills"]
+    print(f"==> bundling profile skills ({skills_stage}) into exe")
+else:
+    print("==> no profile skills found; building without bundled skills")
 
 BUILDS = [
     ("sha", ["--onefile", str(ROOT / "tools" / "launcher_sha.py")]),

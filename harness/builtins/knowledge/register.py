@@ -58,9 +58,10 @@ def register(ctx) -> None:
         return state["kb"]
 
     def search_knowledge(query: str, k: int = 4) -> str:
-        """在本地知识库里检索与 query 最相关的片段，返回原文。
+        """在本地知识库里检索与 query 最相关的片段，返回原文与来源。
 
         回答「文档里怎么写的 / 之前是怎么约定的」这类问题前先用它，不要凭记忆作答。
+        引用了检索结果时，回复里必须用 [编号]（来源: 文件名） 标注出处。
 
         Args:
             query: 检索问题
@@ -81,10 +82,14 @@ def register(ctx) -> None:
             return f"错误：检索失败（{type(exc).__name__}: {exc}）"
         if not hits:
             return "知识库中没有找到相关内容。"
-        return "\n\n".join(
-            f"[{i + 1}] (相关度 {hit.get('score', 0):.3f}) {hit.get('text', '')}"
-            for i, hit in enumerate(hits)
-        )
+        lines = []
+        for i, hit in enumerate(hits):
+            meta = hit.get("metadata") or {}
+            source = str(meta.get("source") or "（未知）")
+            lines.append(f"[{i + 1}]（来源: {source}，相关度 {hit.get('score', 0):.3f}）\n"
+                         f"{hit.get('text', '')}")
+        lines.append("（回答引用以上内容时，请用 [编号]（来源: 文件名） 标注出处。）")
+        return "\n\n".join(lines)
 
     def _index_target(target: Path, kb) -> str:
         """对一个已解析的文件/目录执行索引（工具与桌面端服务共用）。"""

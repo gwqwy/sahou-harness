@@ -19,6 +19,7 @@ from nanoagent.llm import LLMResponse
 from test_harness import build_host, make_profile, patch_model_build, tool
 
 from harness.cli import build_runtime
+from harness.desktop import DesktopApp
 from harness.schedule_store import ScheduleError, add_task, due_tasks, load_tasks
 from harness.workspace import safe_image, safe_images
 
@@ -524,3 +525,232 @@ class SubagentReadonlyTests(unittest.TestCase):
             self.assertIn("read_file", names)
             self.assertNotIn("write_file", names)
             self.assertNotIn("run_command", names)
+
+
+class BundledSkillsSeedTests(unittest.TestCase):
+    """exe 内置技能池播种进 profile：补缺失、不覆盖已有、失败静默。"""
+
+    @staticmethod
+    def _make_skill(root: Path, name: str, body: str) -> None:
+        d = root / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} 技能\n---\n{body}",
+            encoding="utf-8")
+        (d / "ref.txt").write_text(f"ref of {name}", encoding="utf-8")
+
+    def test_seed_copies_missing_keeps_existing_idempotent(self):
+        from harness.builtins.skills.register import seed_bundled_skills
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            bundled = tmp / "bundled"
+            self._make_skill(bundled, "alpha", "A")
+            self._make_skill(bundled, "beta", "B")
+            profile = tmp / "profile" / "skills"
+            self._make_skill(profile, "beta", "用户已改过的 beta")
+
+            seeded = seed_bundled_skills(profile, bundled_root=bundled)
+            self.assertEqual(seeded, ["alpha"])
+            # alpha 整目录落地（含附属文件）
+            self.assertTrue((profile / "alpha" / "SKILL.md").exists())
+            self.assertEqual(
+                (profile / "alpha" / "ref.txt").read_text(encoding="utf-8"),
+                "ref of alpha")
+            # 已存在的 beta 原样保留
+            self.assertIn(
+                "用户已改过的 beta",
+                (profile / "beta" / "SKILL.md").read_text(encoding="utf-8"))
+            # 幂等：再次播种无事发生
+            self.assertEqual(seed_bundled_skills(profile, bundled_root=bundled), [])
+
+    def test_seed_missing_root_is_noop(self):
+        from harness.builtins.skills.register import seed_bundled_skills
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "skills"
+            self.assertEqual(
+                seed_bundled_skills(profile, bundled_root=Path(tmp) / "nope"), [])
+            self.assertFalse(profile.exists())
+
+    def test_register_seeds_before_add_dir(self):
+        """register(ctx)：先播种再声明目录，同一次启动即可见新技能。"""
+        from harness.builtins.skills.register import register as register_skills
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._make_skill(tmp / "bundled_skills", "gamma", "G")
+            profile_root = tmp / "profile"
+
+            added: list[str] = []
+
+            class _FakeSkills:
+                def add_dir(self, path):
+                    added.append(path)
+
+            class _Ctx:
+                host = type("H", (), {"profile": type(
+                    "P", (), {"root": str(profile_root)})()})()
+                skills = _FakeSkills()
+
+            # 模拟 PyInstaller 冻结环境：_MEIPASS 指向解包根
+            had_meipass = hasattr(sys, "_MEIPASS")
+            old_meipass = getattr(sys, "_MEIPASS", None)
+            sys._MEIPASS = str(tmp)
+            try:
+                register_skills(_Ctx())
+            finally:
+                if had_meipass:
+                    sys._MEIPASS = old_meipass
+                else:
+                    del sys._MEIPASS
+
+            self.assertEqual(added, [str(profile_root / "skills")])
+            self.assertTrue(
+                (profile_root / "skills" / "gamma" / "SKILL.md").exists())
+
+
+class MaxIterationsTests(unittest.TestCase):
+    """工具调用轮数上限：默认 10、可配置、非法值回退、范围钳制。"""
+
+    def test_max_iterations_config(self):
+        from harness.builtins.chat_loop.register import _max_iterations
+
+        self.assertEqual(_max_iterations({}), 10)
+        self.assertEqual(_max_iterations({"max_iterations": 25}), 25)
+        self.assertEqual(_max_iterations({"max_iterations": "40"}), 40)
+        self.assertEqual(_max_iterations({"max_iterations": "abc"}), 10)
+        self.assertEqual(_max_iterations({"max_iterations": 0}), 1)
+        self.assertEqual(_max_iterations({"max_iterations": 99999}), 200)
+
+
+class ScheduleBackflowTests(unittest.TestCase):
+    """定时任务结果回流：session 字段、set_task_session、write_back_result。"""
+
+    def test_add_task_with_session_and_set_session(self):
+        from harness.schedule_store import (add_task, load_tasks, remove_task,
+                                            set_task_session)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            try:
+                task = add_task(profile, "日报", 3600, "总结进展", session="s-1")
+                self.assertEqual(task["session"], "s-1")
+                self.assertTrue(set_task_session(profile, "日报", "s-2"))
+                self.assertEqual(load_tasks(profile)[0]["session"], "s-2")
+                self.assertTrue(set_task_session(profile, "日报", ""))  # 清空回流
+                self.assertEqual(load_tasks(profile)[0]["session"], "")
+                self.assertFalse(set_task_session(profile, "不存在", "s-9"))
+            finally:
+                remove_task(profile, "日报")
+
+    def test_write_back_result(self):
+        from harness.schedule_store import remove_task, write_back_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            try:
+                task = {"name": "巡检", "session": "s-back"}
+                # 目标会话不存在时 load 返回空历史 → 追加后落盘
+                out = write_back_result(profile, task, "一切正常")
+                self.assertEqual(out, {"session": "s-back"})
+                history = profile.load_session("s-back")
+                self.assertEqual([m["role"] for m in history], ["user", "assistant"])
+                self.assertIn("巡检", history[0]["content"])
+                self.assertEqual(history[1]["content"], "一切正常")
+                # 未配置 session → None
+                self.assertIsNone(
+                    write_back_result(profile, {"name": "x", "session": ""}, "hi"))
+                # 目标会话正在回答（busy）→ 跳过，不落盘
+                before = len(profile.load_session("s-back"))
+                out = write_back_result(profile, task, "第二条", is_busy=lambda s: True)
+                self.assertIsNone(out)
+                self.assertEqual(len(profile.load_session("s-back")), before)
+            finally:
+                remove_task(profile, "巡检")
+
+
+class NewFeatureApiTests(unittest.TestCase):
+    """第五十一批桌面端 API：技能开关 / 回流参数 / 自动压缩 / trace / 本地模型护栏。"""
+
+    def _app(self, tmp):
+        host = build_host(Path(tmp))
+        return host, DesktopApp(host)
+
+    def test_skill_toggle_flow(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(tmp)
+            # 造一个 profile 技能
+            skill_dir = Path(tmp) / "my-skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: my-skill\ndescription: 测试技能\n---\n正文", encoding="utf-8")
+            self.assertTrue(app.install_skill(str(skill_dir))["ok"])
+            names = {s["name"] for s in app.skills()["skills"]}
+            self.assertIn("my-skill", names)
+            # 禁用 → 列表带 disabled 标志 + config 落盘
+            self.assertTrue(app.set_skill_enabled("my-skill", False)["ok"])
+            listing = {s["name"]: s for s in app.skills()["skills"]}
+            self.assertTrue(listing["my-skill"]["disabled"])
+            cfg = json.loads((Path(host.profile.root) / "config.json").read_text(encoding="utf-8"))
+            self.assertIn("my-skill", cfg.get("disabled_skills") or [])
+            # 再启用
+            self.assertTrue(app.set_skill_enabled("my-skill", True)["ok"])
+            listing = {s["name"]: s for s in app.skills()["skills"]}
+            self.assertFalse(listing["my-skill"]["disabled"])
+
+    def test_schedule_set_session_via_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            self.assertTrue(app.schedule_add("体检", 3600, "报个平安")["ok"])
+            self.assertTrue(app.schedule_set_session("体检", "s-9")["ok"])
+            tasks = {t["name"]: t for t in app.schedules()["tasks"]}
+            self.assertEqual(tasks["体检"]["session"], "s-9")
+            self.assertTrue(app.schedule_set_session("体检", "")["ok"])
+
+    def test_auto_compact_toggle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            self.assertFalse(app.auto_compact_enabled()["enabled"])
+            self.assertTrue(app.set_auto_compact(True)["ok"])
+            self.assertTrue(app.auto_compact_enabled()["enabled"])
+            memory = app._config().get("memory") or {}
+            self.assertEqual(memory.get("type"), "summary")
+            self.assertTrue(app.set_auto_compact(False)["ok"])
+            self.assertEqual((app._config().get("memory") or {}).get("type"), "full")
+
+    def test_trace_days_empty_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            r = app.trace_days()
+            self.assertTrue(r["ok"])
+            self.assertEqual(r["days"], [])
+            self.assertEqual(app.trace_events("2026-09-30")["events"], [])
+            self.assertFalse(app.trace_events("../evil")["ok"])
+
+    def test_probe_local_models_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            self.assertFalse(app.probe_local_models("http://example.com/v1")["ok"])
+            self.assertFalse(app.probe_local_models("ftp://127.0.0.1:1")["ok"])
+            self.assertFalse(app.probe_local_models("")["ok"])
+
+    def test_ask_user_sink_without_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            # 无窗口（测试环境）：立即返回提示，绝不阻塞
+            out = app._ask_user_sink("选 A 还是 B？", "A|B", timeout=10)
+            self.assertIn("没有交互界面", out)
+            self.assertFalse(app.answer_ask_user("nope", "x")["ok"])
+            # 有等待者时 answer_ask_user 唤醒事件并带回答案
+            import threading as _th
+            event = _th.Event()
+            holder = {"answer": ""}
+            app._ask_waiters["au-test"] = (event, holder)
+            self.assertTrue(app.answer_ask_user("au-test", "用 B 方案")["ok"])
+            self.assertTrue(event.is_set())
+            self.assertEqual(holder["answer"], "用 B 方案")
+            # 回答一次后等待者被弹出，重复回答报不存在
+            self.assertFalse(app.answer_ask_user("au-test", "again")["ok"])

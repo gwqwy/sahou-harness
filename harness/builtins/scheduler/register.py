@@ -33,7 +33,7 @@ def register(ctx) -> None:
 
     def _build_runtime():
         """为任务执行构建一套独立运行时（模型 + 工具 + 技能），不复用主 agent。"""
-
+        from harness.builtins.chat_loop.register import _max_iterations
         from nanoagent import Agent
         from nanoagent.memory import Memory
         from nanoagent.skills import SkillRegistry
@@ -51,6 +51,7 @@ def register(ctx) -> None:
         rules = host.service("guardrails") or {}
         agent = Agent(name="定时任务", instructions="你是定时任务执行器：执行给定任务并给出简明结果。",
                       llm=llm, tools=host.collect_tools(), memory=Memory(),
+                      max_iterations=_max_iterations(host.profile.load_config()),
                       input_guardrails=rules.get("input") or None,
                       output_guardrails=rules.get("output") or None, tracer=None)
         if len(registry):
@@ -59,13 +60,35 @@ def register(ctx) -> None:
 
     def _run_task(task: dict) -> str:
         """执行一个任务，返回给日志的一行摘要。"""
+        from harness.schedule_store import write_back_result
+
         name = str(task.get("name"))
         started = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             agent = _build_runtime()
             result = agent.run(str(task.get("prompt") or ""), session_id=f"scheduled-{name}")
-            lines = [f"[{started}] 完成", str(result.content or "（空回复）"), ""]
-            summary = f"{name}: 完成（{len(str(result.content or ''))} 字）"
+            content = str(result.content or "（空回复）")
+            lines = [f"[{started}] 完成", content, ""]
+            summary = f"{name}: 完成（{len(content)} 字）"
+            # 结果回流：task.session 指定的会话追加本轮结果（桌面端可见）
+            back = None
+            try:
+                busy = getattr(host, "is_session_busy", None)
+                back = write_back_result(host.profile, task, content, is_busy=busy)
+            except Exception as exc:  # noqa: BLE001 —— 回流失败不影响任务本身
+                lines.append(f"（回流会话失败: {type(exc).__name__}: {exc}）")
+            if back:
+                # 会话文件已变：让 chat_loop 丢弃内存里的旧历史（下轮按盘回放）
+                reset = host.service("new_session")
+                if callable(reset):
+                    reset(str(back["session"]))
+                emit = getattr(host, "emit_agent_event", None)
+                if callable(emit):
+                    try:
+                        emit({"kind": "schedule_done", "task": name,
+                              "session": str(back["session"])})
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as exc:  # noqa: BLE001 —— 单个任务失败不能弄死调度线程
             lines = [f"[{started}] 失败：{type(exc).__name__}: {exc}", ""]
             summary = f"{name}: 失败（{type(exc).__name__}）"

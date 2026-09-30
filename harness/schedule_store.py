@@ -78,8 +78,11 @@ def validate_every(every: Any) -> int:
 
 
 def add_task(profile: Profile, name: str, every: int, prompt: str,
-             enabled: bool = True) -> dict[str, Any]:
-    """新增任务；重名拒绝（先 remove 再 add 才是改配置的正确路径）。"""
+             enabled: bool = True, session: str = "") -> dict[str, Any]:
+    """新增任务；重名拒绝（先 remove 再 add 才是改配置的正确路径）。
+
+    session 非空时，任务每次执行的结果会回写进该会话（结果回流）。
+    """
     clean = validate_name(name)
     interval = validate_every(every)
     text = str(prompt or "").strip()
@@ -89,10 +92,49 @@ def add_task(profile: Profile, name: str, every: int, prompt: str,
     if any(str(t.get("name")) == clean for t in tasks):
         raise ScheduleError(f"任务 '{clean}' 已存在（先 sha schedule remove {clean}）")
     task = {"name": clean, "every": interval, "prompt": text,
-            "enabled": bool(enabled), "last_run": 0.0, "created": time.time()}
+            "enabled": bool(enabled), "last_run": 0.0, "created": time.time(),
+            "session": str(session or "").strip()}
     tasks.append(task)
     save_tasks(profile, tasks)
     return task
+
+
+def set_task_session(profile: Profile, name: str, session: str) -> bool:
+    """设置/清除任务的结果回流会话（空串 = 只写日志不回流）。不存在返回 False。"""
+    clean = validate_name(name)
+    tasks = load_tasks(profile)
+    hit = False
+    for task in tasks:
+        if str(task.get("name")) == clean:
+            task["session"] = str(session or "").strip()
+            hit = True
+            break
+    if hit:
+        save_tasks(profile, tasks)
+    return hit
+
+
+def write_back_result(profile: Profile, task: dict[str, Any], content: str,
+                      is_busy=None) -> dict[str, Any] | None:
+    """把定时任务的执行结果回写进 task.session 指定的会话（结果回流）。
+
+    会话文件追加一组 user/assistant 消息；``is_busy(session_id)`` 返回 True 时
+    跳过——该会话正在流式回答，此刻落盘会被流结束时的整史覆盖。
+    返回 {"session": sid} 或 None（未配置/跳过）。
+    """
+    target = str((task or {}).get("session") or "").strip()
+    text = str(content or "").strip()
+    if not target or not text:
+        return None
+    if callable(is_busy) and is_busy(target):
+        return None
+    history = profile.load_session(target)
+    name = str((task or {}).get("name") or "定时任务")
+    history.append({"role": "user",
+                    "content": f"⏰ 定时任务「{name}」执行结果："})
+    history.append({"role": "assistant", "content": text})
+    profile.save_session(target, history)
+    return {"session": target}
 
 
 def remove_task(profile: Profile, name: str) -> bool:
