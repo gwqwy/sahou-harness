@@ -89,6 +89,15 @@ def register(ctx) -> None:
                               "session": str(back["session"])})
                     except Exception:  # noqa: BLE001
                         pass
+                # 通知中心：错过的回流可以在 🔔 面板里补看
+                try:
+                    from harness.notifications import push_notification
+
+                    push_notification(host.profile, "schedule",
+                                      f"定时任务「{name}」结果已写入会话",
+                                      str(back["session"]))
+                except Exception:  # noqa: BLE001 —— 通知失败不影响任务
+                    pass
         except Exception as exc:  # noqa: BLE001 —— 单个任务失败不能弄死调度线程
             lines = [f"[{started}] 失败：{type(exc).__name__}: {exc}", ""]
             summary = f"{name}: 失败（{type(exc).__name__}）"

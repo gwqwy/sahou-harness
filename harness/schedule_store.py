@@ -29,6 +29,9 @@ TASK_NAME_RE = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff
 MIN_EVERY_SECONDS = 1
 MAX_EVERY_SECONDS = 30 * 86400
 
+# 钟点制（kind="daily"）：每天在 at="HH:MM" 执行一次
+TIME_RE = re.compile(r"^(\d{1,2}):([0-5]\d)$")
+
 
 class ScheduleError(ValueError):
     """任务参数非法（名字不合法 / 间隔超界 / prompt 为空）。"""
@@ -77,23 +80,49 @@ def validate_every(every: Any) -> int:
     return value
 
 
+def normalize_at(at: str) -> str:
+    """校验并规整钟点 "H:MM" → "HH:MM"；非法抛 ScheduleError。"""
+    m = TIME_RE.match(str(at or "").strip())
+    if not m:
+        raise ScheduleError(f'时间格式应为 "HH:MM"（如 "09:30"），收到: {at!r}')
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def daily_target_ts(at: str, now: float) -> float:
+    """now 所在**本地日**的 at 时刻对应的时间戳（本地时区，含 DST 处理）。"""
+    hh, mm = normalize_at(at).split(":")
+    lt = time.localtime(now)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                        int(hh), int(mm), 0, 0, 0, -1))
+
+
 def add_task(profile: Profile, name: str, every: int, prompt: str,
-             enabled: bool = True, session: str = "") -> dict[str, Any]:
+             enabled: bool = True, session: str = "",
+             kind: str = "interval", at: str = "") -> dict[str, Any]:
     """新增任务；重名拒绝（先 remove 再 add 才是改配置的正确路径）。
 
+    kind="interval"：每 every 秒执行一次（既有行为）。
+    kind="daily"：每天 at（"HH:MM"）执行一次，every 忽略。
     session 非空时，任务每次执行的结果会回写进该会话（结果回流）。
     """
     clean = validate_name(name)
-    interval = validate_every(every)
     text = str(prompt or "").strip()
     if not text:
         raise ScheduleError("prompt 不能为空（到点要执行什么提示词？）")
+    kind_clean = str(kind or "interval").strip().lower()
+    task: dict[str, Any] = {"name": clean, "prompt": text,
+                            "enabled": bool(enabled), "last_run": 0.0,
+                            "created": time.time(),
+                            "session": str(session or "").strip()}
+    if kind_clean in ("daily", "clock", "每天"):
+        task["kind"] = "daily"
+        task["at"] = normalize_at(at)
+    else:
+        task["kind"] = "interval"
+        task["every"] = validate_every(every)
     tasks = load_tasks(profile)
     if any(str(t.get("name")) == clean for t in tasks):
         raise ScheduleError(f"任务 '{clean}' 已存在（先 sha schedule remove {clean}）")
-    task = {"name": clean, "every": interval, "prompt": text,
-            "enabled": bool(enabled), "last_run": 0.0, "created": time.time(),
-            "session": str(session or "").strip()}
     tasks.append(task)
     save_tasks(profile, tasks)
     return task
@@ -167,23 +196,35 @@ def set_task_enabled(profile: Profile, name: str, enabled: bool) -> bool:
 
 
 def due_tasks(tasks: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
-    """挑出到点应执行的任务（enabled 且 now - last_run >= every）。
+    """挑出到点应执行的任务（enabled 且到达触发条件）。
 
     纯函数，方便离线测试调度判定而不必真起线程。
+
+    - interval：now - last_run >= every（既有行为）
+    - daily：now 已过今天的 at 时刻，且 last_run 早于该时刻（每天最多一次，
+      错过（关机/停用）则下次运行时补跑一次）
     """
     due = []
     for task in tasks:
         if not task.get("enabled", True):
             continue
-        try:
-            every = validate_every(task.get("every"))
-        except ScheduleError:
-            continue  # 配置写坏的任务跳过，不拖垮调度线程
         last = task.get("last_run") or 0.0
         try:
             last = float(last)
         except (TypeError, ValueError):
             last = 0.0
+        if str(task.get("kind") or "interval").lower() == "daily":
+            try:
+                target = daily_target_ts(str(task.get("at") or ""), now)
+            except ScheduleError:
+                continue  # at 写坏的任务跳过，不拖垮调度线程
+            if now >= target and last < target:
+                due.append(task)
+            continue
+        try:
+            every = validate_every(task.get("every"))
+        except ScheduleError:
+            continue  # 配置写坏的任务跳过，不拖垮调度线程
         if now - last >= every:
             due.append(task)
     return due

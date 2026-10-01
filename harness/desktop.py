@@ -128,6 +128,8 @@ class DesktopApp:
         self._win_maximized = False  # 自绘标题栏的最大化/还原态
         threading.Thread(target=self._auto_backup_loop, daemon=True,
                          name="sha-auto-backup").start()
+        threading.Thread(target=self._global_hotkey_loop, daemon=True,
+                         name="sha-hotkey").start()
 
     # -- 自绘标题栏（frameless 窗口）------------------------------------------
     def _apply_frame_style(self) -> None:
@@ -183,6 +185,63 @@ class DesktopApp:
             return {"ok": True}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
+
+    def win_toggle_top(self) -> dict[str, Any]:
+        """窗口置顶开关（标题栏 📌）：Win32 HWND_TOPMOST / NOTOPMOST。"""
+        import ctypes
+
+        hwnd = self._win_hwnd()
+        if not hwnd:
+            return {"ok": False, "error": "窗口未就绪"}
+        self._win_top = not getattr(self, "_win_top", False)
+        user32 = ctypes.windll.user32
+        HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+        SWP_NOSIZE, SWP_NOMOVE = 0x1, 0x2
+        user32.SetWindowPos(hwnd,
+                            HWND_TOPMOST if self._win_top else HWND_NOTOPMOST,
+                            0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE)
+        self._push_stream_event({"kind": "win_top", "top": self._win_top})
+        return {"ok": True, "top": self._win_top}
+
+    def _win_hwnd(self) -> int:
+        try:
+            native = getattr(self._window, "native", None)
+            return int(native.Handle) if native is not None else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _global_hotkey_loop(self) -> None:
+        """系统级热键（默认 Ctrl+Alt+Space）唤起/收起窗口：守护线程 + 线程级热键。
+
+        config.hotkey_enabled=false 可关闭（重启生效）；热键被其他程序占用时放弃。
+        """
+        import ctypes
+        import ctypes.wintypes as wt
+
+        if self._config().get("hotkey_enabled") is False:
+            return
+        user32 = ctypes.windll.user32
+        MOD_CONTROL, MOD_ALT, VK_SPACE = 0x2, 0x1, 0x20
+        HOTKEY_ID = 0xB00B
+        WM_HOTKEY = 0x0312
+        # 注册到当前线程（None）：消息进入本线程队列，不打扰 UI 线程的 WndProc
+        if not user32.RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_SPACE):
+            return
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message != WM_HOTKEY:
+                continue
+            hwnd = self._win_hwnd()
+            if not hwnd:
+                continue
+            visible = bool(user32.IsWindowVisible(hwnd)) and not user32.IsIconic(hwnd)
+            foreground = user32.GetForegroundWindow() == hwnd
+            if visible and foreground:
+                user32.ShowWindowAsync(hwnd, 6)   # SW_MINIMIZE
+            else:
+                user32.ShowWindowAsync(hwnd, 9)   # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+        user32.UnregisterHotKey(None, HOTKEY_ID)
 
     # -- 内部工具 -----------------------------------------------------------
     @staticmethod
@@ -1245,12 +1304,14 @@ class DesktopApp:
         return {"ok": True, "session": sid, "model": model}
 
     def schedule_add(self, name: str, every: int, prompt: str,
-                     session: str = "") -> dict[str, Any]:
+                     session: str = "", kind: str = "interval",
+                     at: str = "") -> dict[str, Any]:
         from .schedule_store import ScheduleError, add_task
 
         try:
             task = add_task(self.host.profile, str(name or ""), int(every or 0),
-                            str(prompt or ""), session=str(session or ""))
+                            str(prompt or ""), session=str(session or ""),
+                            kind=str(kind or "interval"), at=str(at or ""))
         except (ScheduleError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "task": task}
@@ -1388,6 +1449,11 @@ class DesktopApp:
         try:
             emit({"kind": "ask_user", "id": qid,
                   "question": str(question or ""), "options": opts})
+            from .notifications import push_notification
+
+            push_notification(self.host.profile, "ask",
+                              "agent 提问：" + str(question or "")[:80],
+                              " | ".join(opts))
         except Exception:  # noqa: BLE001 —— 推送失败按无界面处理
             with self._ask_lock:
                 self._ask_waiters.pop(qid, None)
@@ -1783,6 +1849,191 @@ class DesktopApp:
         ok = bool(results) and all(not r["summary"].startswith("错误") for r in results)
         return {"ok": ok, "results": results}
 
+    # -- 通知中心 / 消息收藏夹 ------------------------------------------------------
+    def notifications(self) -> dict[str, Any]:
+        from .notifications import load_notifications, unread_count
+
+        items = load_notifications(self.host.profile)
+        for n in items:
+            n["icon"] = {"ask": "❓", "schedule": "⏰", "error": "⚠️"}.get(
+                str(n.get("kind")), "ℹ️")
+        return {"ok": True, "items": items,
+                "unread": unread_count(self.host.profile)}
+
+    def notifications_read(self, ids: list | None = None) -> dict[str, Any]:
+        from .notifications import mark_read
+
+        changed = mark_read(self.host.profile, ids)
+        return {"ok": True, "changed": changed}
+
+    def favorites(self) -> dict[str, Any]:
+        from .notifications import load_notifications as _load  # 复用 json 读法
+
+        path = Path(self.host.profile.root) / "favorites.json"
+        items: list[dict[str, Any]] = []
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                items = data if isinstance(data, list) else []
+            except (ValueError, OSError):
+                items = []
+        meta = self._config().get("sessions_meta") or {}
+        for f in items:
+            f["session_name"] = self._display_name(str(f.get("session") or ""),
+                                                   meta.get(str(f.get("session"))) or {})
+        return {"ok": True, "items": items}
+
+    def favorite_add(self, session_id: str, index: int) -> dict[str, Any]:
+        """收藏某会话的第 index 条可见消息（index 口径与界面 data-hi 一致）。"""
+        import time as _t
+
+        sid = str(session_id or "").strip() or self._current_session
+        history = self.host.profile.load_session(sid)
+        visible = self._visible_history(history)
+        try:
+            idx = int(index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"序号非法: {index}"}
+        if idx < 0 or idx >= len(visible):
+            return {"ok": False, "error": f"序号越界: {idx}"}
+        _, msg = visible[idx]
+        text = str(msg.get("content") or "").strip()
+        if not text:
+            return {"ok": False, "error": "空消息不能收藏"}
+        path = Path(self.host.profile.root) / "favorites.json"
+        items: list[dict[str, Any]] = []
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                items = data if isinstance(data, list) else []
+            except (ValueError, OSError):
+                items = []
+        fingerprint = f"{sid}:{idx}:{hash(text) % 100000}"
+        if any(str(f.get("id")) == fingerprint for f in items):
+            return {"ok": True, "duplicate": True}
+        items.insert(0, {"id": fingerprint, "session": sid, "index": idx,
+                         "snippet": text[:160].replace("\n", " "),
+                         "ts": _t.time()})
+        path.write_text(json.dumps(items[:100], ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        return {"ok": True}
+
+    def favorite_remove(self, fav_id: str) -> dict[str, Any]:
+        path = Path(self.host.profile.root) / "favorites.json"
+        if not path.is_file():
+            return {"ok": False, "error": "没有收藏"}
+        try:
+            items = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {"ok": False, "error": "收藏文件损坏"}
+        kept = [f for f in items if str(f.get("id")) != str(fav_id)]
+        if len(kept) == len(items):
+            return {"ok": False, "error": "收藏不存在"}
+        path.write_text(json.dumps(kept, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        return {"ok": True}
+
+    # -- 模型健康检查 / 测速 ---------------------------------------------------------
+    def models_ping(self) -> dict[str, Any]:
+        """逐个模型发一条探测消息，返回可用性与延迟（毫秒）。并发跑，超时 20s。"""
+        entries = [dict(m) for m in (self._config().get("models") or [])]
+        if not entries:
+            return {"ok": False, "error": "还没有配置模型"}
+        results: dict[str, dict[str, Any]] = {}
+        lock = threading.Lock()
+
+        def probe(entry: dict) -> None:
+            name = str(entry.get("name") or "")
+            try:
+                llm = _build_llm_safe(entry)
+                started = time.monotonic()
+                llm.chat([{"role": "user",
+                           "content": "连接测试，请只回复：ok"}])
+                ms = int((time.monotonic() - started) * 1000)
+                with lock:
+                    results[name] = {"ok": True, "ms": ms, "error": ""}
+            except Exception as exc:  # noqa: BLE001 —— 单模型失败不影响其余
+                with lock:
+                    results[name] = {"ok": False, "ms": 0,
+                                     "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+        def _build_llm_safe(entry: dict):
+            from .builtins.models.register import _build_llm
+
+            return _build_llm(entry)
+
+        threads = [threading.Thread(target=probe, args=(e,), daemon=True)
+                   for e in entries]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=25)
+        for e in entries:  # 超时兜底
+            name = str(e.get("name") or "")
+            results.setdefault(name, {"ok": False, "ms": 0, "error": "超时（25s）"})
+        return {"ok": True, "results": results}
+
+    # -- Git 智能提交（审查面板：生成提交信息 → 确认 → 提交） -------------------------
+    def git_prepare_commit(self) -> dict[str, Any]:
+        """暂存全部改动并让当前模型生成提交信息（不提交）。"""
+        if (self._config().get("git_permission") or "ask") == "deny":
+            return {"ok": False, "error": "git 已被禁用（权限：禁止）"}
+        code, out, _ = self._git_run("add", "-A")
+        if code != 0:
+            return {"ok": False, "error": out.strip() or "git add 失败（不是 git 仓库？）"}
+        code, stat, _ = self._git_run("diff", "--cached", "--stat")
+        if code != 0:
+            return {"ok": False, "error": stat.strip() or "git diff 失败"}
+        if not stat.strip():
+            return {"ok": False, "error": "没有可提交的改动"}
+        code, diff, _ = self._git_run("diff", "--cached")
+        if code != 0:
+            return {"ok": False, "error": "读取 diff 失败"}
+        runtime = self.host.service("models_runtime") or {}
+        pool = runtime.get("pool") or {}
+        llm = pool.get(runtime.get("current") or "")
+        message = ""
+        if callable(getattr(llm, "chat", None)):
+            prompt = ("根据下面的 git diff 写一条提交信息：第一行是不超过 50 字的中文"
+                      "概括（无句号/前缀），空一行后给 1-3 条要点。只输出提交信息本身。"
+                      f"\n\n变更统计：\n{stat[:800]}\n\n差异（截断）：\n{diff[:6000]}")
+            try:
+                resp = llm.chat([{"role": "user", "content": prompt}])
+                message = str(getattr(resp, "content", "") or "").strip()
+            except Exception:  # noqa: BLE001 —— 生成失败走兜底信息
+                message = ""
+        if not message:
+            files = [ln.split("|")[0].strip() for ln in stat.splitlines() if "|" in ln]
+            message = "更新 " + (", ".join(files[:3]) or "工作区文件") + \
+                (" 等文件" if len(files) > 3 else "")
+        return {"ok": True, "message": message, "stat": stat[:1200]}
+
+    def git_do_commit(self, message: str) -> dict[str, Any]:
+        message = str(message or "").strip()
+        if not message:
+            return {"ok": False, "error": "提交信息为空"}
+        code, out, _ = self._git_run("commit", "-m", message)
+        if code != 0:
+            return {"ok": False, "error": out.strip()[:400] or "git commit 失败"}
+        return {"ok": True, "message": message, "output": out.strip()[:400]}
+
+    # -- MCP 服务器预设模板 ------------------------------------------------------------
+    MCP_PRESETS: ClassVar[list[dict[str, str]]] = [
+        {"name": "filesystem", "desc": "工作区文件读写",
+         "command": "npx -y @modelcontextprotocol/server-filesystem <工作区路径>"},
+        {"name": "fetch", "desc": "网页抓取（转 Markdown）",
+         "command": "uvx mcp-server-fetch"},
+        {"name": "playwright", "desc": "浏览器自动化",
+         "command": "npx -y @playwright/mcp@latest"},
+        {"name": "memory", "desc": "长期记忆图谱",
+         "command": "npx -y @modelcontextprotocol/server-memory"},
+        {"name": "sqlite", "desc": "SQLite 数据库查询",
+         "command": "npx -y @modelcontextprotocol/server-sqlite --db-path <数据库路径>"},
+    ]
+
+    def mcp_presets(self) -> dict[str, Any]:
+        return {"ok": True, "presets": [dict(p) for p in self.MCP_PRESETS]}
+
     # -- 模式系统（预设 + 用户自定义） ---------------------------------------------
     PRESET_MODES = (
         {"name": "默认", "desc": "标准工作模式（读写文件、跑命令，按需工具）"},
@@ -1790,6 +2041,7 @@ class DesktopApp:
         {"name": "快速回答", "desc": "纯对话：不调用工具，直接给简洁答案"},
         {"name": "只读分析", "desc": "只阅读分析给建议，不写文件、不执行有副作用的命令"},
         {"name": "安全研究", "desc": "授权安全工作语境：防御分析/授权渗透测试/CTF/样本分析（声明语境，不改变服务商策略）"},
+        {"name": "知识库问答", "desc": "强制先查知识库，只按检索内容作答并标注出处；没有的明确说未涵盖"},
     )
 
     def get_modes(self) -> dict[str, Any]:
@@ -1930,6 +2182,14 @@ class DesktopApp:
                         "session": session_id,
                     })
             except Exception as exc:  # noqa: BLE001 —— 错误回到界面而不是崩窗口
+                from .notifications import push_notification
+
+                try:
+                    push_notification(self.host.profile, "error",
+                                      "对话出错：" + str(exc)[:80],
+                                      f"会话 {session_id}")
+                except Exception:  # noqa: BLE001
+                    pass
                 self._push_stream_event({"kind": "done", "ok": False,
                                          "error": str(exc), "session": session_id})
             finally:

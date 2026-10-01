@@ -21,10 +21,22 @@ harness 却一直没接 —— agent 面对「我们内部文档里怎么写的�
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".rst", ".csv", ".sahou"}
 MAX_INDEX_FILES = 200
+
+
+def _file_meta(item) -> dict:
+    """索引元数据：来源名 + 完整路径 + mtime（自动重索引的变化依据）。"""
+    import os
+
+    try:
+        mtime = os.path.getmtime(item)
+    except OSError:
+        mtime = 0.0
+    return {"source": item.name, "path": str(item), "mtime": mtime}
 
 
 def register(ctx) -> None:
@@ -117,7 +129,7 @@ def register(ctx) -> None:
             if text is None:
                 continue
             try:
-                count = kb.add_text(text, {"source": item.name})
+                count = kb.add_text(text, _file_meta(item))
             except Exception as exc:  # noqa: BLE001 —— 单个文件失败不放弃整批
                 failures.append(f"{item.name}: {type(exc).__name__}")
                 break  # 多半是网络/密钥问题，继续试也只会一路失败
@@ -180,7 +192,7 @@ def register(ctx) -> None:
             if text is None:
                 continue
             try:
-                count = kb.add_text(text, {"source": item.name})
+                count = kb.add_text(text, _file_meta(item))
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"{item.name}: {type(exc).__name__}")
                 break
@@ -234,6 +246,79 @@ def register(ctx) -> None:
         """列出已索引的来源文件与各自片段数（供界面做细粒度管理）。"""
         return _sources_payload()
 
+    # -- 自动重索引：来源文件变化后自动刷新对应片段 -------------------------------
+    import threading
+
+    reindex_stop = threading.Event()
+
+    def _reindex_changed() -> int:
+        """检查内存库中带 path 的来源，mtime 变了的整源重索引。返回刷新的文件数。"""
+        kb = state["kb"]
+        if kb is None or len(kb.store) == 0:
+            return 0
+        latest: dict[str, tuple[float, str]] = {}  # path → (mtime, source)
+        for meta in kb.store.metadata:
+            path = str((meta or {}).get("path") or "")
+            if not path:
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue  # 文件被删/暂不可达：保留旧索引，不报错
+            latest[path] = (mtime, str((meta or {}).get("source") or path))
+        changed = []
+        for path, (mtime, source) in latest.items():
+            stored = next((float((m or {}).get("mtime") or 0)
+                           for m in kb.store.metadata
+                           if str((m or {}).get("path") or "") == path), 0.0)
+            if mtime > stored:
+                changed.append((path, source))
+        if not changed:
+            return 0
+        from harness.workspace import read_text_file
+
+        for path, source in changed:
+            keep = [i for i, m in enumerate(kb.store.metadata)
+                    if str((m or {}).get("source") or "") != source]
+            kb.store.texts = [kb.store.texts[i] for i in keep]
+            kb.store.metadata = [kb.store.metadata[i] for i in keep]
+            if kb.store.vectors is not None:
+                kb.store.vectors = kb.store.vectors[keep] if keep else None
+            item = Path(path)
+            text = read_text_file(item)
+            if text is not None:
+                try:
+                    kb.add_text(text, _file_meta(item))
+                except Exception:  # noqa: BLE001 —— 单文件失败保留删除后的状态
+                    pass
+        try:
+            kb.save()
+        except Exception:  # noqa: BLE001 —— 落盘失败下次再试
+            pass
+        return len(changed)
+
+    def _reindex_worker() -> None:
+        interval_min = 10
+        try:
+            interval_min = int((settings.get("auto_reindex_minutes") or 10))
+        except (TypeError, ValueError):
+            interval_min = 10
+        if interval_min <= 0:
+            return  # 0 = 关闭自动重索引
+        while not reindex_stop.wait(max(60, interval_min * 60)):
+            try:
+                _reindex_changed()
+            except Exception:  # noqa: BLE001 —— 后台刷新失败不影响主流程
+                pass
+
+    def _start_reindex():
+        thread = threading.Thread(target=_reindex_worker, daemon=True,
+                                  name="sha-kb-reindex")
+        thread.start()
+        return reindex_stop.set
+
+    ctx.effect(_start_reindex)
+
     def knowledge_remove_source(name: str) -> str:
         """从知识库里删除某个来源文件的全部片段（其余来源保留），并落盘。"""
         target = str(name or "").strip()
@@ -286,6 +371,11 @@ def register(ctx) -> None:
         info: dict = {"backend": str(settings.get("backend") or "numpy"),
                       "dir": str(index_dir),
                       "embedding_model": str(settings.get("embedding_model") or "")}
+        try:
+            interval_min = int((settings.get("auto_reindex_minutes") or 10))
+        except (TypeError, ValueError):
+            interval_min = 10
+        info["auto_reindex_minutes"] = max(0, interval_min)
         if state["kb"] is not None:
             info["chunks"] = len(state["kb"].store)
             return info
