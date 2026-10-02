@@ -81,9 +81,9 @@ def validate_every(every: Any) -> int:
 
 
 def normalize_at(at: str) -> str:
-    """校验并规整钟点 "H:MM" → "HH:MM"；非法抛 ScheduleError。"""
+    """校验并规整钟点 "H:MM" → "HH:MM"；非法（含小时 >23）抛 ScheduleError。"""
     m = TIME_RE.match(str(at or "").strip())
-    if not m:
+    if not m or not 0 <= int(m.group(1)) <= 23:
         raise ScheduleError(f'时间格式应为 "HH:MM"（如 "09:30"），收到: {at!r}')
     return f"{int(m.group(1)):02d}:{m.group(2)}"
 

@@ -224,6 +224,77 @@ class _EventTracer:
             pass
 
 
+def _filter_disabled_tools(tools: list, config: dict) -> list:
+    """按 config.disabled_tools 过滤工具（桌面端「通用 → Agent 工具」开关）。"""
+    disabled = config.get("disabled_tools")
+    if not isinstance(disabled, list) or not disabled:
+        return tools
+    banned = {str(x) for x in disabled}
+    return [t for t in tools if getattr(t, "name", "") not in banned]
+
+
+_DISTILL_STATE = {"rounds": 0}
+
+
+def _maybe_distill(host, session_id: str) -> None:
+    """长期记忆自动沉淀：每 N 轮（config.memory_distill.every_rounds，默认 8）在后台
+    让模型从最近对话提炼「值得长期记住」的要点，写成建议稿（memory_suggest.json）
+    并推一条通知——采纳与否由用户在 🧠 记忆面板决定，绝不静默改写 memory.md。
+
+    默认**关闭**（config.memory_distill.enabled=true 显式开启）：它会在对话外
+    额外发一次 LLM 请求，是否接受这份开销由用户决定。
+    """
+    import json
+    import threading
+    import time
+    from pathlib import Path
+
+    try:
+        cfg = host.profile.load_config()
+        md = cfg.get("memory_distill") if isinstance(cfg.get("memory_distill"), dict) else {}
+        if md.get("enabled") is not True:
+            return
+        every = max(1, int(md.get("every_rounds") or 8))
+    except Exception:  # noqa: BLE001
+        return
+    _DISTILL_STATE["rounds"] += 1
+    if (_DISTILL_STATE["rounds"] - 1) % every:
+        return
+
+    def work() -> None:
+        try:
+            runtime = host.service("models_runtime") or {}
+            llm = (runtime.get("pool") or {}).get(runtime.get("current") or "")
+            if llm is None or not callable(getattr(llm, "chat", None)):
+                return
+            history = host.profile.load_session(session_id)
+            transcript = "\n".join(
+                f"{m.get('role')}: {str(m.get('content') or '')[:400]}"
+                for m in history[-12:] if str(m.get("content") or "").strip())
+            if not transcript:
+                return
+            prompt = ("从下面的对话里提炼「值得长期记住」的信息：用户的偏好、稳定事实、"
+                      "项目关键结论。没有值得记的就只输出：无。每条一行、不超过 8 条，"
+                      "不要寒暄和过程性内容。\n\n对话：\n" + transcript[:6000])
+            text = str(llm.chat([{"role": "user", "content": prompt}]).content or "").strip()
+            if not text or text in ("无", "无。"):
+                return
+            suggest = {"text": text[:2000], "ts": time.time(),
+                       "session": session_id}
+            path = Path(host.profile.root) / "memory_suggest.json"
+            path.write_text(json.dumps(suggest, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            from harness.notifications import push_notification
+
+            push_notification(host.profile, "info",
+                              "记忆沉淀建议已生成（🧠 面板可采纳）",
+                              text.splitlines()[0][:80] if text else "")
+        except Exception:  # noqa: BLE001 —— 沉淀失败绝不影响对话
+            pass
+
+    threading.Thread(target=work, daemon=True, name="sha-distill").start()
+
+
 def _max_iterations(config: dict) -> int:
     """单轮回答允许的最大 模型↔工具 循环数（config.max_iterations，默认 10）。
 
@@ -475,6 +546,8 @@ def register(ctx) -> None:
             make_tracer = (host.service("tracing") or {}).get("new_tracer")
 
             tools = host.collect_tools()
+            # 工具黑白名单：config.disabled_tools 里的工具名不进 agent
+            tools = _filter_disabled_tools(tools, config)
             # ask_user：agent 主动向用户提问（config.ask_user=false 关闭）
             if config.get("ask_user") is not False:
                 tools = [*tools, _make_ask_user_tool()]
@@ -625,6 +698,7 @@ def register(ctx) -> None:
         reply = result.content or ""
         if hook_text:
             reply += hook_text
+        _maybe_distill(host, session_id)
         return {"reply": reply, "reasoning": getattr(result, "reasoning", ""),
                 "tool_calls": result.tool_calls,
                 "model": runtime.get("current", ""), "usage": result.usage}
@@ -665,6 +739,7 @@ def register(ctx) -> None:
                           getattr(final_result, "usage", None) or {},
                           fallback=_estimate_usage(agent, session_id, message,
                                                    final_result.content or ""))
+            _maybe_distill(host, session_id)
 
     def new_session(session_id: str | None = None) -> str:
         """开始一个新会话，返回新的会话 id（旧会话历史仍保留在磁盘上）。

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import sys
 import threading
@@ -32,6 +33,20 @@ MARKET_URL = ("https://raw.githubusercontent.com/awesome-dsh-plugin/"
               "awesome-dsh-plugin/main/README.zh.md")
 # 权限确认对话框的最长等待（秒）：超时按「拒绝」处理
 CONFIRM_TIMEOUT = 120.0
+
+
+def _apply_proxy_env(proxy: str) -> None:
+    """把配置里的代理写进进程环境：urllib/requests 默认会读取这些变量，
+    模型请求与知识库 embeddings 随之走代理。localhost 不走代理。"""
+    import os
+
+    if proxy:
+        os.environ["HTTP_PROXY"] = proxy
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+    else:
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
 
 
 def _validate_url(url: str) -> str:
@@ -126,10 +141,12 @@ class DesktopApp:
         # 定时任务回流前检查目标会话是否正在回答（流式结束会整史落盘，避免互相覆盖）
         host.is_session_busy = self._busy_sessions.__contains__
         self._win_maximized = False  # 自绘标题栏的最大化/还原态
+        self._remote = None          # 远程访问 HTTP 服务（remote_save 时惰性创建）
         threading.Thread(target=self._auto_backup_loop, daemon=True,
                          name="sha-auto-backup").start()
-        threading.Thread(target=self._global_hotkey_loop, daemon=True,
-                         name="sha-hotkey").start()
+        # 全局热键线程不在 __init__ 启动：测试会构造大量 DesktopApp，
+        # 线程立刻读 config.json 会与测试的原子写竞态（WinError 32）
+        # —— 改在 desktop() 入口、窗口就绪后启动。
 
     # -- 自绘标题栏（frameless 窗口）------------------------------------------
     def _apply_frame_style(self) -> None:
@@ -1809,6 +1826,21 @@ class DesktopApp:
             reset()
         return {"ok": True, "value": n}
 
+    # -- 记忆沉淀开关（默认关；开启后每 N 轮提炼建议） --------------------------------
+    def get_memory_distill(self) -> dict[str, Any]:
+        md = self._config().get("memory_distill") or {}
+        return {"ok": True, "enabled": md.get("enabled") is True,
+                "every_rounds": int(md.get("every_rounds") or 8)}
+
+    def set_memory_distill(self, enabled: bool) -> dict[str, Any]:
+        md = self._config().get("memory_distill")
+        md = dict(md) if isinstance(md, dict) else {}
+        md["enabled"] = bool(enabled)
+        md.setdefault("every_rounds", 8)
+        self.host.profile.update_config(memory_distill=md)
+        return {"ok": True, "enabled": bool(enabled),
+                "note": "开启后每 8 轮在后台提炼一次，建议出现在 🧠 面板"}
+
     # -- 长会话自动压缩（SummaryMemory 一键开关） -----------------------------------
     def auto_compact_enabled(self) -> dict[str, Any]:
         memory = self._config().get("memory") or {}
@@ -2033,6 +2065,264 @@ class DesktopApp:
 
     def mcp_presets(self) -> dict[str, Any]:
         return {"ok": True, "presets": [dict(p) for p in self.MCP_PRESETS]}
+
+    # -- 远程访问（手机配对） ---------------------------------------------------------
+    def remote_status(self) -> dict[str, Any]:
+        from .remote import remote_config
+
+        remote = remote_config(self.host.profile)
+        running = bool(self._remote and self._remote.is_running())
+        import socket
+
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            lan_ip = "<本机IP>"
+        return {"ok": True, "enabled": bool(remote.get("enabled")),
+                "bind": str(remote.get("bind") or "127.0.0.1"),
+                "port": int(remote.get("port") or 8741),
+                "token": str(remote.get("token") or ""),
+                "running": running,
+                "lan_ip": lan_ip}
+
+    def remote_save(self, enabled: bool, bind: str = "127.0.0.1",
+                    port: int = 8741, regenerate_token: bool = False) -> dict[str, Any]:
+        """保存远程访问设置并即时生效（开启则启动监听，关闭则停）。"""
+        import secrets
+
+        from .remote import RemoteServer, remote_config
+
+        remote = remote_config(self.host.profile)
+        bind = str(bind or "127.0.0.1").strip()
+        if bind not in ("127.0.0.1", "0.0.0.0", "localhost"):
+            return {"ok": False, "error": "bind 仅支持 127.0.0.1 / 0.0.0.0"}
+        try:
+            port = int(port or 8741)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "端口必须是数字"}
+        if not 1024 <= port <= 65535:
+            return {"ok": False, "error": "端口需在 1024~65535 之间"}
+        remote["enabled"] = bool(enabled)
+        remote["bind"] = "127.0.0.1" if bind == "localhost" else bind
+        remote["port"] = port
+        if regenerate_token or not remote.get("token"):
+            remote["token"] = secrets.token_hex(6)
+        self.host.profile.update_config(remote=remote)
+        if self._remote is None:
+            self._remote = RemoteServer(self)
+        if remote["enabled"]:
+            result = self._remote.start()
+            if not result.get("ok"):
+                return result
+            return {"ok": True, **remote, "running": True}
+        self._remote.stop()
+        return {"ok": True, **remote, "running": False}
+
+    # -- 记忆沉淀建议（🧠 面板采纳/丢弃） ---------------------------------------------
+    def memory_suggestion(self) -> dict[str, Any]:
+        path = Path(self.host.profile.root) / "memory_suggest.json"
+        if not path.is_file():
+            return {"ok": True, "suggestion": None}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {"ok": True, "suggestion": data}
+        except (ValueError, OSError):
+            return {"ok": True, "suggestion": None}
+
+    def memory_accept_suggestion(self) -> dict[str, Any]:
+        from .config import atomic_write_text
+
+        path = Path(self.host.profile.root) / "memory_suggest.json"
+        if not path.is_file():
+            return {"ok": False, "error": "没有待采纳的建议"}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "建议为空"}
+        memory_path = Path(self.host.profile.root) / "memory.md"
+        old = memory_path.read_text(encoding="utf-8") if memory_path.is_file() else ""
+        stamp = time.strftime("%Y-%m-%d")
+        atomic_write_text(memory_path,
+                          (old.rstrip() + f"\n\n## 沉淀（{stamp}）\n{text}\n").lstrip())
+        path.unlink(missing_ok=True)
+        reset = self.host.service("reset_agent")
+        if callable(reset):
+            reset()
+        return {"ok": True}
+
+    def memory_discard_suggestion(self) -> dict[str, Any]:
+        path = Path(self.host.profile.root) / "memory_suggest.json"
+        path.unlink(missing_ok=True)
+        return {"ok": True}
+
+    # -- 会话历史编辑器（改写某条可见消息的内容） --------------------------------------
+    def session_edit_text(self, session_id: str, index: int,
+                          new_text: str) -> dict[str, Any]:
+        sid = str(session_id or "").strip() or self._current_session
+        history = self.host.profile.load_session(sid)
+        raw = self._visible_pos(history, index)
+        if raw is None:
+            return {"ok": False, "error": f"序号越界: {index}"}
+        new_text = str(new_text or "")
+        if not new_text.strip():
+            return {"ok": False, "error": "内容不能为空（删除请用「删除此条」）"}
+        history[raw]["content"] = new_text
+        self.host.profile.save_session(sid, history)
+        reset = self.host.service("new_session")
+        if callable(reset):
+            reset(sid)
+        return {"ok": True, "session": sid}
+
+    # -- 工具黑白名单 ------------------------------------------------------------------
+    def tools_list(self) -> dict[str, Any]:
+        disabled = {str(x) for x in (self._config().get("disabled_tools") or [])}
+        names = sorted({getattr(t, "name", "?") for t in self.host.collect_tools()})
+        return {"ok": True,
+                "tools": [{"name": n, "disabled": n in disabled} for n in names]}
+
+    def set_tool_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "error": "缺少工具名"}
+        config = self._config()
+        disabled = [str(x) for x in (config.get("disabled_tools") or []) if str(x)]
+        if enabled and name in disabled:
+            disabled.remove(name)
+        elif not enabled and name not in disabled:
+            disabled.append(name)
+        self.host.profile.update_config(disabled_tools=disabled)
+        reset = self.host.service("reset_agent")
+        if callable(reset):
+            reset()
+        return {"ok": True, "name": name, "enabled": bool(enabled)}
+
+    # -- 截图提问（全屏抓取，前端框选裁剪） ---------------------------------------------
+    def screenshot_capture(self) -> dict[str, Any]:
+        """抓取整个虚拟屏幕为 PNG data URL（System.Drawing，无新增依赖）。"""
+        import base64
+        import tempfile
+
+        try:
+            import clr  # pythonnet（pywebview winforms 已随装）
+
+            clr.AddReference("System.Windows.Forms")
+            clr.AddReference("System.Drawing")
+            from System.Drawing import Bitmap, Graphics, Imaging
+            from System.Windows.Forms import Screen
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"截图组件不可用: {exc}"}
+        try:
+            bounds = Screen.PrimaryScreen.Bounds
+            width, height = int(bounds.Width), int(bounds.Height)
+            bmp = Bitmap(width, height)
+            g = Graphics.FromImage(bmp)
+            g.CopyFromScreen(0, 0, 0, 0, bmp.Size)
+            g.Dispose()
+            tmp = Path(tempfile.gettempdir()) / f"sha-shot-{time.time_ns()}.png"
+            bmp.Save(str(tmp), Imaging.ImageFormat.Png)
+            bmp.Dispose()
+            data = tmp.read_bytes()
+            tmp.unlink(missing_ok=True)
+            return {"ok": True, "data_url": "data:image/png;base64,"
+                    + base64.b64encode(data).decode("ascii"),
+                    "w": width, "h": height}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # -- Office/PDF 拖入对话：抽取文本 ---------------------------------------------------
+    def drop_extract(self, path: str) -> dict[str, Any]:
+        p = Path(str(path or "").strip().strip('"'))
+        allowed = {".docx": "docx", ".xlsx": "xlsx", ".pptx": "pptx"}
+        if p.suffix.lower() not in allowed:
+            return {"ok": False, "error": f"不支持的类型 {p.suffix or '(无扩展名)'}"}
+        try:
+            if p.stat().st_size > 50 * 1024 * 1024:
+                return {"ok": False, "error": "文件超过 50MB"}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        kind = allowed[p.suffix.lower()]
+        try:
+            if kind == "docx":
+                text = self._docx_text(str(p))
+            elif kind == "xlsx":
+                text = self._xlsx_text(str(p))
+            else:
+                text = self._pptx_text(str(p))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"解析失败: {type(exc).__name__}: {exc}"}
+        text = str(text or "").strip()
+        if not text:
+            return {"ok": False, "error": "没有解析出文本"}
+        return {"ok": True, "name": p.name, "text": text[:40000]}
+
+    # -- 网络代理 --------------------------------------------------------------------------
+    def get_proxy(self) -> dict[str, Any]:
+        return {"ok": True, "proxy": str(self._config().get("proxy") or "")}
+
+    def set_proxy(self, proxy: str) -> dict[str, Any]:
+        import os
+
+        proxy = str(proxy or "").strip()
+        if proxy and "://" not in proxy:
+            proxy = "http://" + proxy
+        if proxy and not proxy.startswith(("http://", "https://", "socks5://")):
+            return {"ok": False, "error": "代理格式如 http://127.0.0.1:7890"}
+        self.host.profile.update_config(proxy=proxy)
+        _apply_proxy_env(proxy)
+        return {"ok": True, "proxy": proxy,
+                "note": "已生效（对本进程后续的模型/知识库请求）"}
+
+    # -- 桌面端新建技能 ----------------------------------------------------------------------
+    def create_skill(self, name: str) -> dict[str, Any]:
+        import re
+
+        clean = str(name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\u4e00-\u9fff][A-Za-z0-9._\-\u4e00-\u9fff]{0,39}", clean):
+            return {"ok": False, "error": "技能名只允许中英文/数字/._-，1~40 字符"}
+        root = self._profile_skills_dir() / clean
+        if root.exists():
+            return {"ok": False, "error": f"技能「{clean}」已存在"}
+        root.mkdir(parents=True)
+        template = (
+            f"---\nname: {clean}\ndescription: （一句话说明这个技能做什么、什么时候用）\n---\n\n"
+            f"# {clean}\n\n"
+            "在这里写给模型看的操作说明：\n\n"
+            "## 步骤\n\n1. …\n2. …\n\n"
+            "## 注意\n\n- …\n")
+        (root / "SKILL.md").write_text(template, encoding="utf-8")
+        return {"ok": True, "name": clean, "path": str(root / "SKILL.md"),
+                "note": "模板已生成，编辑 description 与正文后新会话生效"}
+
+    # -- 启动自检 --------------------------------------------------------------------------------
+    def self_check(self) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        config = self._config()
+        models = config.get("models") or []
+        placeholder = any(str(m.get("api_key") or "").strip() in ("sk-...", "sk-xxx")
+                          for m in models if isinstance(m, dict))
+        items.append({"name": "模型配置",
+                      "ok": bool(models) and not placeholder,
+                      "detail": f"{len(models)} 个模型" + ("（含示例占位 Key）" if placeholder else "")})
+        ws = self.host.workspace
+        items.append({"name": "工作区", "ok": bool(ws) and Path(ws).is_dir(),
+                      "detail": str(ws or "（未选择）")})
+        skills = self.skills()
+        items.append({"name": "技能", "ok": skills.get("ok"),
+                      "detail": f"{len(skills.get('skills') or [])} 个已加载"})
+        mcp = config.get("mcpServers") or {}
+        items.append({"name": "MCP", "ok": True,
+                      "detail": f"{len(mcp)} 个已配置" + ("（连接状态用「测试」按钮）" if mcp else "")})
+        kb = config.get("knowledge") or {}
+        items.append({"name": "知识库",
+                      "ok": kb.get("enabled") is not False,
+                      "detail": "启用" if kb.get("enabled") is not False else "未启用"})
+        sessions = self.host.profile.session_ids()
+        items.append({"name": "会话数据", "ok": True,
+                      "detail": f"{len(sessions)} 个会话"})
+        return {"ok": True, "items": items}
 
     # -- 模式系统（预设 + 用户自定义） ---------------------------------------------
     PRESET_MODES = (
@@ -3870,18 +4160,18 @@ html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
             white-space:pre-wrap; word-break:break-word; }
 .cmp-err { color:var(--err); }
 /* 统一控件外观：等高胶囊、elev 底、悬停上浮—— badges / 图标按钮 / 下拉 */
-.badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #cmpBtn {
+.badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #cmpBtn, #shotBtn {
   background:var(--elev); border:1px solid var(--line-soft); color:var(--dim);
   border-radius:999px; padding:5px 12px; height:28px; font-size:11.5px;
   cursor:pointer; white-space:nowrap;
   transition:color .15s, border-color .15s, background .15s, transform .12s; }
 .badge:hover, #ctxBtn:hover, #imgBtn:hover, #sideBtn:hover,
-#snipBtn:hover, #cmpBtn:hover { color:var(--fg); border-color:var(--line); transform:translateY(-1px); }
+#snipBtn:hover, #cmpBtn:hover, #shotBtn:hover { color:var(--fg); border-color:var(--line); transform:translateY(-1px); }
 /* 权限徽标与模型选择允许收缩（收缩时省略号），其余按钮永不压缩 */
 #permBadge { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
 .badge.allow { color:var(--ok); border-color:rgba(92,198,137,.45); }
 .badge.deny  { color:var(--err); border-color:rgba(239,123,109,.45); }
-#ctxBtn:hover, #imgBtn:hover, #snipBtn:hover, #cmpBtn:hover { color:var(--accent); }
+#ctxBtn:hover, #imgBtn:hover, #snipBtn:hover, #cmpBtn:hover, #shotBtn:hover { color:var(--accent); }
 #sideBtn.off { color:var(--faint); }
 /* 下拉：自定义箭头 + 胶囊外观（与按钮统一）；模式下拉一并纳入 */
 #modelSel, #thinkSel, #modeSel { flex:0 1 auto; min-width:70px; max-width:170px;
@@ -3924,10 +4214,66 @@ body.side-hidden #sideFloat { display:flex; }
 .tb-actions { display:flex; align-items:stretch; flex:none; }
 .tb-actions button { width:44px; border:none; background:transparent;
                      color:var(--dim); font-size:12px; cursor:pointer;
+                     position:relative;
                      transition:background .12s, color .12s; }
 .tb-actions button:hover { background:var(--hover); color:var(--fg); }
 .tb-actions .tb-close:hover { background:var(--err); color:#fff; }
+.tb-actions button.on { color:var(--accent); }
 body.win-max #tbMax { font-size:10px; }
+/* 标题栏铃铛未读角标 */
+#bellBadge { position:absolute; top:3px; right:5px; min-width:14px; height:14px;
+             border-radius:7px; background:var(--err); color:#fff; font-size:9px;
+             display:none; align-items:center; justify-content:center;
+             padding:0 3px; line-height:1; }
+/* 标题栏弹出面板：通知中心 / 收藏夹 */
+.tb-pop { display:none; position:fixed; top:44px; right:10px; width:340px;
+          max-width:88vw; max-height:62vh; overflow-y:auto; z-index:48;
+          background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; padding:8px;
+          box-shadow:0 12px 34px var(--shadow); animation:pop .16s ease; }
+.tb-pop.open { display:block; }
+.tb-pop .np-head { display:flex; align-items:center; padding:4px 6px 8px;
+                   font-weight:700; font-size:13px; }
+.tb-pop .np-head .sp { flex:1; }
+.tb-pop .np-row { border-bottom:1px solid var(--line-soft); padding:7px 6px;
+                  font-size:12.5px; cursor:pointer; }
+.tb-pop .np-row:hover { background:var(--hover); }
+.tb-pop .np-row.unread { border-left:2px solid var(--accent); }
+.tb-pop .np-row .np-title { font-weight:600; margin-bottom:2px; }
+.tb-pop .np-row .np-body { color:var(--dim); font-size:11.5px; overflow:hidden;
+                           text-overflow:ellipsis; white-space:nowrap; }
+.tb-pop .np-row .np-time { float:right; color:var(--faint); font-size:10.5px; }
+/* 回复字号（外观页可调） */
+:root { --msg-size: 14px; }
+.msg .md-body, .msg.user { font-size: var(--msg-size); }
+
+/* 历史消息编辑器 + 截图选区 */
+#histEditor { display:none; position:fixed; inset:0; z-index:52;
+              background:rgba(6,8,18,.6); }
+#histEditor.open { display:flex; align-items:center; justify-content:center; }
+#histEditor .he-card { width:640px; max-width:92vw; background:var(--panel);
+                       border:1px solid var(--line); border-radius:14px;
+                       padding:14px; box-shadow:var(--shadow-lg); }
+#histEditor .he-head { display:flex; align-items:center; font-weight:700;
+                       margin-bottom:8px; }
+#histEditor .he-head .sp { flex:1; }
+#histEditor textarea { width:100%; height:260px; resize:vertical;
+                       background:var(--elev); color:var(--fg);
+                       border:1px solid var(--line); border-radius:10px;
+                       padding:10px; font-size:13px; line-height:1.5;
+                       font-family:inherit; outline:none; }
+#histEditor .he-acts { display:flex; gap:8px; margin-top:10px; }
+#shotMask { position:fixed; inset:0; z-index:53; display:none;
+            background:rgba(6,8,18,.75); cursor:crosshair; }
+#shotMask.open { display:block; }
+#shotMask img { position:absolute; inset:0; width:100%; height:100%;
+                object-fit:contain; opacity:.85; pointer-events:none; }
+#shotMask .shot-rect { position:absolute; border:2px dashed var(--accent);
+                       background:rgba(91,124,250,.15); display:none; }
+#shotMask .shot-tip { position:absolute; top:14px; left:50%; transform:translateX(-50%);
+                      background:var(--panel); border:1px solid var(--line);
+                      color:var(--fg); border-radius:10px; padding:6px 14px;
+                      font-size:12.5px; }
 .img-chip { display:inline-flex; align-items:center; gap:6px; max-width:250px;
             background:var(--accent-soft); border:1px solid rgba(91,124,250,.28);
             color:var(--fg); border-radius:999px; padding:3px 10px; font-size:11.5px;
@@ -4457,12 +4803,17 @@ body.dragging #dropMask { display:flex; }
     <span class="tb-ws" id="tbWs"></span>
   </div>
   <div class="tb-actions">
+    <button id="tbStar" title="收藏夹（跨会话）" onclick="toggleFavPanel()">⭐</button>
+    <button id="tbPin" title="窗口置顶" onclick="api().win_toggle_top()">📌</button>
+    <button id="tbBell" title="通知中心" onclick="toggleNotifPanel()">🔔<span id="bellBadge"></span></button>
     <button id="tbPanel" title="切换面板（Ctrl+J）" onclick="togglePanel()">▣</button>
     <button title="最小化" onclick="api().win_minimize()">—</button>
     <button id="tbMax" title="最大化 / 还原（双击标题栏同效）" onclick="api().win_toggle_max()">□</button>
     <button class="tb-close" title="关闭" onclick="api().win_close()">✕</button>
   </div>
 </div>
+<div id="notifPanel" class="tb-pop"></div>
+<div id="favPanel" class="tb-pop"></div>
 <div class="app">
   <aside>
     <div class="brand">
@@ -4519,8 +4870,9 @@ body.dragging #dropMask { display:flex; }
       <div class="composer-row">
         <button id="permBadge" class="badge" title="执行权限" onclick="togglePermMenu()"></button>
         <span class="flex1"></span>
-        <button id="snipBtn" title="快捷指令（常用提示词片段，一键插入）" onclick="snipMenu()">⚡</button>
-        <button id="imgBtn" title="附加图片（或直接粘贴图片路径）" onclick="attachImage()">📎</button>
+          <button id="snipBtn" title="快捷指令（常用提示词片段，一键插入）" onclick="snipMenu()">⚡</button>
+          <button id="imgBtn" title="附加图片（或直接粘贴图片路径）" onclick="attachImage()">📎</button>
+          <button id="shotBtn" title="截图提问（抓屏后框选区域发给模型）" onclick="startScreenshot()">📷</button>
         <button id="ctxBtn" title="上下文占用" onclick="toggleCtxCard()">…</button>
         <select id="modeSel" title="模式：预设或自定义（切换立即生效，含「计划」模式）"></select>
         <select id="thinkSel" title="思考级别（映射 reasoning_effort）"></select>
@@ -4629,6 +4981,7 @@ body.dragging #dropMask { display:flex; }
           <button class="mini-btn" onclick="savePersona()">💾 保存人设</button>
         </div>
         <div class="hint" style="margin:6px 0 4px">长期记忆 memory.md（项目约定、常用路径、注意事项）</div>
+        <div id="memSuggest" style="display:none;border:1px solid var(--accent);border-radius:10px;padding:8px;margin-bottom:8px;background:var(--elev)"></div>
         <textarea id="memText" style="flex:1;min-height:160px;resize:vertical;border:1px solid var(--line);border-radius:10px;background:var(--elev);color:var(--fg);padding:10px;font-size:12.5px;line-height:1.6;font-family:Consolas,monospace;"
           placeholder="写点让 agent 永远记住的事，例如：&#10;- 本项目用 pytest，测试命令：python -m pytest -q&#10;- 提交信息用中文，格式：类型: 摘要&#10;- 不要动 legacy/ 目录"></textarea>
         <div class="term-row" style="padding:8px 0 0">
@@ -4683,6 +5036,7 @@ body.dragging #dropMask { display:flex; }
       <div class="ws-nav">
         <span class="crumb">工作区改动（git status + diff）</span>
         <button class="mini-btn" onclick="loadReview()">⟳ 生成</button>
+        <button class="mini-btn" onclick="commitFlow()">✍ 提交</button>
       </div>
       <div class="git-remote">
         <input id="gitRemoteUrl" placeholder="远程仓库地址（origin），如 https://github.com/user/repo.git">
@@ -4731,10 +5085,12 @@ body.dragging #dropMask { display:flex; }
         <div id="cards"></div>
         <div class="modal-footer">
           <button class="ghost" onclick="addCard()">＋ 添加模型</button>
+          <button class="ghost" id="pingBtn" onclick="pingModels()">⚡ 测速</button>
           <span class="flex1"></span>
           <span id="saveNote"></span>
           <button class="primary" onclick="saveSettings()">保存</button>
         </div>
+        <div id="pingResults"></div>
         <div class="set-h">本地服务一键接入</div>
         <div class="hint">Ollama / LM Studio 等 OpenAI 兼容服务：填地址拉取模型列表，勾选后批量添加（api_key=local，无需密钥）。</div>
         <div class="market-toolbar">
@@ -4764,6 +5120,7 @@ body.dragging #dropMask { display:flex; }
         <div class="install-row">
           <input id="skillPath" placeholder="本地技能目录路径（内含 SKILL.md），如 D:\skills\my-skill">
           <button class="ghost" onclick="installSkill()">安装</button>
+          <button class="ghost" onclick="createSkillFlow()">＋ 新建</button>
         </div>
         <div class="set-h">SkillHub 市场</div>
         <div class="hint" id="skillhubHint">检查 CLI 中…</div>
@@ -4794,6 +5151,9 @@ body.dragging #dropMask { display:flex; }
         <div class="hint">stdio 填启动命令（参数用空格分隔，含空格的路径建议写进命令行引号内或改用 http）；
           http / sse 填 URL。Headers 与 Env 用 JSON 对象（如 {"Authorization": "Bearer sk-..."}），
           值以掩码显示，保存时回传掩码即保持原值。保存后自动断开重连，下一轮对话生效。</div>
+        <div class="market-toolbar" id="mcpPresetRow">
+          <span class="hint" style="flex:none">常用模板：</span>
+        </div>
         <div id="mcpCards"></div>
         <div class="modal-footer">
           <button class="ghost" onclick="addMcpCard()">＋ 添加服务器</button>
@@ -4856,6 +5216,15 @@ body.dragging #dropMask { display:flex; }
             <input id="fontInput" placeholder="如 微软雅黑 / Consolas">
             <button class="ghost" onclick="applyCustomFont()">应用</button>
           </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">回复字号</div>
+              <div class="desc">聊天正文的字体大小，即时生效</div></div>
+            <div class="seg" id="msgSizeSeg">
+              <button onclick="pickMsgSize(13)">小</button>
+              <button onclick="pickMsgSize(14)">标准</button>
+              <button onclick="pickMsgSize(15)">大</button>
+            </div>
+          </div>
         </div>
         <div class="modal-footer"><span id="appearanceNote"></span></div>
       </div>
@@ -4872,6 +5241,48 @@ body.dragging #dropMask { display:flex; }
                    style="width:76px;height:28px;border:1px solid var(--line);border-radius:8px;background:var(--elev);color:var(--fg);padding:0 8px;">
             <button class="msg-act" onclick="saveMaxIterations()">保存</button>
           </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">网络代理</div>
+              <div class="desc">模型与知识库请求走此代理，如 http://127.0.0.1:7890（留空关闭）</div></div>
+            <input id="proxyInput" placeholder="http://127.0.0.1:7890"
+                   style="width:180px;height:28px;border:1px solid var(--line);border-radius:8px;background:var(--elev);color:var(--fg);padding:0 8px;">
+            <button class="msg-act" onclick="saveProxy()">保存</button>
+          </div>
+        </div>
+        <div class="set-h">Agent 工具（禁用后 agent 不能调用，下一轮生效）</div>
+        <div class="set-card"><div id="toolToggles"><div class="hint">加载中…</div></div></div>
+        <div class="set-h">远程访问（手机浏览器配对使用）</div>
+        <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">开启远程访问</div>
+              <div class="desc" id="remoteHint">默认仅本机 127.0.0.1；局域网选 0.0.0.0（务必保管好配对码）</div></div>
+            <button class="msg-act" id="remoteBtn" onclick="toggleRemote()">已关闭</button>
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">监听 / 端口</div>
+              <div class="desc">手机与电脑需在同一局域网；手机浏览器打开下方地址，输入配对码</div></div>
+            <select id="remoteBind" style="height:28px;border:1px solid var(--line);border-radius:8px;background:var(--elev);color:var(--fg)">
+              <option value="127.0.0.1">127.0.0.1（仅本机）</option>
+              <option value="0.0.0.0">0.0.0.0（局域网）</option>
+            </select>
+            <input id="remotePort" type="number" value="8741"
+                   style="width:84px;height:28px;border:1px solid var(--line);border-radius:8px;background:var(--elev);color:var(--fg);padding:0 8px;">
+          </div>
+          <div class="set-row">
+            <div class="set-main"><div class="name">配对码</div>
+              <div class="desc" id="remoteTokenHint">—</div></div>
+            <button class="msg-act" onclick="regenRemoteToken()">换一个</button>
+            <button class="msg-act" onclick="applyRemote()">应用</button>
+          </div>
+        </div>
+        <div class="set-h">启动自检</div>
+        <div class="set-card">
+          <div class="set-row">
+            <div class="set-main"><div class="name">体检</div>
+              <div class="desc">模型配置 / 工作区 / 技能 / MCP / 知识库 / 会话数据</div></div>
+            <button class="msg-act" onclick="runSelfCheck()">▶ 运行</button>
+          </div>
+          <div id="selfCheckOut"></div>
         </div>
         <div class="set-h">文件改动与回滚</div>
         <div class="set-card">
@@ -4958,7 +5369,8 @@ body.dragging #dropMask { display:flex; }
 
 <div id="lightbox"><img id="lightboxImg" alt=""></div>
 <div id="toast"></div>
-<div id="dropMask"><div class="dm-card">松开以添加文件（图片 → 附加发送；文本 → 插入输入框；按住 Alt 松开 → 入知识库）</div></div>
+<div id="dropMask"><div class="dm-card">松开以添加文件（图片 → 附加发送；文本 → 插入输入框；按住 Alt 松开 → 入知识库；docx/xlsx/pptx → 读取内容插入）</div></div>
+<div id="shotMask"><img id="shotImg" alt=""><div class="shot-rect" id="shotRect"></div><div class="shot-tip">拖动框选要发给模型的区域 · Esc 取消</div></div>
 
 <script>
 const api = () => window.pywebview.api;
@@ -5464,7 +5876,19 @@ function add(text, cls, meta, reasoning, hi, tools) {
     rg.className = 'msg-act msg-regen'; rg.textContent = '↻ 重新生成';
     rg.onclick = regenerateLast;
     acts.appendChild(rg);
-    // 分支/手术仅在回放消息上出现（有 hi 序号）
+    const fv = document.createElement('button');
+    fv.className = 'msg-act';
+    fv.textContent = '★ 收藏';
+    fv.onclick = () => {
+      const msgs = [...document.querySelectorAll('#thread .msg')];
+      const idx = msgs.indexOf(div);
+      api().favorite_add(currentSession, idx).then(r => {
+        if (r.ok) toast(r.duplicate ? '已在收藏夹中' : '已收藏（标题栏 ⭐ 查看）');
+        else toast(r.error || '收藏失败', true);
+      });
+    };
+    acts.appendChild(fv);
+    // 分支/手术/历史编辑仅在回放消息上出现（有 hi 序号）
     if (typeof hi === 'number') {
       const br = document.createElement('button');
       br.className = 'msg-act';
@@ -5476,6 +5900,12 @@ function add(text, cls, meta, reasoning, hi, tools) {
       sg.textContent = '✂ 手术';
       sg.onclick = () => surgeryFrom(currentSession, hi);
       acts.appendChild(sg);
+      const ed = document.createElement('button');
+      ed.className = 'msg-act';
+      ed.textContent = '✎ 改';
+      ed.title = '编辑这条历史消息的内容（可视化编辑器）';
+      ed.onclick = () => openHistEditor(hi);
+      acts.appendChild(ed);
     }
     div.appendChild(acts);
   }
@@ -5559,12 +5989,14 @@ function saveUiPrefs() {
     show_done: !!uiPrefs.show_done,
     accent: uiPrefs.accent || '',
     font: uiPrefs.font || '',
+    msg_size: uiPrefs.msg_size || 14,
   };
   lsSet('sh_wsbar_hidden', wsBarDismissed ? '1' : '0');
   lsSet('sh_rp_width', String(prefs.rp_width));
   lsSet('sh_side_width', String(prefs.side_width));
   lsSet('sh_accent', prefs.accent);
   lsSet('sh_font', prefs.font);
+  lsSet('sh_msg_size', String(prefs.msg_size));
   if (window.pywebview && window.pywebview.api) {
     window.pywebview.api.set_ui_prefs(prefs).catch(() => {});
   }
@@ -5572,6 +6004,7 @@ function saveUiPrefs() {
 function applyUiPrefs(prefs) {
   if (!prefs) return;
   if (typeof prefs.wsbar_hidden === 'boolean') wsBarDismissed = prefs.wsbar_hidden;
+  if (prefs.msg_size) applyMsgSize(prefs.msg_size);
   const apply = (el, w, lo, hi) => {
     if (el && w >= lo && w <= hi) { el.style.width = w + 'px'; el.style.minWidth = w + 'px'; }
   };
@@ -5595,6 +6028,7 @@ function applyUiPrefs(prefs) {
     show_done: !!prefs.show_done,
     accent: typeof prefs.accent === 'string' ? prefs.accent : '',
     font: typeof prefs.font === 'string' ? prefs.font : '',
+    msg_size: Number(prefs.msg_size) || 14,
   };
   applyAccent(uiPrefs.accent);
   applyFont(uiPrefs.font);
@@ -6353,6 +6787,162 @@ async function previewToolFile(rel) {
   await previewWsFile(rel, rel);
 }
 
+/* ---------- 通知中心（🔔）与收藏夹（⭐）弹出面板 ---------- */
+let unread = 0;
+function renderBellBadge() {
+  const b = $('bellBadge');
+  if (!b) return;
+  b.style.display = unread ? 'flex' : 'none';
+  b.textContent = unread > 9 ? '9+' : String(unread);
+}
+function bumpBell() { unread++; renderBellBadge(); }
+function closeTbPop() {
+  document.querySelectorAll('.tb-pop').forEach(p => p.classList.remove('open'));
+}
+async function toggleNotifPanel() {
+  const p = $('notifPanel');
+  const wasOpen = p.classList.contains('open');
+  closeTbPop();
+  if (wasOpen) return;
+  p.classList.add('open');
+  await loadNotif();
+}
+async function loadNotif() {
+  const p = $('notifPanel');
+  p.innerHTML = '<div class="hint" style="padding:6px">加载中…</div>';
+  const r = await api().notifications();
+  if (!r.ok) { p.innerHTML = '<div class="hint" style="padding:6px">' + esc(r.error || '加载失败') + '</div>'; return; }
+  unread = r.unread || 0;
+  renderBellBadge();
+  const head = document.createElement('div');
+  head.className = 'np-head';
+  head.innerHTML = '<span>通知中心</span><span class="sp"></span>';
+  const readAll = document.createElement('button');
+  readAll.className = 'msg-act';
+  readAll.textContent = '全部已读';
+  readAll.onclick = async (e) => { e.stopPropagation(); await api().notifications_read(null); loadNotif(); };
+  head.appendChild(readAll);
+  p.innerHTML = '';
+  p.appendChild(head);
+  if (!(r.items || []).length) {
+    p.innerHTML += '<div class="hint" style="padding:6px">暂无通知。agent 提问、定时任务回流、对话出错会出现在这里。</div>';
+    return;
+  }
+  for (const n of r.items) {
+    const row = document.createElement('div');
+    row.className = 'np-row' + (n.read ? '' : ' unread');
+    const when = n.ts ? new Date(n.ts * 1000).toLocaleString('zh-CN') : '';
+    row.innerHTML = '<span class="np-time">' + esc(when) + '</span>' +
+      '<div class="np-title">' + (n.icon || 'ℹ️') + ' ' + esc(n.title || '') + '</div>' +
+      (n.body ? '<div class="np-body">' + esc(n.body) + '</div>' : '');
+    row.onclick = async () => {
+      if (!n.read) { await api().notifications_read([n.id]); row.classList.remove('unread'); unread = Math.max(0, unread - 1); renderBellBadge(); }
+    };
+    p.appendChild(row);
+  }
+}
+async function toggleFavPanel() {
+  const p = $('favPanel');
+  const wasOpen = p.classList.contains('open');
+  closeTbPop();
+  if (wasOpen) return;
+  p.classList.add('open');
+  await loadFavs();
+}
+async function loadFavs() {
+  const p = $('favPanel');
+  p.innerHTML = '<div class="hint" style="padding:6px">加载中…</div>';
+  const r = await api().favorites();
+  const head = document.createElement('div');
+  head.className = 'np-head';
+  head.innerHTML = '<span>收藏夹</span><span class="sp"></span>';
+  p.innerHTML = '';
+  p.appendChild(head);
+  if (!r.ok) { p.innerHTML += '<div class="hint" style="padding:6px">' + esc(r.error || '加载失败') + '</div>'; return; }
+  if (!(r.items || []).length) {
+    p.innerHTML += '<div class="hint" style="padding:6px">还没有收藏。回复左下角的「★」可把重要回答收进来。</div>';
+    return;
+  }
+  for (const f of r.items) {
+    const row = document.createElement('div');
+    row.className = 'np-row';
+    const when = f.ts ? new Date(f.ts * 1000).toLocaleString('zh-CN') : '';
+    row.innerHTML = '<span class="np-time">' + esc(when) + '</span>' +
+      '<div class="np-title">' + esc(f.session_name || f.session || '') + '</div>' +
+      '<div class="np-body">' + esc(f.snippet || '') + '</div>';
+    const acts = document.createElement('div');
+    acts.style.marginTop = '4px';
+    const go = document.createElement('button');
+    go.className = 'msg-act';
+    go.textContent = '↗ 跳转';
+    go.onclick = (e) => { e.stopPropagation(); closeTbPop(); favJump(f); };
+    const del = document.createElement('button');
+    del.className = 'msg-act';
+    del.textContent = '移除';
+    del.onclick = async (e) => { e.stopPropagation(); await api().favorite_remove(f.id); loadFavs(); };
+    acts.append(go, del);
+    row.appendChild(acts);
+    row.onclick = () => { closeTbPop(); favJump(f); };
+    p.appendChild(row);
+  }
+}
+async function favJump(f) {
+  await selectSession(f.session);
+  const el = document.querySelector('#thread .msg[data-hi="' + f.index + '"]');
+  if (el) {
+    el.scrollIntoView({ block: 'center' });
+    el.style.outline = '2px solid var(--accent)';
+    setTimeout(() => { el.style.outline = ''; }, 1600);
+  }
+}
+document.addEventListener('mousedown', (e) => {
+  // 点击弹层与标题栏以外区域时收起
+  if (!e.target.closest('.tb-pop') && !e.target.closest('.tb-actions')) closeTbPop();
+});
+
+/* ---------- 历史消息可视化编辑器（✎ 改：改写 / 删除单条历史） ---------- */
+async function openHistEditor(hi) {
+  const s = await api().session_history(currentSession);
+  const msgs = (s.history || []).filter(m => (m.content || '').trim());
+  const msg = msgs[hi];
+  if (!msg) { toast('消息不存在', true); return; }
+  let box = $('histEditor');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'histEditor';
+    document.body.appendChild(box);
+  }
+  box.innerHTML =
+    '<div class="he-card">' +
+    '<div class="he-head">✎ 编辑历史消息 <span class="sp"></span>' +
+    '<span class="hint">#' + hi + ' · ' + esc(msg.role) + '</span></div>' +
+    '<textarea id="heText" spellcheck="false"></textarea>' +
+    '<div class="he-acts">' +
+    '<button class="ghost" onclick="closeHistEditor()">取消</button>' +
+    '<span class="flex1"></span>' +
+    '<button class="ghost" id="heDel">🗑 删除此条</button>' +
+    '<button class="primary" id="heSave">保存</button></div></div>';
+  box.classList.add('open');
+  $('heText').value = msg.content || '';
+  $('heSave').onclick = async () => {
+    const r = await api().session_edit_text(currentSession, hi, $('heText').value);
+    if (r.ok) { closeHistEditor(); await selectSession(currentSession); toast('已保存（上下文同步重建）'); }
+    else toast(r.error || '保存失败', true);
+  };
+  $('heDel').onclick = async () => {
+    const ok = await dialogConfirm('删除历史消息',
+      '确定删除第 ' + hi + ' 条消息？此操作不可恢复。');
+    if (!ok) return;
+    const r = await api().session_delete_message(currentSession, hi);
+    if (r.ok) { closeHistEditor(); await selectSession(currentSession); toast('已删除'); }
+    else toast(r.error || '删除失败', true);
+  };
+}
+function closeHistEditor() {
+  const box = $('histEditor');
+  if (box) box.classList.remove('open');
+}
+
 /* ---------- 后台会话运行指示（其他会话在回答时显示，点击切换过去） ---------- */
 function renderBgBadge() {
   const el = $('bgChip');
@@ -6366,9 +6956,10 @@ function renderBgBadge() {
 
 function onAgentEvent(evt) {
   // ask_user 问答卡片最先处理：它可能来自后台会话，不能被会话过滤挡掉
-  if (evt.kind === 'ask_user') { showAskCard(evt); return; }
+  if (evt.kind === 'ask_user') { bumpBell(); showAskCard(evt); return; }
   // 定时任务结果回流：提示 + 刷新侧栏（该会话内容已更新）
   if (evt.kind === 'schedule_done') {
+    bumpBell();
     toast('⏰ 定时任务「' + (evt.task || '') + '」结果已写入会话');
     refreshSidebar();
     if (evt.session === currentSession) selectSession(currentSession);
@@ -6470,6 +7061,8 @@ window.onerror = function (msg, src, line, col) {
 window.onStreamEvent = function (evt) {
   // 窗口最大化/还原：同步标题栏按钮形态（▣ — ❐ ✕ 所在的自绘标题栏）
   if (evt.kind === 'win_state') { syncWinMax(evt.max); return; }
+  // 窗口置顶态：📌 按钮高亮
+  if (evt.kind === 'win_top') { const b = $('tbPin'); if (b) b.classList.toggle('on', !!evt.top); return; }
   // 多会话并行：非当前会话的增量不渲染（后台继续收，done 时只提示）
   if (evt.session && evt.session !== currentSession && evt.kind !== 'done') return;
   if (evt.kind === 'delta') {
@@ -6524,7 +7117,7 @@ function finishStream(evt) {
   removeLiveBlock();
   setBusy(false);
   $('input').focus();
-  if (!evt.ok) { add(evt.error || '未知错误', 'bot error'); flushQueue(evt.session); return; }
+  if (!evt.ok) { bumpBell(); add(evt.error || '未知错误', 'bot error'); flushQueue(evt.session); return; }
   lastSpeed = roundSpeed(evt.usage);
   const meta = ['模型: ' + (evt.model || '?')];
   for (const call of (evt.tool_calls || [])) meta.push(call.name);
@@ -7118,6 +7711,7 @@ async function loadMcp() {
   }));
   if (!editingMcp.length) addMcpEntry();
   renderMcpCards();
+  loadMcpPresetChips();
   $('mcpSaveNote').textContent = '';
 }
 function addMcpEntry() {
@@ -7453,6 +8047,23 @@ async function installSkill() {
   if (res.ok) { $('skillPath').value = ''; loadSkills(); }
 }
 
+/* ---------- 新建技能（生成 SKILL.md 模板） ---------- */
+async function createSkillFlow() {
+  const name = await dialogPrompt('新建技能 —— 技能名（中英文/数字/._-）', '');
+  if (name === null || !name.trim()) return;
+  const r = await api().create_skill(name.trim());
+  const note = $('skillNote');
+  if (r.ok) {
+    note.className = 'note-ok';
+    note.textContent = '模板已生成：' + r.path;
+    toast('技能模板已生成，编辑后新会话生效');
+    loadSkills();
+  } else {
+    note.className = 'note-err';
+    note.textContent = r.error || '创建失败';
+  }
+}
+
 /* ---------- 本地模型一键接入（Ollama / LM Studio） ---------- */
 function fillLocal(url) {
   $('localUrl').value = url;
@@ -7567,6 +8178,60 @@ async function backupAutoNowFlow() {
   const r = await api().backup_auto_now();
   if (r.ok) { toast('已备份 ' + r.files + ' 个文件' + (r.pruned ? '，清理 ' + r.pruned + ' 份旧备份' : '')); refreshAutoBackupRow(); }
   else toast(r.error || '备份失败', true);
+}
+
+/* ---------- 模型健康检查 / 测速 ---------- */
+async function pingModels() {
+  const btn = $('pingBtn');
+  const box = $('pingResults');
+  btn.disabled = true;
+  box.innerHTML = '<div class="hint">探测中（每条真实请求，最长 25s）…</div>';
+  const r = await api().models_ping();
+  btn.disabled = false;
+  if (!r.ok) { box.innerHTML = '<div class="hint">' + esc(r.error || '测速失败') + '</div>'; return; }
+  const rows = Object.entries(r.results || {}).map(([name, v]) =>
+    '<div class="np-row" style="cursor:default"><div class="np-title">' +
+    (v.ok ? '✅ ' : '❌ ') + esc(name) + '</div>' +
+    '<div class="np-body">' + (v.ok ? ('可用 · ' + v.ms + ' ms') : esc(v.error || '失败')) + '</div></div>');
+  box.innerHTML = rows.join('') || '<div class="hint">没有可测的模型</div>';
+}
+
+/* ---------- MCP 常用模板 ---------- */
+let mcpPresetCache = null;
+async function loadMcpPresetChips() {
+  const row = $('mcpPresetRow');
+  if (!row) return;
+  if (!mcpPresetCache) {
+    const r = await api().mcp_presets();
+    mcpPresetCache = (r && r.presets) || [];
+  }
+  row.querySelectorAll('button').forEach(b => b.remove());
+  for (const p of mcpPresetCache) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ghost';
+    b.title = p.desc + '：' + p.command;
+    b.textContent = p.name;
+    b.onclick = () => {
+      editingMcp.push({ name: p.name, type: 'stdio', url: '',
+                        command: p.command, args: '', headers: '', env: '' });
+      renderMcpCards();
+      $('mcpSaveNote').textContent = '已加入「' + p.name + '」模板，把 <占位符> 改成实际路径后保存';
+    };
+    row.appendChild(b);
+  }
+}
+
+/* ---------- 审查面板：一键生成提交信息并提交 ---------- */
+async function commitFlow() {
+  toast('生成提交信息中…');
+  const p = await api().git_prepare_commit();
+  if (!p.ok) { toast(p.error || '无法提交', true); return; }
+  const ok = await dialogConfirm('确认提交', p.message + '\n\n—— 变更 ——\n' + (p.stat || ''));
+  if (!ok) return;
+  const r = await api().git_do_commit(p.message);
+  if (r.ok) { toast('已提交：' + String(p.message).split('\n')[0]); loadReview(); }
+  else toast(r.error || '提交失败', true);
 }
 
 /* ---------- 右侧面板 ---------- */
@@ -7865,6 +8530,36 @@ async function loadMemory() {
   $('memText').value = r.ok ? (r.text || '') : ('读取失败: ' + (r.error || ''));
   const p = await api().get_persona();
   $('personaText').value = p.ok ? (p.text || '') : '';
+  // 记忆沉淀建议（自动提炼 → 用户采纳）
+  const box = $('memSuggest');
+  if (box) {
+    const s = await api().memory_suggestion();
+    if (s.ok && s.suggestion && (s.suggestion.text || '').trim()) {
+      box.style.display = '';
+      box.innerHTML = '<div class="side-label" style="margin-bottom:4px">💡 沉淀建议（' +
+        new Date(s.suggestion.ts * 1000).toLocaleString('zh-CN') + '）</div>' +
+        '<pre class="sub-out" style="max-height:120px">' + esc(s.suggestion.text) + '</pre>';
+      const acts = document.createElement('div');
+      acts.className = 'sched-acts';
+      const yes = document.createElement('button');
+      yes.className = 'mini-btn';
+      yes.textContent = '✓ 采纳进长期记忆';
+      yes.onclick = async () => {
+        const r2 = await api().memory_accept_suggestion();
+        if (r2.ok) { toast('已写入 memory.md'); loadMemory(); }
+        else toast(r2.error || '失败', true);
+      };
+      const no = document.createElement('button');
+      no.className = 'mini-btn';
+      no.textContent = '丢弃';
+      no.onclick = async () => { await api().memory_discard_suggestion(); loadMemory(); };
+      acts.append(yes, no);
+      box.appendChild(acts);
+    } else {
+      box.style.display = 'none';
+      box.innerHTML = '';
+    }
+  }
 }
 async function saveMemory() {
   const r = await api().save_agent_memory($('memText').value);
@@ -7907,12 +8602,39 @@ async function loadSchedules() {
   pane.innerHTML = '<div class="hint">加载中…</div>';
   const r = await api().schedules();
   pane.innerHTML = '';
+  // 新建表单：支持 钟点制（每天 HH:MM）与 间隔制（每 N 秒）
+  const form = document.createElement('div');
+  form.className = 'sub-row open';
+  form.innerHTML =
+    '<div class="sub-head"><span class="sub-badge ok">＋</span><span class="sub-task">新建定时任务</span></div>' +
+    '<div class="sub-body">' +
+    '<div class="install-row"><input id="schedName" placeholder="任务名，如 日报"></div>' +
+    '<div class="install-row">' +
+    '<select id="schedKind" style="flex:none;width:96px">' +
+    '<option value="daily">每天</option><option value="interval">每隔</option></select>' +
+    '<input id="schedAt" type="time" value="09:00" style="flex:none;width:110px">' +
+    '<input id="schedEvery" type="number" value="3600" min="1" style="flex:none;width:110px" title="间隔秒数">' +
+    '<span class="hint" id="schedKindHint" style="flex:1">到点执行一次（错过后补跑）</span></div>' +
+    '<div class="install-row"><input id="schedPrompt" placeholder="到点执行的提示词，如 总结今天的进展"></div>' +
+    '<div class="install-row"><button class="ghost" onclick="createSchedule()">添加任务</button>' +
+    '<span class="hint">可选：让 agent 帮你安排，或 sha schedule add</span></div>' +
+    '</div>';
+  pane.appendChild(form);
+  const kindSel = form.querySelector('#schedKind');
+  const syncKind = () => {
+    form.querySelector('#schedAt').style.display = kindSel.value === 'daily' ? '' : 'none';
+    form.querySelector('#schedEvery').style.display = kindSel.value === 'daily' ? 'none' : '';
+    form.querySelector('#schedKindHint').textContent =
+      kindSel.value === 'daily' ? '到点执行一次（错过后补跑）' : '按间隔秒数循环执行';
+  };
+  kindSel.onchange = syncKind;
   const tasks = (r && r.tasks) || [];
   if (!tasks.length) {
-    pane.innerHTML = '<div class="hint">还没有定时任务。<br>' +
-      '用 <b>sha schedule add &lt;名&gt; --every &lt;秒&gt; --prompt &lt;提示词&gt;</b> 创建，' +
-      '或直接让 agent 帮你安排。到点会用独立 agent 执行提示词，结果写进 profile 的 scheduled/ 目录。</div>';
-    return;
+    const empty = document.createElement('div');
+    empty.className = 'hint';
+    empty.style.padding = '8px 10px';
+    empty.textContent = '还没有定时任务。用上面的表单创建，到点会用独立 agent 执行提示词；结果可回流到指定会话。';
+    pane.appendChild(empty);
   }
   for (const t of tasks) {
     const row = document.createElement('div');
@@ -7920,10 +8642,13 @@ async function loadSchedules() {
     const head = document.createElement('div');
     head.className = 'sub-head';
     const last = t.last_run ? new Date(t.last_run * 1000).toLocaleString('zh-CN') : '从未';
+    const cadence = t.kind === 'daily'
+      ? ('每天 ' + (t.at || '--:--'))
+      : ('每 ' + esc(String(t.every ?? '?')) + 's');
     head.innerHTML = '<span class="sub-badge ' + (t.enabled !== false ? 'ok' : 'bad') + '">' +
       (t.enabled !== false ? '▶' : '⏸') + '</span>' +
       '<span class="sub-task">' + esc(t.name || '') + '</span>' +
-      '<span class="sub-time">每 ' + esc(String(t.every ?? '?')) + 's · 上次 ' + esc(last) + '</span>';
+      '<span class="sub-time">' + cadence + ' · 上次 ' + esc(last) + '</span>';
     head.title = t.prompt || '';
     head.onclick = () => row.classList.toggle('open');
     row.appendChild(head);
@@ -7971,6 +8696,18 @@ async function loadSchedules() {
     row.appendChild(body);
     pane.appendChild(row);
   }
+}
+
+async function createSchedule() {
+  const name = ($('schedName') || {}).value?.trim();
+  const kind = ($('schedKind') || {}).value || 'daily';
+  const at = ($('schedAt') || {}).value || '09:00';
+  const every = parseInt(($('schedEvery') || {}).value || '3600', 10);
+  const prompt = ($('schedPrompt') || {}).value?.trim();
+  if (!name || !prompt) { toast('任务名和提示词都要填', true); return; }
+  const r = await api().schedule_add(name, every, prompt, '', kind, at);
+  if (r && r.ok) { toast('已创建任务「' + name + '」'); loadSchedules(); }
+  else toast((r && r.error) || '创建失败', true);
 }
 
 /* ---------- 远程仓库配置与手动推送（审查面板；agent 无 push 能力） ---------- */
@@ -8507,7 +9244,22 @@ function renderAppearance() {
   }
   $('accentInput').value = uiPrefs.accent || '';
   $('fontInput').value = uiPrefs.font || '';
+  const sizeLabel = { 13: '小', 14: '标准', 15: '大' }[uiPrefs.msg_size || 14] || '标准';
+  document.querySelectorAll('#msgSizeSeg button').forEach(b =>
+    b.classList.toggle('sel', b.textContent === sizeLabel));
   $('appearanceNote').textContent = '';
+}
+
+/* ---------- 回复字号（CSS 变量，即时生效） ---------- */
+function applyMsgSize(px) {
+  const size = [13, 14, 15].includes(Number(px)) ? Number(px) : 14;
+  uiPrefs.msg_size = size;
+  document.documentElement.style.setProperty('--msg-size', size + 'px');
+}
+function pickMsgSize(px) {
+  applyMsgSize(px);
+  saveUiPrefs();
+  renderAppearance();
 }
 
 /* ---------- 设置页：通用（界面开关 / 数据） ---------- */
@@ -8526,6 +9278,13 @@ const GENERAL_TOGGLES = [
     act: async () => {
       const r = await api().set_auto_compact(!autoCompactOn);
       if (r.ok) { autoCompactOn = !autoCompactOn; toast(r.note || '已切换'); }
+      else toast(r.error || '切换失败', true);
+    } },
+  { label: '记忆沉淀建议（每 8 轮后台提炼，🧠 面板采纳；会多一次后台请求）',
+    get: () => !!memDistillOn,
+    act: async () => {
+      const r = await api().set_memory_distill(!memDistillOn);
+      if (r.ok) { memDistillOn = !memDistillOn; toast(r.note || '已切换'); }
       else toast(r.error || '切换失败', true);
     } },
 ];
@@ -8554,6 +9313,9 @@ function renderGeneral() {
   loadCheckpoints();
   refreshAutoBackupRow();
   loadMaxIterations();
+  loadToolToggles();
+  loadProxy();
+  loadRemote();
   $('generalNote').textContent = '';
 }
 
@@ -8570,10 +9332,98 @@ async function saveMaxIterations() {
   else toast(r.error || '保存失败', true);
 }
 
+/* ---------- Agent 工具开关 ---------- */
+async function loadToolToggles() {
+  const box = $('toolToggles');
+  if (!box) return;
+  const r = await api().tools_list();
+  box.innerHTML = '';
+  if (!r.ok) { box.innerHTML = '<div class="hint">' + esc(r.error || '加载失败') + '</div>'; return; }
+  for (const t of (r.tools || [])) {
+    const row = document.createElement('div');
+    row.className = 'ctx-row';
+    const dot = document.createElement('span');
+    dot.className = 'dot' + (t.disabled ? ' dim' : '');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = t.name;
+    const btn = document.createElement('button');
+    btn.className = 'msg-act';
+    btn.textContent = t.disabled ? '已禁用' : '已启用';
+    btn.onclick = async () => {
+      const res = await api().set_tool_enabled(t.name, !!t.disabled);
+      if (res.ok) loadToolToggles();
+      else toast(res.error || '操作失败', true);
+    };
+    row.append(dot, name, btn);
+    box.appendChild(row);
+  }
+}
+
+/* ---------- 网络代理 ---------- */
+async function loadProxy() {
+  const r = await api().get_proxy();
+  const input = $('proxyInput');
+  if (input && r.ok) input.value = r.proxy || '';
+}
+async function saveProxy() {
+  const r = await api().set_proxy(($('proxyInput').value || '').trim());
+  if (r.ok) toast(r.note || '代理已保存');
+  else toast(r.error || '保存失败', true);
+}
+
+/* ---------- 远程访问 ---------- */
+async function loadRemote() {
+  const r = await api().remote_status();
+  if (!r.ok) return;
+  $('remoteBtn').textContent = r.enabled ? '已开启' : '已关闭';
+  $('remoteBind').value = r.bind === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
+  $('remotePort').value = r.port;
+  const addr = r.bind === '0.0.0.0'
+    ? ('http://' + r.lan_ip + ':' + r.port + '/')
+    : ('http://127.0.0.1:' + r.port + '/');
+  $('remoteTokenHint').textContent =
+    (r.running ? '● 运行中 · ' : '○ 未运行 · ') + addr + '　配对码：' + r.token;
+}
+async function toggleRemote() {
+  const r = await api().remote_status();
+  const res = await api().remote_save(!r.enabled, r.bind, r.port, false);
+  if (res.ok) { toast(res.enabled ? '远程访问已开启' : '远程访问已关闭'); loadRemote(); }
+  else toast(res.error || '操作失败', true);
+}
+async function applyRemote() {
+  const res = await api().remote_save(true, $('remoteBind').value,
+                                      parseInt($('remotePort').value, 10), false);
+  if (res.ok) { toast('远程访问已生效'); loadRemote(); }
+  else toast(res.error || '应用失败', true);
+}
+async function regenRemoteToken() {
+  const r = await api().remote_status();
+  const res = await api().remote_save(r.enabled, r.bind, r.port, true);
+  if (res.ok) { toast('配对码已更换，旧配对码立即失效'); loadRemote(); }
+  else toast(res.error || '操作失败', true);
+}
+
+/* ---------- 启动自检 ---------- */
+async function runSelfCheck() {
+  const box = $('selfCheckOut');
+  box.innerHTML = '<div class="hint">检查中…</div>';
+  const r = await api().self_check();
+  if (!r.ok) { box.innerHTML = '<div class="hint">' + esc(r.error || '失败') + '</div>'; return; }
+  box.innerHTML = (r.items || []).map(i =>
+    '<div class="ctx-row"><span class="dot' + (i.ok ? '' : ' dim') + '" style="background:' +
+    (i.ok ? 'var(--ok)' : 'var(--err)') + '"></span>' +
+    '<span class="name">' + esc(i.name) + '</span>' +
+    '<span class="pct" style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+    esc(i.detail || '') + '</span></div>').join('');
+}
+
 /* 「写文件前显示 diff 确认」开关（服务端配置 permissions.confirm_write） */
 let confirmWriteOn = false;
 /* 「长会话自动压缩」状态（服务端 config.memory.type=summary），启动时拉取 */
 let autoCompactOn = false;
+/* 「记忆沉淀建议」状态（服务端 config.memory_distill.enabled），默认关 */
+let memDistillOn = false;
 async function toggleConfirmWrite() {
   confirmWriteOn = !confirmWriteOn;
   await api().set_confirm_write(confirmWriteOn);
@@ -8653,11 +9503,27 @@ async function bootstrapFlow() {
 }
 
 /* ---------- 快捷指令（常用提示词片段，一键插入） ---------- */
+/* 插入快捷指令：含 {{占位符}} 时逐个弹窗填参（取消任一项则放弃整条插入） */
+async function insertSnippet(text) {
+  const vars = [...new Set((String(text).match(/\{\{([^{}]+)\}\}/g) || [])
+    .map(s => s.slice(2, -2).trim()))];
+  let out = String(text);
+  for (const v of vars) {
+    const val = await dialogPrompt('填充 {{' + v + '}}', '');
+    if (val === null) return;
+    out = out.split('{{' + v + '}}').join(val);
+  }
+  const ta = $('input');
+  ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n' + out : out;
+  ta.dispatchEvent(new Event('input'));
+  ta.focus();
+  if (vars.length) toast('已填充 ' + vars.length + ' 个占位符');
+}
+
 async function snipMenu() {
   const res = await api().snippets_list();
   const items = res.snippets || [];
-  const ta = $('input');
-  if (!items.length) {
+  const ta = $('input');  if (!items.length) {
     // 一条都没有：引导从当前输入新建
     const name = await dialogPrompt('新建快捷指令：名称', '');
     if (name === null || !name.trim()) return;
@@ -8676,11 +9542,7 @@ async function snipMenu() {
   if (pick === null) return;
   if (pick.startsWith('use:')) {
     const s = items.find(i => i.name === pick.slice(4));
-    if (s) {
-      ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n' + s.text : s.text;
-      ta.dispatchEvent(new Event('input'));
-      ta.focus();
-    }
+    if (s) await insertSnippet(s.text);
   } else if (pick === 'add') {
     const name = await dialogPrompt('指令名称', '');
     if (name === null || !name.trim()) return;
@@ -8692,6 +9554,68 @@ async function snipMenu() {
     if (del !== null) await api().snippets_delete(del);
   }
 }
+
+/* ---------- 截图提问：抓全屏 → 框选 → 裁剪为图片附件 ---------- */
+async function startScreenshot() {
+  const r = await api().screenshot_capture();
+  if (!r.ok) { toast(r.error || '截图失败', true); return; }
+  const mask = $('shotMask');
+  $('shotImg').src = r.data_url;
+  const probe = new Image();
+  probe.onload = () => { mask.__img = probe; };
+  probe.src = r.data_url;
+  mask.__img = probe;
+  mask.classList.add('open');
+}
+(function initShot() {
+  const mask = $('shotMask');
+  if (!mask) return;
+  let dragging = false, sx = 0, sy = 0;
+  const rect = $('shotRect');
+  mask.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.shot-tip')) return;
+    dragging = true; sx = e.clientX; sy = e.clientY;
+    rect.style.display = 'block';
+    rect.style.left = sx + 'px'; rect.style.top = sy + 'px';
+    rect.style.width = '0'; rect.style.height = '0';
+  });
+  mask.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    rect.style.left = Math.min(e.clientX, sx) + 'px';
+    rect.style.top = Math.min(e.clientY, sy) + 'px';
+    rect.style.width = Math.abs(e.clientX - sx) + 'px';
+    rect.style.height = Math.abs(e.clientY - sy) + 'px';
+  });
+  mask.addEventListener('mouseup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const r = rect.getBoundingClientRect();
+    rect.style.display = 'none';
+    mask.classList.remove('open');
+    if (r.width < 8 || r.height < 8) return;
+    cropShot(r);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { mask.classList.remove('open'); rect.style.display = 'none'; }
+  });
+  function cropShot(cssRect) {
+    const img = mask.__img;
+    if (!img || !img.naturalWidth) return;
+    // 屏幕坐标 → 原图坐标：截图按 object-fit:contain 铺满窗口
+    const vw = innerWidth, vh = innerHeight;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const scale = Math.min(vw / iw, vh / ih);
+    const ox = (vw - iw * scale) / 2, oy = (vh - ih * scale) / 2;
+    const sxI = (cssRect.left - ox) / scale, syI = (cssRect.top - oy) / scale;
+    const swI = cssRect.width / scale, shI = cssRect.height / scale;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(swI));
+    canvas.height = Math.max(1, Math.round(shI));
+    canvas.getContext('2d').drawImage(img, sxI, syI, swI, shI, 0, 0, canvas.width, canvas.height);
+    addImagePath(canvas.toDataURL('image/png'));
+    toast('截图已附加，补充一句话说明后发送即可');
+  }
+})();
 
 /* ---------- 拖拽文件入窗（图片 → 附加；文本 → 插入输入框） ---------- */
 const DROP_IMG_RE = /\.(png|jpe?g|gif|webp)$/i;
@@ -8748,8 +9672,21 @@ window.addEventListener('drop', async (e) => {
       ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n\n' + head + body : head + body;
       ta.dispatchEvent(new Event('input'));
       ta.focus();
+    } else if (/\.(docx|xlsx|pptx)$/i.test(f.name)) {
+      // Office 文档：读出文本塞进输入框（解析走 file_preview 同一套能力）
+      const p = f.path || '';
+      if (!p) { toast('拿不到「' + f.name + '」的磁盘路径', true); continue; }
+      toast('正在读取 ' + f.name + ' …');
+      const r = await api().drop_extract(p);
+      if (!r.ok) { toast(r.error || '读取失败', true); continue; }
+      const ta = $('input');
+      const head = '【' + r.name + '】\n';
+      const body = r.text.slice(0, 8000) + (r.text.length > 8000 ? '\n…（已截断）' : '');
+      ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n\n' + head + body : head + body;
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
     } else {
-      toast('已跳过「' + f.name + '」——只支持图片或 200KB 内的文本文件', true);
+      toast('已跳过「' + f.name + '」——只支持图片、文本或 docx/xlsx/pptx', true);
     }
   }
 });
@@ -9250,6 +10187,14 @@ window.addEventListener('pywebviewready', async () => {
     const r = await api().auto_compact_enabled();
     if (r && r.ok) autoCompactOn = !!r.enabled;
   });
+  await step('记忆沉淀偏好', async () => {
+    const r = await api().get_memory_distill();
+    if (r && r.ok) memDistillOn = !!r.enabled;
+  });
+  await step('通知未读数', async () => {
+    const n = await api().notifications();
+    if (n && n.ok) { unread = n.unread || 0; renderBellBadge(); }
+  });
   updateSendState();
   $('input').focus();
 });
@@ -9293,6 +10238,26 @@ def run(host, title: str = "卅 harness", width: int = 1180, height: int = 780) 
     except ConfigError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
+    # 单实例锁：避免双开造成 profile 文件竞争（锁文件记录 PID，进程死了自动失效）
+    lock_path = Path(host.profile.root) / "desktop.lock"
+    try:
+        if lock_path.is_file():
+            old_pid = int(lock_path.read_text(encoding="ascii").strip() or 0)
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, old_pid)  # QUERY_LIMITED
+            alive = bool(handle)
+            if handle:
+                kernel32.CloseHandle(handle)
+            if alive:
+                print(f"错误：桌面端已在运行（PID {old_pid}），请使用已打开的窗口。", file=sys.stderr)
+                return 2
+        lock_path.write_text(str(os.getpid()), encoding="ascii")
+    except (OSError, ValueError):
+        pass  # 锁不可用不阻断启动（best-effort）
+    # 网络代理（config.proxy）：模型/知识库请求走代理
+    _apply_proxy_env(str(config.get("proxy") or ""))
     saved_ws = (config.get("workspace") or "").strip()
     if saved_ws and Path(saved_ws).is_dir():
         host.workspace = str(Path(saved_ws).resolve())
@@ -9311,5 +10276,13 @@ def run(host, title: str = "卅 harness", width: int = 1180, height: int = 780) 
         easy_drag=False)  # 关闭全窗口拖拽：否则每次 mousedown 都可能移动窗口，
                           # 面板缩放手柄与所有点击都会被"窗口跟手"破坏（拖拽区在 #tbDrag）
     app._window = window
-    webview.start(app._apply_frame_style)  # 启动后补回可缩放边框（WS_THICKFRAME）
+    threading.Thread(target=app._global_hotkey_loop, daemon=True,
+                     name="sha-hotkey").start()
+    try:
+        webview.start(app._apply_frame_style)  # 启动后补回可缩放边框（WS_THICKFRAME）
+    finally:
+        try:
+            (Path(host.profile.root) / "desktop.lock").unlink(missing_ok=True)
+        except OSError:
+            pass
     return 0

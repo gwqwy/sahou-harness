@@ -624,6 +624,190 @@ class MaxIterationsTests(unittest.TestCase):
         self.assertEqual(_max_iterations({"max_iterations": 99999}), 200)
 
 
+class DailyScheduleTests(unittest.TestCase):
+    """钟点制定时任务：at 校验/规整、daily_target_ts、due_tasks 的每日一次语义。"""
+
+    def test_normalize_at(self):
+        from harness.schedule_store import ScheduleError, normalize_at
+
+        self.assertEqual(normalize_at("9:05"), "09:05")
+        self.assertEqual(normalize_at(" 23:59 "), "23:59")
+        with self.assertRaises(ScheduleError):
+            normalize_at("9:5")
+        with self.assertRaises(ScheduleError):
+            normalize_at("25:00")
+        with self.assertRaises(ScheduleError):
+            normalize_at("")
+
+    def test_add_daily_task_and_due(self):
+        import time as _t
+
+        from harness.schedule_store import (add_task, daily_target_ts,
+                                            due_tasks, load_tasks,
+                                            remove_task)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            try:
+                task = add_task(profile, "晨报", 0, "来份晨报",
+                                kind="daily", at="7:30")
+                self.assertEqual(task["kind"], "daily")
+                self.assertEqual(task["at"], "07:30")
+                self.assertNotIn("every", task)
+                stored = load_tasks(profile)[0]
+                now = _t.time()
+                target = daily_target_ts("07:30", now)
+                if now >= target:
+                    # 已过今天的 7:30：应触发（每天一次），跑过后不重复
+                    self.assertIn(stored, due_tasks([stored], now))
+                    stored["last_run"] = target
+                    self.assertNotIn(stored, due_tasks([stored], now + 1))
+                else:
+                    # 还没到点：不触发
+                    self.assertNotIn(stored, due_tasks([stored], now))
+            finally:
+                remove_task(profile, "晨报")
+
+    def test_add_interval_task_keeps_every(self):
+        from harness.schedule_store import add_task, load_tasks, remove_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            try:
+                task = add_task(profile, "巡检", 60, "报平安")
+                self.assertEqual(task["kind"], "interval")
+                self.assertEqual(task["every"], 60)
+                self.assertEqual(load_tasks(profile)[0]["every"], 60)
+            finally:
+                remove_task(profile, "巡检")
+
+
+class NotificationStoreTests(unittest.TestCase):
+    """通知中心存储：追加置顶、未读数、逐条/全部已读、上限截断。"""
+
+    def test_push_unread_and_mark(self):
+        from harness.notifications import (load_notifications, mark_read,
+                                           push_notification, unread_count)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            a = push_notification(profile, "ask", "问题", "A|B")
+            b = push_notification(profile, "schedule", "晨报回流")
+            items = load_notifications(profile)
+            self.assertEqual([i["id"] for i in items], [b["id"], a["id"]])
+            self.assertEqual(unread_count(profile), 2)
+            self.assertEqual(mark_read(profile, [a["id"]]), 1)
+            self.assertEqual(unread_count(profile), 1)
+            self.assertEqual(mark_read(profile, None), 1)
+            self.assertEqual(unread_count(profile), 0)
+            self.assertEqual(mark_read(profile, None), 0)
+
+    def test_push_cap(self):
+        from harness.notifications import (MAX_NOTIFICATIONS,
+                                           load_notifications,
+                                           push_notification)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            for i in range(MAX_NOTIFICATIONS + 10):
+                push_notification(profile, "info", f"n{i}")
+            items = load_notifications(profile)
+            self.assertEqual(len(items), MAX_NOTIFICATIONS)
+            self.assertEqual(items[0]["title"], f"n{MAX_NOTIFICATIONS + 9}")
+
+
+class Batch60Tests(unittest.TestCase):
+    """第六十批：远程访问 / 历史编辑 / 工具开关 / 技能新建 / 自检 / 拖入解析。"""
+
+    def _app(self, tmp):
+        host = build_host(Path(tmp))
+        return host, DesktopApp(host)
+
+    def test_remote_config_and_token(self):
+        from harness.remote import check_token, remote_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            remote = remote_config(profile)
+            self.assertFalse(remote["enabled"])
+            self.assertEqual(remote["bind"], "127.0.0.1")
+            self.assertTrue(remote["token"])
+            # 二次读取不重新生成 token
+            self.assertEqual(remote_config(profile)["token"], remote["token"])
+            self.assertTrue(check_token(remote["token"], remote["token"]))
+            self.assertFalse(check_token("wrong", remote["token"]))
+            self.assertFalse(check_token("", remote["token"]))
+
+    def test_remote_save_start_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            # 未开启时 start 直接返回未开启错误
+            r = app.remote_save(False, "127.0.0.1", 8741, False)
+            self.assertTrue(r["ok"])
+            self.assertFalse(r["running"])
+            # 非法 bind / 端口被拒
+            self.assertFalse(app.remote_save(True, "http://x", 8741)["ok"])
+            self.assertFalse(app.remote_save(True, "127.0.0.1", 80)["ok"])
+
+    def test_session_edit_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(tmp)
+            sid = "s-edit"
+            host.profile.save_session(sid, [
+                {"role": "user", "content": "旧问题"},
+                {"role": "assistant", "content": "旧回答"},
+            ])
+            r = app.session_edit_text(sid, 0, "新问题")
+            self.assertTrue(r["ok"])
+            history = host.profile.load_session(sid)
+            self.assertEqual(history[0]["content"], "新问题")
+            self.assertEqual(history[1]["content"], "旧回答")
+            self.assertFalse(app.session_edit_text(sid, 99, "x")["ok"])
+            self.assertFalse(app.session_edit_text(sid, 0, "  ")["ok"])
+
+    def test_tools_list_and_toggle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            r = app.tools_list()
+            self.assertTrue(r["ok"])
+            names = {t["name"] for t in r["tools"]}
+            target = "list_files" if "list_files" in names else (names.pop() if names else "")
+            self.assertTrue(app.set_tool_enabled(target, False)["ok"])
+            listing = {t["name"]: t for t in app.tools_list()["tools"]}
+            self.assertTrue(listing[target]["disabled"])
+            self.assertTrue(app.set_tool_enabled(target, True)["ok"])
+            listing = {t["name"]: t for t in app.tools_list()["tools"]}
+            self.assertFalse(listing[target]["disabled"])
+
+    def test_create_skill_template(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host, app = self._app(tmp)
+            r = app.create_skill("my-tool")
+            self.assertTrue(r["ok"])
+            text = (Path(r["path"])).read_text(encoding="utf-8")
+            self.assertIn("name: my-tool", text)
+            # 重名拒绝 + 非法名拒绝
+            self.assertFalse(app.create_skill("my-tool")["ok"])
+            self.assertFalse(app.create_skill("../evil")["ok"])
+
+    def test_self_check_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            r = app.self_check()
+            self.assertTrue(r["ok"])
+            names = {i["name"] for i in r["items"]}
+            self.assertIn("模型配置", names)
+            self.assertIn("工作区", names)
+
+    def test_drop_extract_rejects_bad(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app = self._app(tmp)
+            self.assertFalse(app.drop_extract(r"C:\nope.docx")["ok"])
+            self.assertFalse(app.drop_extract(__file__)["ok"])  # .py 不在白名单
+
+
 class ScheduleBackflowTests(unittest.TestCase):
     """定时任务结果回流：session 字段、set_task_session、write_back_result。"""
 
