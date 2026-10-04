@@ -611,16 +611,18 @@ class BundledSkillsSeedTests(unittest.TestCase):
 
 
 class MaxIterationsTests(unittest.TestCase):
-    """工具调用轮数上限：默认 10、可配置、非法值回退、范围钳制。"""
+    """工具调用轮数：默认/0/非法 = 无上限（None）；正数 1~200 为安全阀。"""
 
     def test_max_iterations_config(self):
         from harness.builtins.chat_loop.register import _max_iterations
 
-        self.assertEqual(_max_iterations({}), 10)
+        self.assertIsNone(_max_iterations({}))
+        self.assertIsNone(_max_iterations({"max_iterations": 0}))
+        self.assertIsNone(_max_iterations({"max_iterations": -3}))
+        self.assertIsNone(_max_iterations({"max_iterations": "abc"}))
+        self.assertIsNone(_max_iterations({"max_iterations": ""}))
         self.assertEqual(_max_iterations({"max_iterations": 25}), 25)
         self.assertEqual(_max_iterations({"max_iterations": "40"}), 40)
-        self.assertEqual(_max_iterations({"max_iterations": "abc"}), 10)
-        self.assertEqual(_max_iterations({"max_iterations": 0}), 1)
         self.assertEqual(_max_iterations({"max_iterations": 99999}), 200)
 
 
@@ -716,6 +718,38 @@ class NotificationStoreTests(unittest.TestCase):
             self.assertEqual(items[0]["title"], f"n{MAX_NOTIFICATIONS + 9}")
 
 
+class AttachToolsTests(unittest.TestCase):
+    """工具摘要落盘：附到最后一条 assistant、轻量视图、空工具不写。"""
+
+    def test_attach_tools(self):
+        from harness.builtins.chat_loop.register import _attach_tools
+
+        history = [
+            {"role": "user", "content": "做个页面"},
+            {"role": "assistant", "content": "完成"},
+        ]
+        _attach_tools(history, [
+            {"name": "write_file",
+             "arguments": {"path": "ledger.html", "content": "x" * 5000},
+             "result": "+12 -0 已写入 ledger.html"},
+            {"name": "run_command",
+             "arguments": {"command": "node check.js"},
+             "result": "错误：exit 1"},
+        ])
+        tools = history[1]["tools"]
+        self.assertEqual([t["name"] for t in tools], ["write_file", "run_command"])
+        self.assertEqual(tools[0]["args"]["path"], "ledger.html")
+        self.assertNotIn("xxxx", tools[0]["args"].get("content", "") and "x" * 5000)
+        self.assertTrue(tools[0]["ok"])
+        self.assertFalse(tools[1]["ok"])
+        # user 消息不被污染
+        self.assertNotIn("tools", history[0])
+        # 空工具列表：不动 history
+        _attach_tools(history, [])
+        self.assertNotIn("tools", history[0])
+        self.assertEqual(len(history[1]["tools"]), 2)
+
+
 class Batch60Tests(unittest.TestCase):
     """第六十批：远程访问 / 历史编辑 / 工具开关 / 技能新建 / 自检 / 拖入解析。"""
 
@@ -806,6 +840,51 @@ class Batch60Tests(unittest.TestCase):
             _, app = self._app(tmp)
             self.assertFalse(app.drop_extract(r"C:\nope.docx")["ok"])
             self.assertFalse(app.drop_extract(__file__)["ok"])  # .py 不在白名单
+
+
+class WorkflowStoreTests(unittest.TestCase):
+    """分任务执行的存储层：建记录/断点标记/续跑定位/摘要。"""
+
+    def test_new_next_pending_and_mark_interrupted(self):
+        from harness.workflow_store import (list_workflows, load_workflow,
+                                            mark_interrupted, new_workflow,
+                                            next_pending_index, save_workflow)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            wf = new_workflow(profile, "把项目测试补齐", "s-1", [
+                {"title": "盘点现状", "detail": "列出测试盲区"},
+                {"title": "补测试", "detail": "逐个补"},
+                {"title": "跑全量", "detail": "全绿为准"},
+            ])
+            self.assertEqual(wf["status"], "running")
+            self.assertEqual(len(wf["steps"]), 3)
+            # 第 1 步完成、第 2 步 running → 断点标记为 interrupted，续跑定位第 2 步
+            wf["steps"][0]["status"] = "done"
+            wf["steps"][1]["status"] = "running"
+            save_workflow(profile, wf)
+            self.assertEqual(mark_interrupted(profile), 1)
+            stored = load_workflow(profile, wf["id"])
+            self.assertEqual(stored["status"], "interrupted")
+            self.assertEqual(next_pending_index(stored), 1)
+            self.assertEqual(mark_interrupted(profile), 0)  # 已无 running
+            brief = list_workflows(profile)[0]
+            self.assertEqual(brief["steps_done"], 1)
+            self.assertEqual(brief["steps_total"], 3)
+
+    def test_active_and_empty_plan_rejected(self):
+        from harness.workflow_store import (WorkflowError, active_workflow,
+                                            new_workflow)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = make_profile(Path(tmp))
+            self.assertIsNone(active_workflow(profile))
+            new_workflow(profile, "任务A", "", [{"title": "s1"}])
+            self.assertIsNotNone(active_workflow(profile))
+            with self.assertRaises(WorkflowError):
+                new_workflow(profile, "任务B", "", [{"detail": "没标题"}])
+            with self.assertRaises(WorkflowError):
+                new_workflow(profile, "", "", [{"title": "s"}])
 
 
 class ScheduleBackflowTests(unittest.TestCase):

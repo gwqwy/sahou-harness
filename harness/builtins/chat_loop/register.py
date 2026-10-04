@@ -110,6 +110,33 @@ def _attach_reasoning(history: list, reasoning) -> None:
             return
 
 
+def _attach_tools(history: list, tool_calls: list) -> None:
+    """把本轮工具调用摘要附到最后一条 assistant 消息（就地修改传入副本）。
+
+    会话文件此前只存 role/content/reasoning——重进会话后「更改 / 运行命令 /
+    工具调用」分组就消失了。这里存**轻量视图**（工具名 + 参数摘要 + 结果首段
+    + 成败），完整参数与结果不落盘（write_file 的 content 可能非常大）；
+    界面回放时据此还原分组。
+    """
+    if not tool_calls:
+        return
+    view: list[dict] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        result = str(tc.get("result") or "")
+        view.append({"name": str(tc.get("name") or "?"),
+                     "args": _summarize_args(tc.get("arguments")),
+                     "result": result[:300],
+                     "ok": not result.startswith("错误")})
+    if not view:
+        return
+    for item in reversed(history):
+        if item.get("role") == "assistant":
+            item["tools"] = view
+            return
+
+
 # 预设模式（用户不可改，可新建自定义模式补充）：name → 附加提示词 / 是否禁用工具。
 # current_mode 为空或 "默认" 即不附加任何东西（与既往行为一致）。
 PRESET_MODES: dict[str, dict] = {
@@ -295,20 +322,22 @@ def _maybe_distill(host, session_id: str) -> None:
     threading.Thread(target=work, daemon=True, name="sha-distill").start()
 
 
-def _max_iterations(config: dict) -> int:
-    """单轮回答允许的最大 模型↔工具 循环数（config.max_iterations，默认 10）。
+def _max_iterations(config: dict) -> int | None:
+    """单轮回答允许的最大 模型↔工具 循环数（config.max_iterations）。
 
-    这是防死循环的安全阀：模型连续请求工具而不给最终回答时，到顶即停，
-    避免无限烧 token。桌面端「通用」页可调（任务重的场景调大即可）。
+    **默认无上限（None）**：任务没完成就不截断，靠模型自己收敛或用户点「停止」
+    中止。显式配置正整数（1~200）则恢复安全阀；0 / 负数 / 非法值同样视为无上限。
     """
     raw = config.get("max_iterations")
     if raw is None or (isinstance(raw, str) and not raw.strip()):
-        raw = 10
+        return None
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return 10
-    return max(1, min(value, 200))
+        return None
+    if value <= 0:
+        return None
+    return min(value, 200)
 
 
 def _build_memory(cfg: dict, llm):
@@ -612,6 +641,7 @@ def register(ctx) -> None:
         result = agent.run(message, session_id=sid, images=_validate_images(images))
         history = agent.memory.history(sid)
         _attach_reasoning(history, getattr(result, "reasoning", ""))
+        _attach_tools(history, result.tool_calls)
         host.profile.save_session(sid, history)
         _record_usage(host, sid, name, result.usage,
                       fallback=_estimate_usage(agent, sid, message, result.content or ""))
@@ -689,6 +719,7 @@ def register(ctx) -> None:
         result = agent.run(message, session_id=session_id, images=_validate_images(images))
         history = agent.memory.history(session_id)
         _attach_reasoning(history, getattr(result, "reasoning", ""))
+        _attach_tools(history, result.tool_calls)
         host.profile.save_session(session_id, history)
         runtime = host.service("models_runtime") or {}
         _record_usage(host, session_id, runtime.get("current", ""), result.usage,
@@ -732,6 +763,8 @@ def register(ctx) -> None:
         # 消费方提前 break 时生成器被关闭，这里不会执行（与 ask 中断即不落盘一致）
         history = agent.memory.history(session_id)
         _attach_reasoning(history, getattr(final_result, "reasoning", "") if final_result else "")
+        if final_result is not None:
+            _attach_tools(history, final_result.tool_calls)
         host.profile.save_session(session_id, history)
         if final_result is not None:
             runtime = host.service("models_runtime") or {}

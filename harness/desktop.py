@@ -1803,28 +1803,33 @@ class DesktopApp:
                 pass
             time.sleep(6 * 3600)
 
-    # -- 工具调用轮数上限（防死循环安全阀，桌面端「通用」页可调） --------------------
+    # -- 工具调用轮数上限（0/缺省 = 无上限；桌面端「通用」页可调） --------------------
     def get_max_iterations(self) -> dict[str, Any]:
         config = self._config()
+        raw = config.get("max_iterations")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return {"ok": True, "value": 0}
         try:
-            value = int(config.get("max_iterations") or 10)
+            value = int(raw)
         except (TypeError, ValueError):
-            value = 10
-        return {"ok": True, "value": max(1, min(value, 200))}
+            return {"ok": True, "value": 0}
+        return {"ok": True, "value": max(0, min(value, 200))}
 
     def set_max_iterations(self, value: int) -> dict[str, Any]:
-        """设置单轮回答的 模型↔工具 最大循环数（1~200，下一轮对话生效）。"""
+        """设置单轮回答的 模型↔工具 最大循环数（0 = 无上限，下一轮对话生效）。"""
         try:
             n = int(value)
         except (TypeError, ValueError):
             return {"ok": False, "error": "必须是整数"}
-        if not 1 <= n <= 200:
-            return {"ok": False, "error": "范围 1~200"}
+        if n < 0 or n > 200:
+            return {"ok": False, "error": "范围 0~200（0 = 无上限）"}
         self.host.profile.update_config(max_iterations=n)
         reset = self.host.service("reset_agent")
         if callable(reset):
             reset()
-        return {"ok": True, "value": n}
+        return {"ok": True, "value": n,
+                "note": "无上限：任务没完成不截断，可随时点「停止」中止"
+                if n == 0 else f"上限 {n} 轮（下一轮对话生效）"}
 
     # -- 记忆沉淀开关（默认关；开启后每 N 轮提炼建议） --------------------------------
     def get_memory_distill(self) -> dict[str, Any]:
@@ -2323,6 +2328,47 @@ class DesktopApp:
         items.append({"name": "会话数据", "ok": True,
                       "detail": f"{len(sessions)} 个会话"})
         return {"ok": True, "items": items}
+
+    # -- 分任务执行（工作流） -----------------------------------------------------
+    def _workflow_service(self):
+        svc = self.host.service("workflow")
+        if svc is None:
+            return None
+        return svc
+
+    def workflow_list(self) -> dict[str, Any]:
+        svc = self._workflow_service()
+        if svc is None:
+            return {"ok": False, "error": "工作流插件未激活"}
+        return svc["list"]()
+
+    def workflow_get(self, wf_id: str) -> dict[str, Any]:
+        svc = self._workflow_service()
+        if svc is None:
+            return {"ok": False, "error": "工作流插件未激活"}
+        return svc["get"](str(wf_id or ""))
+
+    def workflow_create(self, task: str, session: str = "") -> dict[str, Any]:
+        svc = self._workflow_service()
+        if svc is None:
+            return {"ok": False, "error": "工作流插件未激活"}
+        return svc["create"](str(task or ""), str(session or self._current_session))
+
+    def workflow_pause(self, wf_id: str) -> dict[str, Any]:
+        svc = self._workflow_service()
+        return svc["pause"](str(wf_id or "")) if svc else {"ok": False, "error": "插件未激活"}
+
+    def workflow_resume(self, wf_id: str) -> dict[str, Any]:
+        svc = self._workflow_service()
+        return svc["resume"](str(wf_id or "")) if svc else {"ok": False, "error": "插件未激活"}
+
+    def workflow_stop(self, wf_id: str) -> dict[str, Any]:
+        svc = self._workflow_service()
+        return svc["stop"](str(wf_id or "")) if svc else {"ok": False, "error": "插件未激活"}
+
+    def workflow_delete(self, wf_id: str) -> dict[str, Any]:
+        svc = self._workflow_service()
+        return svc["delete"](str(wf_id or "")) if svc else {"ok": False, "error": "插件未激活"}
 
     # -- 模式系统（预设 + 用户自定义） ---------------------------------------------
     PRESET_MODES = (
@@ -4160,18 +4206,18 @@ html[data-theme="light"] .msg.user { border-color:rgba(77,107,254,.20); }
             white-space:pre-wrap; word-break:break-word; }
 .cmp-err { color:var(--err); }
 /* 统一控件外观：等高胶囊、elev 底、悬停上浮—— badges / 图标按钮 / 下拉 */
-.badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #cmpBtn, #shotBtn {
+.badge, #ctxBtn, #imgBtn, #sideBtn, #snipBtn, #cmpBtn, #shotBtn, #wfBtn {
   background:var(--elev); border:1px solid var(--line-soft); color:var(--dim);
   border-radius:999px; padding:5px 12px; height:28px; font-size:11.5px;
   cursor:pointer; white-space:nowrap;
   transition:color .15s, border-color .15s, background .15s, transform .12s; }
 .badge:hover, #ctxBtn:hover, #imgBtn:hover, #sideBtn:hover,
-#snipBtn:hover, #cmpBtn:hover, #shotBtn:hover { color:var(--fg); border-color:var(--line); transform:translateY(-1px); }
+#snipBtn:hover, #cmpBtn:hover, #shotBtn:hover, #wfBtn:hover { color:var(--fg); border-color:var(--line); transform:translateY(-1px); }
 /* 权限徽标与模型选择允许收缩（收缩时省略号），其余按钮永不压缩 */
 #permBadge { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
 .badge.allow { color:var(--ok); border-color:rgba(92,198,137,.45); }
 .badge.deny  { color:var(--err); border-color:rgba(239,123,109,.45); }
-#ctxBtn:hover, #imgBtn:hover, #snipBtn:hover, #cmpBtn:hover, #shotBtn:hover { color:var(--accent); }
+#ctxBtn:hover, #imgBtn:hover, #snipBtn:hover, #cmpBtn:hover, #shotBtn:hover, #wfBtn:hover { color:var(--accent); }
 #sideBtn.off { color:var(--faint); }
 /* 下拉：自定义箭头 + 胶囊外观（与按钮统一）；模式下拉一并纳入 */
 #modelSel, #thinkSel, #modeSel { flex:0 1 auto; min-width:70px; max-width:170px;
@@ -4880,7 +4926,8 @@ body.dragging #dropMask { display:flex; }
         <span id="queueBadge" class="q-badge" style="display:none" title="本轮回答完成后将自动依次发送这些消息"></span>
         <button id="bgChip" class="q-badge" style="display:none"
                 title="有会话在后台回答中，点击切换过去"></button>
-        <button id="cmpBtn" title="与另一个模型并答对比（当前输入的问题，纯对话不带工具）" onclick="compareFlow()">⚖</button>
+          <button id="cmpBtn" title="与另一个模型并答对比（当前输入的问题，纯对话不带工具）" onclick="compareFlow()">⚖</button>
+          <button id="wfBtn" title="分任务执行：把当前输入作为大任务，规划子任务逐步完成" onclick="workflowCreateFromInput()">🧩</button>
         <button id="stopBtn" class="send stop" style="display:none" title="停止生成（部分内容不保留）" onclick="stopStream()">■</button>
         <button id="send" class="send" onclick="send()">↑</button>
       </div>
@@ -5030,6 +5077,19 @@ body.dragging #dropMask { display:flex; }
           <span>在上方输入网址后打开；部分站点（如 GitHub）禁止内嵌，请用「系统浏览器」。<br>支持多标签页：点「＋」新开一个。</span>
         </div>
       </div>
+    </div>
+
+    <div class="rp-body" id="rp-wf">
+      <div class="ws-nav">
+        <span class="crumb">分任务执行：大任务 → 规划子任务 → 逐步完成</span>
+        <button class="mini-btn" onclick="loadWorkflow()">⟳ 刷新</button>
+      </div>
+      <div class="install-row">
+        <input id="wfTask" placeholder="描述一个大任务，如：给这个项目补一套完整测试并跑通">
+        <button class="mini-btn" onclick="workflowCreateFlow()">🧩 拆解执行</button>
+      </div>
+      <div class="hint" style="padding:2px 10px 6px">规划成 3~8 个子任务后串行派发独立 agent 完成（每步落盘可续跑）；结果自动回流发起会话。同一时刻执行一条。</div>
+      <div id="wfBoard"></div>
     </div>
 
     <div class="rp-body" id="rp-review">
@@ -5236,8 +5296,8 @@ body.dragging #dropMask { display:flex; }
         <div class="set-card">
           <div class="set-row">
             <div class="set-main"><div class="name">工具调用轮数上限</div>
-              <div class="desc">单轮回答内 模型↔工具 的最大循环数（默认 10）。这是防死循环的安全阀：到顶即停并提示，避免无限烧 token；长任务报「已达上限」时调大即可</div></div>
-            <input id="maxIterInput" type="number" min="1" max="200"
+              <div class="desc">单轮回答内 模型↔工具 的最大循环数。0 = 无上限（默认）：任务没完成不截断，可随时点「停止」；设置正数则到轮数即停（防死循环安全阀）</div></div>
+            <input id="maxIterInput" type="number" min="0" max="200" value="0"
                    style="width:76px;height:28px;border:1px solid var(--line);border-radius:8px;background:var(--elev);color:var(--fg);padding:0 8px;">
             <button class="msg-act" onclick="saveMaxIterations()">保存</button>
           </div>
@@ -5825,6 +5885,25 @@ function applyTheme(mode) {
 
 /* ---------- 消息渲染 ---------- */
 
+/* 把会话文件里存的工具摘要还原成 liveTools 形状（重进会话后重建分组） */
+function reviveTools(list) {
+  return (list || []).map(t => {
+    const detail = String(t.result || '').split('\n')[0].slice(0, 120);
+    const stat = detail.match(/\+(\d+)\s+-(\d+)/) || [];
+    const args = t.args || {};
+    return {
+      name: t.name || '?',
+      detail,
+      ok: t.ok !== false && !/^错误/.test(detail),
+      args,
+      file: args.path || fileFromToolDetail(detail),
+      plus: stat[1] ? Number(stat[1]) : null,
+      minus: stat[2] ? Number(stat[2]) : null,
+      ms: 0,
+    };
+  });
+}
+
 function add(text, cls, meta, reasoning, hi, tools) {
   $('hero').style.display = 'none';
   text = (text == null ? '' : String(text));
@@ -5973,6 +6052,7 @@ function lsSet(key, val) {
   try { if (window.localStorage) localStorage.setItem(key, val); } catch (err) { /* 忽略 */ }
 }
 let uiPrefs = {};   // 提示音 / 通知 / 强调色 / 字体（与面板宽度等一起持久化）
+let currentWsPath = '';  // 当前工作区绝对路径（refreshStatus 维护）
 
 function saveUiPrefs() {
   const panel = $('rightPanel');
@@ -6104,6 +6184,7 @@ function toggleWsBar() {
 async function refreshStatus() {
   const s = await api().status();
   currentModel = s.model || '';
+  currentWsPath = s.workspace || '';   // 供「切会话联动工作区」比较
   perms = { shell: s.shell_permission || 'ask', fs: s.fs_permission || 'allow',
             git: s.git_permission || 'ask' };
   confirmWriteOn = !!s.confirm_write;
@@ -6419,11 +6500,18 @@ async function refreshSidebar() {
 async function selectSession(id) {
   saveDraft();                       // 切走前保存当前会话的未发送文字
   const s = await api().session_history(id);
+  // 联动切换到该会话所属的工作区：左上角工作区名、文件树、侧栏分组一起切
+  const sess = sidebar.sessions.find(x => x.id === id);
+  const wsEntry = sess && sidebar.workspaces.find(w => w.id === sess.ws);
+  if (wsEntry && wsEntry.path && wsEntry.path !== currentWsPath) {
+    await switchWorkspace(wsEntry.path);
+  }
   currentSession = id;
   $('thread').innerHTML = '';
-  // 思考过程随 assistant 消息落盘（chat_loop._attach_reasoning），回放时重建折叠块
+  // 思考过程与工具明细随 assistant 消息落盘，回放时重建折叠块与「更改/运行/工具」分组
   (s.history || []).filter(m => (m.content || '').trim()).forEach((m, i) =>
-    add(m.content, m.role === 'user' ? 'user' : 'bot', null, m.reasoning || '', i));
+    add(m.content, m.role === 'user' ? 'user' : 'bot', null, m.reasoning || '', i,
+        reviveTools(m.tools)));
   restoreDraft();                    // 切回来恢复该会话的草稿
   showHeroIfEmpty();
   updateSendState();  // 发送按钮按新会话的忙状态恢复
@@ -6963,6 +7051,11 @@ function onAgentEvent(evt) {
     toast('⏰ 定时任务「' + (evt.task || '') + '」结果已写入会话');
     refreshSidebar();
     if (evt.session === currentSession) selectSession(currentSession);
+    return;
+  }
+  // 工作流状态变化：看板开着就刷新，完成/失败给提示
+  if (evt.kind === 'workflow_update') {
+    if (curPanel === 'wf') loadWorkflow();
     return;
   }
   // 权限确认最先处理：它可能属于后台会话（并行/子 agent），不能被会话过滤挡掉
@@ -8273,6 +8366,7 @@ function switchPanel(name) {
   if (name === 'kb') loadKnowledge();
   if (name === 'todo') loadTodoPanel();
   if (name === 'sched') loadSchedules();
+  if (name === 'wf') loadWorkflow();
   if (name === 'mem') loadMemory();
   if (name === 'usage') loadUsageChart();
   if (name === 'review') loadReview();
@@ -8282,6 +8376,7 @@ function switchPanel(name) {
 /* ---------- 右侧标签页显隐（点 ✕ 隐藏，「＋」处找回） ---------- */
 let rpHidden = [];
 const TAB_LABELS = { aux: '💬 辅助', ws: '📁 工作区', sub: '🤖 子agent', kb: '📚 知识库',
+                     wf: '🧩 工作流',
                      todo: '✅ 任务', sched: '⏰ 定时', mem: '🧠 记忆', usage: '📈 用量',
                      term: '⌨ 终端', browser: '🌐 浏览器', review: '🔍 审查' };
 
@@ -8336,7 +8431,7 @@ async function showTabMenu() {
 /* 标签页顺序：支持拖拽重排 / 右键「左移 / 右移 / 隐藏」，随界面偏好持久化。
    （第五十三批曾改为「▦ 面板」下拉菜单，第五十五批按用户要求改回标签条；
    面板的显示/隐藏由右上角常驻的 ▣ 按钮与 Ctrl+J 承担，标签条里不再放关闭键） */
-const RP_TAB_ORDER_DEFAULT = ['aux', 'ws', 'sub', 'todo', 'sched', 'mem', 'usage', 'kb', 'term', 'browser', 'review'];
+const RP_TAB_ORDER_DEFAULT = ['aux', 'ws', 'sub', 'todo', 'sched', 'wf', 'mem', 'usage', 'kb', 'term', 'browser', 'review'];
 let rpTabOrder = RP_TAB_ORDER_DEFAULT.slice();
 let curPanel = 'aux';
 
@@ -8708,6 +8803,127 @@ async function createSchedule() {
   const r = await api().schedule_add(name, every, prompt, '', kind, at);
   if (r && r.ok) { toast('已创建任务「' + name + '」'); loadSchedules(); }
   else toast((r && r.error) || '创建失败', true);
+}
+
+/* ---------- 分任务执行（🧩 工作流）：大任务 → 规划 → 串行完成 ---------- */
+let wfPollTimer = 0;
+const WF_MARK = { done: '✅', failed: '❌', running: '▶', pending: '⏳' };
+const WF_STATUS = { running: '▶ 执行中', paused: '⏸ 已暂停', done: '✅ 已完成',
+                    failed: '❌ 有失败', interrupted: '⏸ 已中断（可继续）' };
+async function loadWorkflow() {
+  const box = $('wfBoard');
+  if (!box) return;
+  const r = await api().workflow_list();
+  box.innerHTML = '';
+  if (!r.ok) { box.innerHTML = '<div class="hint">' + esc(r.error || '加载失败') + '</div>'; return; }
+  if (!(r.items || []).length) {
+    box.innerHTML = '<div class="hint" style="padding:8px 10px">还没有工作流。在上方描述大任务点「🧩 拆解执行」。</div>';
+  }
+  for (const brief of (r.items || [])) {
+    const row = document.createElement('div');
+    row.className = 'sub-row open';
+    const head = document.createElement('div');
+    head.className = 'sub-head';
+    const when = brief.created ? new Date(brief.created * 1000).toLocaleString('zh-CN') : '';
+    head.innerHTML = '<span class="sub-badge ' +
+      (brief.status === 'done' ? 'ok' : brief.status === 'failed' ? 'bad' : 'ok') + '">' +
+      (WF_MARK[brief.status] || '·') + '</span>' +
+      '<span class="sub-task">' + esc(String(brief.task || '').slice(0, 40)) + '</span>' +
+      '<span class="sub-time">' + WF_STATUS[brief.status] + ' · ' +
+      (brief.steps_done || 0) + '/' + (brief.steps_total || 0) + ' 步 · ' + esc(when) + '</span>';
+    head.title = brief.task || '';
+    row.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'sub-body';
+    const detail = document.createElement('div');
+    detail.className = 'sub-out';
+    detail.textContent = '加载步骤…';
+    body.appendChild(detail);
+    row.appendChild(body);
+    head.onclick = () => row.classList.toggle('open');
+    const acts = document.createElement('div');
+    acts.className = 'sched-acts';
+    const mkBtn = (label, fn) => {
+      const b = document.createElement('button');
+      b.className = 'mini-btn';
+      b.textContent = label;
+      b.onclick = async (e) => { e.stopPropagation(); await fn(); };
+      return b;
+    };
+    if (brief.status === 'running') {
+      acts.appendChild(mkBtn('⏸ 暂停', async () => {
+        const res = await api().workflow_pause(brief.id);
+        if (res && res.ok) { toast('当前步骤完成后暂停'); loadWorkflow(); }
+        else toast((res && res.error) || '操作失败', true);
+      }));
+      acts.appendChild(mkBtn('⏹ 停止', async () => {
+        const res = await api().workflow_stop(brief.id);
+        if (res && res.ok) { toast('当前步骤完成后中断'); loadWorkflow(); }
+        else toast((res && res.error) || '操作失败', true);
+      }));
+    } else if (brief.status === 'paused' || brief.status === 'interrupted' ||
+               brief.status === 'failed') {
+      acts.appendChild(mkBtn('▶ 继续', async () => {
+        const res = await api().workflow_resume(brief.id);
+        if (res && res.ok) { toast('从第一个未完成步骤继续'); loadWorkflow(); }
+        else toast((res && res.error) || '操作失败', true);
+      }));
+    }
+    acts.appendChild(mkBtn('🗑 删除', async () => {
+      const ok = await dialogConfirm('删除工作流', '确定删除该工作流记录？');
+      if (!ok) return;
+      await api().workflow_delete(brief.id);
+      loadWorkflow();
+    }));
+    body.appendChild(acts);
+    box.appendChild(row);
+    // 展开步骤明细（运行中的工作流自动轮询刷新）
+    api().workflow_get(brief.id).then(g => {
+      const wf = g.workflow;
+      if (!wf) { detail.textContent = '（记录不存在）'; return; }
+      detail.innerHTML = (wf.steps || []).map(s =>
+        '<div style="padding:3px 0">' + (WF_MARK[s.status] || '·') + ' ' +
+        esc((s.index ?? '') + '. ' + (s.title || '')) +
+        (s.result ? '<div class="hint" style="padding-left:22px;white-space:pre-wrap">' +
+          esc(String(s.result).slice(0, 200)) + '</div>' : '') + '</div>').join('');
+      if (wf.status === 'running' && curPanel === 'wf') {
+        clearTimeout(wfPollTimer);
+        wfPollTimer = setTimeout(() => { if (curPanel === 'wf') loadWorkflow(); }, 2500);
+      }
+    });
+  }
+}
+async function workflowCreateFlow() {
+  const task = $('wfTask').value.trim();
+  if (!task) { toast('先描述大任务', true); return; }
+  toast('规划子任务中…');
+  const r = await api().workflow_create(task, currentSession);
+  if (r && r.ok) {
+    $('wfTask').value = '';
+    toast('已启动：' + (r.workflow.steps || []).length + ' 个子任务，结果将回流本会话');
+    loadWorkflow();
+  } else toast((r && r.error) || '启动失败', true);
+}
+async function workflowCreateFromInput() {
+  const task = $('input').value.trim();
+  if (!task) {
+    // 输入框为空：切到工作流面板，从那里填写
+    switchPanel('wf');
+    $('wfTask')?.focus();
+    toast('在上方描述大任务后点「🧩 拆解执行」');
+    return;
+  }
+  const r = await api().workflow_create(task, currentSession);
+  if (r && r.ok) {
+    $('input').value = '';
+    $('input').style.height = 'auto';
+    toast('🧩 已启动工作流：' + (r.workflow.steps || []).length + ' 个子任务；完成后结果回流本会话');
+    switchPanel('wf');
+    loadWorkflow();
+    bumpBell();
+  } else {
+    toast((r && r.error) || '启动失败', true);
+  }
 }
 
 /* ---------- 远程仓库配置与手动推送（审查面板；agent 无 push 能力） ---------- */
